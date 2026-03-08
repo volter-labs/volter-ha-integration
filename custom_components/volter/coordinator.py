@@ -16,10 +16,15 @@ from .const import (
     DEVICE_TELEMETRY_PATH,
     MONITORING_ENTITY_MAP,
     OPT_ENTITY_EMS_MODE,
+    OPT_ENTITY_GRID_POWER,
     TELEMETRY_BATCH_INTERVAL,
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+# Konwersja znaków: GoodWe HA raportuje grid_power jako (+)=import, (-)=export,
+# ale nasz system oczekuje (+)=export, (-)=import. Negujemy przy odczycie.
+_NEGATE_KEYS = {OPT_ENTITY_GRID_POWER}
 
 
 class VolterTelemetryCoordinator:
@@ -56,9 +61,31 @@ class VolterTelemetryCoordinator:
         """Uruchom coordinator — zarejestruj listenery i timer."""
         self._running = True
         self._session = aiohttp.ClientSession()
+        self._read_initial_states()
         self._setup_state_listeners()
         self._schedule_flush()
         _LOGGER.debug("Telemetry coordinator started")
+
+    def _read_initial_states(self) -> None:
+        """Odczytaj aktualny stan wszystkich zmapowanych encji (np. ems_mode)."""
+        options = self._entry.options
+        for opt_key, telemetry_key in MONITORING_ENTITY_MAP.items():
+            entity_id = options.get(opt_key, "")
+            if not entity_id:
+                continue
+            state = self.hass.states.get(entity_id)
+            if state is None or state.state in ("unknown", "unavailable"):
+                continue
+            try:
+                value = float(state.state)
+                if opt_key in _NEGATE_KEYS:
+                    value = -value
+                self._latest_values[telemetry_key] = value
+            except (ValueError, TypeError):
+                self._latest_values[telemetry_key] = state.state
+        _LOGGER.debug(
+            "Initial states read: %d values", len(self._latest_values)
+        )
 
     async def async_stop(self) -> None:
         """Zatrzymaj coordinator — wyczyść listenery i timer."""
@@ -115,7 +142,10 @@ class VolterTelemetryCoordinator:
         for opt_key, telemetry_key in MONITORING_ENTITY_MAP.items():
             if options.get(opt_key) == entity_id:
                 try:
-                    self._latest_values[telemetry_key] = float(new_state.state)
+                    value = float(new_state.state)
+                    if opt_key in _NEGATE_KEYS:
+                        value = -value
+                    self._latest_values[telemetry_key] = value
                 except (ValueError, TypeError):
                     # EMS mode lub inne non-numeric
                     self._latest_values[telemetry_key] = new_state.state
