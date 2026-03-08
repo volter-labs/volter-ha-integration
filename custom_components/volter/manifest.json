@@ -5,6 +5,7 @@
   "config_flow": true,
   "documentation": "https://github.com/volter-labs/volter-ha-integration",
   "integration_type": "hub",
+  "issue_tracker": "https://github.com/volter-labs/volter-ha-integration/issues",
   "iot_class": "cloud_push",
   "requirements": [],
   "version": "1.0.0"
