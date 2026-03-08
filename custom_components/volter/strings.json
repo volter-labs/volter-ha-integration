@@ -1,0 +1,58 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Volter Energy",
+        "description": "Enter the API key from your Volter app (Settings > API Key).",
+        "data": {
+          "api_key": "API Key"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Cannot connect to Volter API. Check your internet connection.",
+      "invalid_auth": "Invalid API key. Generate a new key in the Volter app.",
+      "unknown": "Unexpected error. Check the Home Assistant logs."
+    },
+    "abort": {
+      "already_configured": "This device is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Monitoring — Required entities",
+        "description": "Map your inverter entities to Volter monitoring. These are required for energy optimization.",
+        "data": {
+          "entity_soc": "Battery State of Charge (SoC)",
+          "entity_pv_power": "PV Power",
+          "entity_grid_power": "Grid Power"
+        }
+      },
+      "monitoring_extended": {
+        "title": "Monitoring — Optional entities",
+        "description": "Additional entities for improved optimization accuracy.",
+        "data": {
+          "entity_battery_power": "Battery Power (charge/discharge)",
+          "entity_load_power": "House Load Power",
+          "entity_pv_energy_total": "PV Total Energy (counter)",
+          "entity_grid_import_total": "Grid Import Total (counter)",
+          "entity_grid_export_total": "Grid Export Total (counter)"
+        }
+      },
+      "control": {
+        "title": "Control — Inverter commands",
+        "description": "Map inverter control entities to enable remote commands from the Volter app. All fields are optional.",
+        "data": {
+          "entity_ems_mode": "EMS / Operation Mode (select)",
+          "entity_charge_limit": "Battery Charge Limit",
+          "entity_discharge_limit": "Battery Discharge Depth (DOD)",
+          "entity_export_limit": "Grid Export Limit (W)",
+          "entity_export_limit_switch": "Export Limit Switch (on/off)",
+          "entity_eco_mode_power": "Eco Mode Power (%)",
+          "entity_eco_mode_soc": "Eco Mode SOC Target (%)"
+        }
+      }
+    }
+  }
+}
