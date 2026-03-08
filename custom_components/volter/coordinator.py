@@ -29,8 +29,8 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
-# Konwersja znaków: GoodWe HA raportuje grid_power jako (+)=import, (-)=export,
-# ale nasz system oczekuje (+)=export, (-)=import. Negujemy przy odczycie.
+# Konwersja znaków: GoodWe HA raportuje grid_power jako (+)=export, (-)=import,
+# ale SEMS/nasz system oczekuje (+)=import, (-)=export. Negujemy przy odczycie.
 _NEGATE_KEYS = {OPT_ENTITY_GRID_POWER}
 
 
@@ -280,3 +280,9 @@ class VolterTelemetryCoordinator:
                     _LOGGER.debug("Live broadcast failed: %s", resp.status)
         except (aiohttp.ClientError, TimeoutError):
             pass  # Live broadcast nie jest krytyczny — ignoruj błędy
+
+        # ── Local event bus (dla aplikacji na LAN) ────────────────────────
+        self.hass.bus.async_fire("volter_telemetry", {
+            "device_id": self._device_id,
+            **payload,
+        })
