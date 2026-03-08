@@ -1,4 +1,9 @@
-"""Telemetry Coordinator — zbiera stany encji i wysyła batche do Supabase."""
+"""Telemetry Coordinator — zbiera stany encji i wysyła do Supabase.
+
+Dwa kanały wysyłki:
+1. Batch store (60s) → device-telemetry Edge Function → telemetry_raw (zapis + broadcast)
+2. Live broadcast (5s) → Supabase Realtime API bezpośrednio (bez zapisu, live dashboard)
+"""
 
 from __future__ import annotations
 
@@ -13,7 +18,9 @@ from homeassistant.core import CALLBACK_TYPE, Event, EventStateChangedData, Home
 from homeassistant.helpers.event import async_call_later, async_track_state_change_event
 
 from .const import (
+    CONF_SUPABASE_ANON_KEY,
     DEVICE_TELEMETRY_PATH,
+    LIVE_BROADCAST_INTERVAL,
     MONITORING_ENTITY_MAP,
     OPT_ENTITY_EMS_MODE,
     OPT_ENTITY_GRID_POWER,
@@ -28,12 +35,13 @@ _NEGATE_KEYS = {OPT_ENTITY_GRID_POWER}
 
 
 class VolterTelemetryCoordinator:
-    """Zbiera dane z zmapowanych encji HA i wysyła batche co 60s do Supabase.
+    """Zbiera dane z zmapowanych encji HA i wysyła do Supabase.
 
     Flow:
     1. Rejestruje listenery na encje z options (entity mapping)
     2. Na każdy state_change zapisuje najnowszą wartość encji
-    3. Co 60s kompiluje snapshot i wysyła POST do device-telemetry
+    3. Co 60s kompiluje snapshot i wysyła POST do device-telemetry (zapis)
+    4. Co 5s broadcastuje snapshot bezpośrednio do Realtime (live dashboard)
     """
 
     def __init__(
@@ -48,23 +56,30 @@ class VolterTelemetryCoordinator:
         self.hass = hass
         self._entry = entry
         self._api_key = api_key
-        self._device_id = device_id
+        self._device_id = device_id  # = user_id
         self._telemetry_url = f"{supabase_url}{DEVICE_TELEMETRY_PATH}"
+        self._broadcast_url = f"{supabase_url}/realtime/v1/api/broadcast"
+        self._anon_key = entry.data.get(CONF_SUPABASE_ANON_KEY, "")
 
         self._listeners: list[CALLBACK_TYPE] = []
         self._flush_unsub: CALLBACK_TYPE | None = None
+        self._broadcast_unsub: CALLBACK_TYPE | None = None
         self._latest_values: dict[str, Any] = {}
         self._session: aiohttp.ClientSession | None = None
         self._running = False
 
     async def async_start(self) -> None:
-        """Uruchom coordinator — zarejestruj listenery i timer."""
+        """Uruchom coordinator — zarejestruj listenery i timery."""
         self._running = True
         self._session = aiohttp.ClientSession()
         self._read_initial_states()
         self._setup_state_listeners()
         self._schedule_flush()
-        _LOGGER.debug("Telemetry coordinator started")
+        self._schedule_live_broadcast()
+        _LOGGER.debug(
+            "Telemetry coordinator started (store=%ds, broadcast=%ds)",
+            TELEMETRY_BATCH_INTERVAL, LIVE_BROADCAST_INTERVAL,
+        )
 
     def _read_initial_states(self) -> None:
         """Odczytaj aktualny stan wszystkich zmapowanych encji (np. ems_mode)."""
@@ -88,7 +103,7 @@ class VolterTelemetryCoordinator:
         )
 
     async def async_stop(self) -> None:
-        """Zatrzymaj coordinator — wyczyść listenery i timer."""
+        """Zatrzymaj coordinator — wyczyść listenery i timery."""
         self._running = False
 
         for unsub in self._listeners:
@@ -98,6 +113,10 @@ class VolterTelemetryCoordinator:
         if self._flush_unsub is not None:
             self._flush_unsub()
             self._flush_unsub = None
+
+        if self._broadcast_unsub is not None:
+            self._broadcast_unsub()
+            self._broadcast_unsub = None
 
         if self._session and not self._session.closed:
             await self._session.close()
@@ -151,6 +170,8 @@ class VolterTelemetryCoordinator:
                     self._latest_values[telemetry_key] = new_state.state
                 break
 
+    # ── Batch store (60s) → device-telemetry Edge Function ──────────────────
+
     def _schedule_flush(self) -> None:
         """Zaplanuj następny flush za TELEMETRY_BATCH_INTERVAL sekund."""
         if not self._running:
@@ -170,7 +191,7 @@ class VolterTelemetryCoordinator:
         )
 
     async def _async_flush(self) -> None:
-        """Wyślij aktualny snapshot telemetrii do Supabase."""
+        """Wyślij aktualny snapshot telemetrii do Supabase (zapis do DB)."""
         if not self._latest_values:
             return
 
@@ -199,7 +220,63 @@ class VolterTelemetryCoordinator:
                     )
                 else:
                     _LOGGER.debug(
-                        "Telemetry sent: %d values", len(self._latest_values)
+                        "Telemetry stored: %d values", len(self._latest_values)
                     )
         except (aiohttp.ClientError, TimeoutError) as err:
             _LOGGER.warning("Telemetry POST error: %s", err)
+
+    # ── Live broadcast (5s) → Supabase Realtime bezpośrednio ────────────────
+
+    def _schedule_live_broadcast(self) -> None:
+        """Zaplanuj następny live broadcast za LIVE_BROADCAST_INTERVAL sekund."""
+        if not self._running or not self._anon_key:
+            return
+
+        @callback
+        def _broadcast_callback(_now: Any) -> None:
+            self._broadcast_unsub = None
+            if self._running:
+                self.hass.async_create_task(self._async_live_broadcast())
+                self._schedule_live_broadcast()
+
+        self._broadcast_unsub = async_call_later(
+            self.hass,
+            LIVE_BROADCAST_INTERVAL,
+            _broadcast_callback,
+        )
+
+    async def _async_live_broadcast(self) -> None:
+        """Broadcast snapshot bezpośrednio do Supabase Realtime (bez zapisu)."""
+        if not self._latest_values:
+            return
+
+        if not self._session or self._session.closed:
+            self._session = aiohttp.ClientSession()
+
+        payload = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "user_id": self._device_id,
+            **self._latest_values,
+        }
+
+        try:
+            async with self._session.post(
+                self._broadcast_url,
+                json={
+                    "messages": [{
+                        "topic": f"telemetry:{self._device_id}",
+                        "event": "reading",
+                        "payload": payload,
+                    }],
+                },
+                headers={
+                    "Content-Type": "application/json",
+                    "apikey": self._anon_key,
+                    "Authorization": f"Bearer {self._anon_key}",
+                },
+                timeout=aiohttp.ClientTimeout(total=3),
+            ) as resp:
+                if resp.status not in (200, 202):
+                    _LOGGER.debug("Live broadcast failed: %s", resp.status)
+        except (aiohttp.ClientError, TimeoutError):
+            pass  # Live broadcast nie jest krytyczny — ignoruj błędy

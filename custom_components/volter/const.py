@@ -35,8 +35,9 @@ OPT_ENTITY_ECO_MODE_POWER = "entity_eco_mode_power"
 OPT_ENTITY_ECO_MODE_SOC = "entity_eco_mode_soc"
 
 # ── Telemetry ───────────────────────────────────────────────────────────────
-TELEMETRY_BATCH_INTERVAL = 60  # sekund
+TELEMETRY_BATCH_INTERVAL = 60  # sekund — zapis do telemetry_raw
 TELEMETRY_MAX_BATCH_SIZE = 120
+LIVE_BROADCAST_INTERVAL = 5  # sekund — broadcast-only (bez zapisu, live dashboard)
 
 # ── Realtime (Phoenix channels) ─────────────────────────────────────────────
 REALTIME_HEARTBEAT_INTERVAL = 30  # sekund
