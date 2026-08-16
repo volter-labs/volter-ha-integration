@@ -167,6 +167,52 @@ CHARGE_SOURCES: tuple[str, ...] = ("pv", "grid")
 DISCHARGE_PURPOSES: tuple[str, ...] = ("self", "sell")
 
 
+def _waliduj_spojnosc_kierunku(
+    akcja: Action, charge_source: str | None, discharge_purpose: str | None
+) -> None:
+    """U-9: `mode` i pola opisowe kierunku razem opisują JEDEN kierunek — sprzeczna
+    kombinacja to ZŁY KSZTAŁT wejścia, a nie sytuacja do cichego rozstrzygnięcia.
+
+    Bez tej bramy `kierunek_slotu` (jedyne miejsce rozstrzygające kierunek po U-6)
+    musiałoby zgadywać: `mode='idle'` + `discharge_purpose='self'` dawało
+    `Action.DISCHARGE`, czyli slot opisany jako „nie rób nic" wydawał komendę
+    rozładowania (zmierzone, `power_w=1476` przechodziło razem z nim). Analogicznie
+    `mode='charge'` po cichu gubiło sprzeczny `discharge_purpose`.
+
+    Ta sama klasa luki co S-2: niezaufany JSON z chmury przechodzący przez parser
+    do falownika, tylko na polach U-1. Odrzucamy PRZY PARSOWANIU (fail-closed),
+    zanim plan trafi do `Store` — dokładnie tu, gdzie `mode`/`charge_source`/
+    `discharge_purpose` są już osobno zwalidowane, więc kontrola spójności między
+    nimi ma jedno miejsce, a nie jest rozsypana po `mappers.py`/`executor.py`.
+    """
+    if akcja is Action.IDLE and (charge_source is not None or discharge_purpose is not None):
+        raise InvalidSchedule(
+            "mode",
+            "mode='idle' nie może nieść kierunku — charge_source/discharge_purpose "
+            "opisują akcję, której IDLE świadomie nie ma",
+        )
+    if akcja is Action.CHARGE and discharge_purpose is not None:
+        raise InvalidSchedule(
+            "discharge_purpose",
+            "mode='charge' nie może nieść discharge_purpose — to pole opisuje rozładowanie",
+        )
+    if akcja is Action.DISCHARGE and charge_source is not None:
+        raise InvalidSchedule(
+            "charge_source",
+            "mode='discharge' nie może nieść charge_source — to pole opisuje ładowanie",
+        )
+    if charge_source is not None and discharge_purpose is not None:
+        # Możliwe tylko przy mode='self_consume' (bo obie gałęzie wyżej odrzuciłyby
+        # to wcześniej dla charge/discharge) — ale to dwa sprzeczne kierunki w jednym
+        # slocie: `kierunek_slotu` musiałoby wybrać jedno po cichu (dziś: discharge_
+        # purpose wygrywa), gubiąc drugie bez śladu.
+        raise InvalidSchedule(
+            "charge_source",
+            "charge_source i discharge_purpose nie mogą być ustawione jednocześnie "
+            "— to dwa sprzeczne kierunki w jednym slocie",
+        )
+
+
 @dataclass(frozen=True)
 class Slot:
     """Pojedynczy przedział harmonogramu."""
@@ -213,19 +259,24 @@ class Slot:
                 "to", f"slot kończy się ({end.isoformat()}) nie później niż zaczyna "
                 f"({start.isoformat()})"
             )
+        akcja = _akcja(raw)
+        # U-1: pola opcjonalne — plan sprzed rozszerzenia kontraktu (już utrwalony
+        # w `Store`) musi się dalej wczytywać, inaczej aktualizacja integracji
+        # skasowałaby aktywny harmonogram przy pierwszym starcie.
+        charge_source = _wybor(raw, "charge_source", CHARGE_SOURCES)
+        discharge_purpose = _wybor(raw, "discharge_purpose", DISCHARGE_PURPOSES)
+        # U-9: sprawdzamy zgodność PRZED zbudowaniem slotu — fail-closed jak S-2.
+        _waliduj_spojnosc_kierunku(akcja, charge_source, discharge_purpose)
         return cls(
             start=start,
             end=end,
-            action=_akcja(raw),
+            action=akcja,
             power_w=_liczba(raw, "power_w"),
             soc_target=_liczba(raw, "soc_target"),
             price_pln_kwh=_liczba(raw, "price_pln_kwh"),
             export_allowed=_flaga(raw, "export_allowed", True),
-            # U-1: pola opcjonalne — plan sprzed rozszerzenia kontraktu (już utrwalony
-            # w `Store`) musi się dalej wczytywać, inaczej aktualizacja integracji
-            # skasowałaby aktywny harmonogram przy pierwszym starcie.
-            charge_source=_wybor(raw, "charge_source", CHARGE_SOURCES),
-            discharge_purpose=_wybor(raw, "discharge_purpose", DISCHARGE_PURPOSES),
+            charge_source=charge_source,
+            discharge_purpose=discharge_purpose,
             export_limit_w=_moc_nieujemna(raw, "export_limit_w"),
         )
 

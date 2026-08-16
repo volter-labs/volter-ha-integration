@@ -11,11 +11,13 @@ transport, który trafi do firmware Volter BOX (Q-002).
 Cała walidacja kształtu planu (S-2/S-3, fail-closed) siedzi w `schedule.py` —
 ten moduł jest wyłącznie transportem i dwoma strażnikami:
   * błąd sieci / HTTP inny niż 200 NIE może skasować planu lokalnego,
-  * niezmieniony `schedule_id` NIE może ruszać `helpers.storage` co 5 min.
+  * niezmieniony plan NIE może ruszać `helpers.storage` co 5 min — po `schedule_id`,
+    a gdy ten jest pusty (legalny pusty plan, U-8/D-6), po treści planu.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import timedelta
 from typing import Any
@@ -57,6 +59,14 @@ class ScheduleFetcher:
         #: dublujemy tego wewnątrz executora — zderzyłoby się to z RR-4, który
         #: wymaga, żeby KAŻDE wywołanie `async_set_schedule` naprawdę zapisało.
         self._last_schedule_id: str | None = None
+        #: U-8: `schedule_id` pusty (legalny pusty plan, patrz `PUSTY_PLAN_Z_CHMURY`
+        #: w `test_fetcher.py` / D-6) jest ZAWSZE falsy, więc porównanie po samym id
+        #: nigdy nie wykryje "bez zmian" — zmierzone 288 zapisów do Store na dobę,
+        #: bezterminowo, dopóki optymalizator jest wyłączony. Gdy id jest puste,
+        #: dedup schodzi na porównanie TREŚCI planu; ten sygnaturowy odcisk to jej
+        #: nośnik. `None` znaczy "ostatni przyjęty plan miał NIEPUSTY id" — dzięki
+        #: temu przejście niepusty→pusty zawsze przechodzi (nie ma z czym porównać).
+        self._last_empty_plan_signature: str | None = None
 
     # ── cykl życia ───────────────────────────────────────────────────────────
 
@@ -101,9 +111,21 @@ class ScheduleFetcher:
             return
 
         schedule_id = str(plan.get("schedule_id", ""))
-        if schedule_id and schedule_id == self._last_schedule_id:
-            _LOGGER.debug("Plan %s bez zmian — pomijam zapis do Store", schedule_id)
-            return
+        if schedule_id:
+            if schedule_id == self._last_schedule_id:
+                _LOGGER.debug("Plan %s bez zmian — pomijam zapis do Store", schedule_id)
+                return
+        else:
+            # U-8: id pusty (legalny pusty plan, D-6) — "bez zmian" rozstrzyga TREŚĆ,
+            # nie id. Warunek `self._last_schedule_id == ""` celowo wymaga, żeby
+            # OSTATNI PRZYJĘTY plan też miał pusty id: gdy poprzedni plan był
+            # niepusty (albo to pierwszy fetch), sygnatury nie ma z czym porównać
+            # i zapis MUSI przejść — inaczej przejście "plan realny → optymalizator
+            # wyłączony" nigdy by nie dotarło do executora (I-5 zostałoby ślepe).
+            sygnatura = json.dumps(plan, sort_keys=True)
+            if self._last_schedule_id == "" and sygnatura == self._last_empty_plan_signature:
+                _LOGGER.debug("Pusty plan bez zmian — pomijam zapis do Store")
+                return
 
         try:
             await self._executor.async_set_schedule(plan)
@@ -119,6 +141,10 @@ class ScheduleFetcher:
             return
 
         self._last_schedule_id = schedule_id
+        # U-8: sygnatura ma sens WYŁĄCZNIE, gdy ten plan miał pusty id — dla
+        # niepustego id zeruj ją, żeby stary odcisk z poprzedniego pustego planu
+        # nie przeciekł w drugą stronę (pusty → niepusty → znowu ten sam pusty).
+        self._last_empty_plan_signature = json.dumps(plan, sort_keys=True) if not schedule_id else None
         _LOGGER.info(
             "Przyjęto plan %s (%s slotów)", schedule_id or "(bez id)",
             len(plan.get("slots", [])) if isinstance(plan.get("slots"), list) else "?",
