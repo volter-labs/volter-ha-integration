@@ -41,6 +41,11 @@ OPTIONS = {
     "entity_eco_mode_soc": "number.eco_soc",
     "entity_eco_mode_power": "number.eco_power",
     "entity_discharge_limit": "number.discharge_limit",
+    # R-3: `slot_to_params` zawsze emituje `export_limit_enabled` (True albo False) —
+    # bez zmapowanej encji przełącznika ten parametr teraz poprawnie ląduje w errors,
+    # więc fixture musi mapować WSZYSTKIE encje, których mapper może zażądać, inaczej
+    # testy I-1 przypadkiem testowałyby (nieistotną tu) lukę mapowania encji.
+    "entity_export_limit_switch": "switch.export_limit",
     # Scenariusz z ustalenia: rezerwa backup 40%, tryb autarky.
     "soc_reserve": 40.0,
     "user_mode": "autarky",

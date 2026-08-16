@@ -343,11 +343,14 @@ class VolterCommandHandler:
     async def _report_guard_result(self, request_id: str, result: GuardResult) -> None:
         """Zaraportuj wynik razem ze śladem decyzji guardów."""
         self._remember_if_effective(request_id, result)
+        # R-9: `errors=[]` było zahardkodowane — realne błędy per-encja z `executor`
+        # (m.in. niezmapowana encja, R-3) nigdy nie opuszczały HA. To była regresja
+        # wobec implementacji sprzed Fazy A, która przekazywała prawdziwą listę.
         await self._report_result(
             request_id,
             result.status.value,
             executed=list(result.executed),
-            errors=[],
+            errors=list(result.errors),
             notes=[{"invariant": n.invariant, "message": n.message} for n in result.notes],
         )
 

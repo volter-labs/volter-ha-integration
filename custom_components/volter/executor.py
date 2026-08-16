@@ -249,6 +249,10 @@ class VolterExecutor:
             # N-4: raport do chmury musi mówić prawdę — `executed` to to, co naprawdę
             # poszło do falownika, nie to, co przeszło guardy (`result.params`).
             result.executed = executed
+            # R-9: bez tego przypisania realne błędy per-encja (m.in. niezmapowana
+            # encja z R-3) ginęły — command_handler raportował do chmury errors=[]
+            # na sztywno, niezależnie od tego, co faktycznie zawiodło.
+            result.errors = errors
 
             self._throttle.commit({k: writable[k] for k in executed if k in writable}, now_ts)
             self._direction.record(act, now_ts)

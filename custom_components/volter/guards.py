@@ -178,6 +178,11 @@ class GuardResult:
     #: więc zwracają samą intencję — przetłumaczy ją mapper, jedyne miejsce, które te
     #: nazwy zna.
     forced_action: "Action | None" = None
+    #: R-9: realne błędy zapisu per-encja (z `applier.apply_params`). Bez tego pola
+    #: `command_handler._report_guard_result` nie miał skąd wziąć czegokolwiek innego
+    #: niż `[]` — błędy zostawały uwięzione w `executor._last` i nigdy nie docierały
+    #: do chmury. To regresja wobec implementacji sprzed Fazy A.
+    errors: list[dict[str, str]] = field(default_factory=list)
 
     @property
     def rejected(self) -> bool:
@@ -195,6 +200,8 @@ class GuardResult:
             # „plan mówił sprzedawaj, a falownik stoi" wygląda na awarię łącza.
             "forced_action": self.forced_action.value if self.forced_action else None,
             "notes": [{"invariant": n.invariant, "message": n.message} for n in self.notes],
+            # R-9: błędy zapisu per-encja muszą być widoczne w raporcie, nie tylko w logu HA.
+            "errors": list(self.errors),
         }
 
 

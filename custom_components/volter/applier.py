@@ -40,6 +40,16 @@ async def apply_params(
         if param_key == "export_limit_enabled":
             entity_id = options.get(OPT_ENTITY_EXPORT_LIMIT_SWITCH, "")
             if not entity_id:
+                # R-3: cichy `continue` bez wpisu do errors sprawiał, że np. I-4
+                # (eksport przy cenie <= 0) mogło "zniknąć bez śladu" — executor
+                # ustawiał ERROR tylko gdy errors było niepuste, więc brak błędu
+                # + brak zapisu wyglądały jak SUCCESS/PARTIAL, czyli jak zadziałane
+                # zabezpieczenie, mimo że nic nie poszło do falownika.
+                errors.append({
+                    "entity": param_key,
+                    "error": "encja przełącznika limitu eksportu niezmapowana w opcjach integracji",
+                })
+                _LOGGER.warning("Param %s: encja niezmapowana, zapis pominięty [R-3]", param_key)
                 continue
             service = "turn_on" if value else "turn_off"
             ok, err = await _call(hass, "switch", service, {"entity_id": entity_id})
@@ -51,12 +61,25 @@ async def apply_params(
 
         mapping = COMMAND_ENTITY_MAP.get(param_key)
         if not mapping:
+            # R-3: parametr bez mapowania w ogóle (dziś nieosiągalne przez sanitize_params,
+            # ale defensywnie) — traktuj identycznie jak niezmapowaną encję, nie jako
+            # milczący brak zainteresowania.
+            errors.append({
+                "entity": param_key,
+                "error": f"parametr {param_key} nie ma zdefiniowanego mapowania na encję",
+            })
             continue
 
         opt_key, ha_domain, ha_service, data_key = mapping
         entity_id = options.get(opt_key, "")
         if not entity_id:
-            _LOGGER.debug("Param %s: encja niezmapowana, pomijam", param_key)
+            # R-3: patrz komentarz wyżej przy export_limit_enabled — ta sama luka,
+            # druga gałąź kodu.
+            errors.append({
+                "entity": param_key,
+                "error": f"encja dla parametru {param_key} niezmapowana w opcjach integracji",
+            })
+            _LOGGER.warning("Param %s: encja niezmapowana, zapis pominięty [R-3]", param_key)
             continue
 
         ok, err = await _call(
