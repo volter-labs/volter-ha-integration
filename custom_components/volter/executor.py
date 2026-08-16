@@ -54,7 +54,7 @@ from .guards import (
 )
 from .ha_state import read_device_state, read_inverter_limits
 from .mappers import slot_to_params
-from .schedule import Schedule, Slot
+from .schedule import Fallback, Schedule, Slot
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -141,6 +141,15 @@ class VolterExecutor:
             mode=str(options.get(OPT_USER_MODE, "autarky")),
         )
 
+        # R-6: I-4 jest inwariantem (poziom 4 hierarchii specyfikacji), nie regułą
+        # planu — ma bronić także przed komendą operatora. Ścieżka SET_WORK_MODE
+        # z chmury nie niesie ceny wcale (domyślne `None`), więc bez tego I-4 było
+        # martwe dokładnie tam, gdzie miało chronić przed poleceniem z zewnątrz.
+        effective_price = price_pln_kwh
+        if effective_price is None and self._schedule is not None:
+            current_slot, _ = self._schedule.effective_slot(datetime.now(timezone.utc))
+            effective_price = current_slot.price_pln_kwh
+
         # I-10 — fail-closed
         try:
             clean = sanitize_params(raw_params, limits)
@@ -156,7 +165,7 @@ class VolterExecutor:
             state=state,
             limits=limits,
             config=cfg,
-            price_pln_kwh=price_pln_kwh,
+            price_pln_kwh=effective_price,
             # R-1: bez jawnej intencji guardy musiałyby zgadywać kierunek z nazw trybów
             # falownika, których świadomie nie znają — I-1 i I-2 były przez to martwe
             # na całej ścieżce harmonogramu.
@@ -165,7 +174,12 @@ class VolterExecutor:
             max_soc_jump_pp=MAX_SOC_JUMP_PP,
         )
         result = apply_guards(clean, ctx)
-        self._prev_soc = state.soc if state.soc is not None else self._prev_soc
+        # R-5: baseline SoC dla NASTĘPNEGO przebiegu aktualizujemy WYŁĄCZNIE z odczytów,
+        # które same przeszły I-9. Dawniej ta linia biegła bezwarunkowo — odczyt odrzucony
+        # jako fizycznie niemożliwy skok stawał się zaufanym punktem odniesienia już w
+        # kolejnym ticku, więc I-9 chroniło przez dokładnie jeden przebieg.
+        if not any(note.invariant == "I-9" for note in result.notes):
+            self._prev_soc = state.soc if state.soc is not None else self._prev_soc
 
         for note in result.notes:
             _LOGGER.info("[%s] guard %s: %s", source, note.invariant, note.message)
@@ -285,9 +299,31 @@ class VolterExecutor:
         await self._async_execute_now()
 
     async def _async_execute_now(self) -> GuardResult:
+        options = dict(self._entry.options)
+
         if self._schedule is None:
-            _LOGGER.debug("Brak harmonogramu — nic do wykonania")
-            return GuardResult(params={}, status=Status.SUCCESS)
+            # R-11: brak harmonogramu to stan DOMYŚLNY po instalacji i po restarcie
+            # z pustym storage — nie wolno go traktować inaczej niż wygaśnięcie planu.
+            # Cichy SUCCESS bez zapisu zostawiał falownik na dowolnej wcześniejszej
+            # nastawie; I-5 wymaga jawnego fallbacku (self_consume + rezerwa
+            # użytkownika), nie „nic nie rób".
+            reserve = float(options.get(OPT_SOC_RESERVE, DEFAULT_SOC_RESERVE))
+            fallback = Fallback(action=Action.SELF_CONSUME, soc_reserve=reserve)
+            slot = fallback.as_slot(datetime.now(timezone.utc))
+            _LOGGER.info(
+                "Brak harmonogramu — wchodzę w domyślny fallback: self_consume, "
+                "rezerwa %s%% [I-5]",
+                reserve,
+            )
+            rated = float(options.get(OPT_RATED_POWER_W, DEFAULT_RATED_POWER_W))
+            params = slot_to_params(slot, rated_power_w=rated)
+            return await self.async_apply(
+                params,
+                price_pln_kwh=slot.price_pln_kwh,
+                action=slot.action,
+                source="fallback",
+                slot=slot,
+            )
 
         now = datetime.now(timezone.utc)
         slot, is_fallback = self._schedule.effective_slot(now)
@@ -299,7 +335,6 @@ class VolterExecutor:
                 self._schedule.fallback.soc_reserve,
             )
 
-        options = dict(self._entry.options)
         rated = float(options.get(OPT_RATED_POWER_W, DEFAULT_RATED_POWER_W))
         params = slot_to_params(slot, rated_power_w=rated)
 
