@@ -14,7 +14,7 @@ from typing import Any
 from homeassistant.core import HomeAssistant
 
 from .const import COMMAND_ENTITY_MAP, OPT_ENTITY_EXPORT_LIMIT_SWITCH, WRITE_RETRIES
-from .guards import ordered
+from .guards import WritePermit, ordered
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -28,11 +28,49 @@ def _is_forced(param_key: str, forced_params: set[str] | None) -> bool:
     return forced_params is None or param_key in forced_params
 
 
+def _pominiete_po_odebraniu(
+    pozostale: list[tuple[str, Any]],
+    permit: WritePermit,
+    executed: list[str],
+) -> list[dict[str, str]]:
+    """S-5b: rozlicz nastawy, które nie poszły, bo sekwencja straciła przepustkę.
+
+    DLACZEGO to są `errors`, a nie `notes`: przerwana sekwencja zostawia falownik
+    w stanie, któremu ma zapobiegać `PARAM_ORDER` (np. nowy tryb ze starymi limitami).
+    Przerwanie jest tu MNIEJSZYM złem niż dokończenie — dokończona sekwencja pisze
+    do falownika, którego pilnuje już inny właściciel, i rozjeżdża jego `WriteThrottle`
+    ze stanem fizycznym (S-1 przez granicę executora). Skoro jednak wybieramy złamanie
+    `PARAM_ORDER`, to musi ono być GŁOŚNE: każda pominięta nastawa z osobna, z powodem
+    i z informacją, co zdążyło pójść przed przerwaniem. Cichy `break` przywracałby
+    dokładnie ten stan połowiczny, którego niewidzialność była treścią S-5.
+    """
+    permit.aborted = True
+    zapisane = ", ".join(executed) or "nic"
+    _LOGGER.error(
+        "Sekwencja nastaw przerwana (%s) — PARAM_ORDER złamany: zapisano [%s], "
+        "pominięto [%s] [S-5b]",
+        permit.reason or "przepustka odebrana",
+        zapisane,
+        ", ".join(k for k, _v in pozostale),
+    )
+    return [
+        {
+            "entity": param_key,
+            "error": (
+                f"sekwencja nastaw przerwana ({permit.reason or 'przepustka odebrana'}) "
+                f"— parametr nie został zapisany, PARAM_ORDER złamany po [{zapisane}] [S-5b]"
+            ),
+        }
+        for param_key, _value in pozostale
+    ]
+
+
 async def apply_params(
     hass: HomeAssistant,
     options: dict,
     params: dict[str, Any],
     forced_params: set[str] | None = None,
+    permit: WritePermit | None = None,
 ) -> tuple[list[str], list[dict[str, str]], list[dict[str, str]]]:
     """Zapisz parametry w jawnej kolejności (`guards.ordered`).
 
@@ -56,12 +94,26 @@ async def apply_params(
         Dosłowne traktowanie obu grup identycznie (naprawa R-3 w rundzie 1)
         zamieniało legalną konfigurację (świadomy brak mapowania encji
         opcjonalnej) w trwały ERROR co przebieg pętli (RR-3).
+
+    S-5b: `permit` (`guards.WritePermit`) to odbieralne prawo tej sekwencji do
+    dotykania falownika. Sprawdzamy je PRZED każdą nastawą i między ponowieniami,
+    bo tylko tam przerwanie jest policzalne — w środku service calla nie da się
+    powiedzieć, czy wartość doszła. Odebranie przepustki (executor zatrzymany albo
+    nowy przebieg przestał czekać na porzuconą sekwencję) przerywa pętlę, a KAŻDA
+    nastawa, która przez to nie poszła, trafia do `errors` z jawną informacją
+    o złamanym `PARAM_ORDER`. Cisza byłaby tu gorsza niż samo przerwanie: to właśnie
+    niewidzialny stan połowiczny był treścią pierwotnego S-5.
     """
     executed: list[str] = []
     errors: list[dict[str, str]] = []
     notes: list[dict[str, str]] = []
 
-    for param_key, value in ordered(params):
+    kolejka = ordered(params)
+    for indeks, (param_key, value) in enumerate(kolejka):
+        if permit is not None and not permit.valid():
+            errors.extend(_pominiete_po_odebraniu(kolejka[indeks:], permit, executed))
+            break
+
         if param_key == "export_limit_enabled":
             entity_id = options.get(OPT_ENTITY_EXPORT_LIMIT_SWITCH, "")
             if not entity_id:
@@ -100,7 +152,7 @@ async def apply_params(
                     )
                 continue
             service = "turn_on" if value else "turn_off"
-            ok, err = await _call(hass, "switch", service, {"entity_id": entity_id})
+            ok, err = await _call(hass, "switch", service, {"entity_id": entity_id}, permit)
             if ok:
                 executed.append(param_key)
             else:
@@ -153,7 +205,7 @@ async def apply_params(
             continue
 
         ok, err = await _call(
-            hass, ha_domain, ha_service, {"entity_id": entity_id, data_key: value}
+            hass, ha_domain, ha_service, {"entity_id": entity_id, data_key: value}, permit
         )
         if ok:
             executed.append(param_key)
@@ -166,7 +218,11 @@ async def apply_params(
 
 
 async def _call(
-    hass: HomeAssistant, domain: str, service: str, data: dict[str, Any]
+    hass: HomeAssistant,
+    domain: str,
+    service: str,
+    data: dict[str, Any],
+    permit: WritePermit | None = None,
 ) -> tuple[bool, str]:
     last_error = ""
     for attempt in range(1, WRITE_RETRIES + 1):
@@ -177,6 +233,15 @@ async def _call(
             last_error = str(err)
             if attempt < WRITE_RETRIES:
                 await asyncio.sleep(1.0 * attempt)
+                # S-5b: backoff to najdłuższe `await` w całym torze zapisu (1 s + 2 s),
+                # więc przepustkę odbiera się najczęściej właśnie tutaj. Ponowienie po
+                # utracie prawa zapisu byłoby dokładnie tym, przed czym broni ustalenie:
+                # nastawą trafiającą do falownika, którego pilnuje już kto inny.
+                if permit is not None and not permit.valid():
+                    return False, (
+                        f"ponowienie porzucone — sekwencja straciła przepustkę "
+                        f"({permit.reason}) [S-5b]"
+                    )
     return False, last_error
 
 

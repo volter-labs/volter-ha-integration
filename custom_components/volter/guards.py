@@ -994,6 +994,47 @@ class RequestDeduplicator:
             self._set.discard(self._seen.pop(0))
 
 
+class WritePermit:
+    """S-5b: odbieralne pozwolenie sekwencji nastaw na dotknięcie falownika.
+
+    DLACZEGO w ogóle istnieje: naprawa S-5 zrobiła sekwencję zapisu nieprzerywalną
+    (`asyncio.shield` + zadanie odpalane poza śledzeniem HA), żeby anulowanie nie
+    zostawiało falownika w nowym trybie ze starymi limitami. Kupiła tym jednak wadę
+    o piętro wyżej: sekwencja przeżywała `async_stop()` i pisała do falownika już po
+    wyładowaniu integracji, ścigając się z NOWYM executorem powołanym przez reload.
+    Zapis, który przeżył swojego właściciela, nie ma prawa dotknąć falownika.
+
+    DLACZEGO przepustka, a nie `task.cancel()`: anulowanie przerywa zadanie w dowolnym
+    miejscu, także w środku `await` na service callu — czyli dokładnie tam, gdzie
+    przerwanie jest niewidoczne i nierozliczalne (sonda E, pierwotne S-5). Przepustka
+    przerywa sekwencję WYŁĄCZNIE na granicy między nastawami, więc przerwanie jest
+    zawsze policzalne: wiadomo, co poszło do falownika, a co nie.
+
+    Obiekt trzymają DWIE strony naraz: executor (żeby móc odebrać prawo) i sama
+    sekwencja (żeby przeżyć wyzerowanie uchwytu w executorze). Dlatego jest zwykłym
+    obiektem, a nie polem executora — sekwencja musi widzieć odebranie prawa także
+    wtedy, gdy jej właściciel już nie istnieje.
+    """
+
+    def __init__(self) -> None:
+        self._valid = True
+        self.reason = ""
+        #: Ustawia `applier.apply_params`, gdy przepustka faktycznie PRZERWAŁA sekwencję.
+        #: Odbieranie przepustki tuż po ostatniej nastawie niczego nie przerywa, a
+        #: nota o złamanym PARAM_ORDER musi opisywać to, co naprawdę zaszło.
+        self.aborted = False
+
+    def valid(self) -> bool:
+        return self._valid
+
+    def revoke(self, reason: str) -> None:
+        """Odbierz prawo zapisu. Powód jedzie dalej do logu i do śladu w `_last`."""
+        if not self._valid:
+            return
+        self._valid = False
+        self.reason = reason
+
+
 def infer_action(params: dict[str, Any]) -> Action:
     """Wywnioskuj kierunek z parametrów — potrzebne dla I-8 przy starym kontrakcie.
 
@@ -1034,6 +1075,7 @@ __all__ = [
     "ReserveHysteresis",
     "Status",
     "UserConfig",
+    "WritePermit",
     "WriteThrottle",
     "apply_guards",
     "infer_action",

@@ -140,10 +140,35 @@ class VolterCommandHandler:
             # ślad w executorze) nigdy nie dostawała szansy się wykonać, bo HA szedł
             # dalej z wyładowaniem integracji. Czekamy z twardym limitem, żeby zawieszony
             # nasłuch nie blokował przeładowania.
-            try:
-                await asyncio.wait_for(self._listen_task, timeout=STOP_LISTEN_TIMEOUT_S)
-            except (asyncio.CancelledError, TimeoutError):
-                pass
+            #
+            # S-5d: `wait_for(task)` + `except CancelledError: pass` mieszało dwa
+            # zupełnie różne zdarzenia w jednym `except`: „zadanie nasłuchu zakończyło
+            # się anulowaniem" (oczekiwane — sami je anulowaliśmy linię wyżej) oraz
+            # „ktoś anulował WOŁAJĄCEGO `async_stop`". To drugie było połykane, wbrew
+            # zasadzie przyjętej w tym samym commicie w `executor._poczekaj_na_zapis`
+            # i w `_execute_command`: anulowania nie wolno zamieniać na normalny powrót,
+            # bo zatrzymywanie HA przestaje wtedy działać.
+            #
+            # `asyncio.wait` rozdziela te przypadki STRUKTURALNIE, a nie zgadywaniem po
+            # stanie zadania: zakończenie zadania (w tym anulowaniem) wraca jako wynik
+            # w zbiorze `done`, a `CancelledError` może z niego wylecieć wyłącznie
+            # wtedy, gdy anulowano nas samych. Wariant `except CancelledError` +
+            # sprawdzenie `task.cancelled()` odrzucony świadomie — przy jednoczesnym
+            # anulowaniu obu stron nadal połykałby anulowanie wołającego.
+            zakonczone, _ = await asyncio.wait(
+                {self._listen_task}, timeout=STOP_LISTEN_TIMEOUT_S
+            )
+            if not zakonczone:
+                _LOGGER.warning(
+                    "Nasłuch nie zakończył się w %.0fs po anulowaniu — idę dalej "
+                    "z wyładowaniem [S-5d]", STOP_LISTEN_TIMEOUT_S,
+                )
+            elif not self._listen_task.cancelled() and self._listen_task.exception():
+                # Bez odebrania wyjątku asyncio zgłosiłoby „Task exception was never
+                # retrieved" długo po wyładowaniu, bez związku z tym miejscem.
+                _LOGGER.warning(
+                    "Nasłuch zakończył się błędem: %s", self._listen_task.exception()
+                )
 
         await self._close_ws()
         _LOGGER.debug("Command handler stopped")

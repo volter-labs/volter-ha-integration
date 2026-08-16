@@ -60,6 +60,7 @@ from .guards import (
     ReserveHysteresis,
     Status,
     UserConfig,
+    WritePermit,
     WriteThrottle,
     apply_guards,
     infer_action,
@@ -132,6 +133,16 @@ class VolterExecutor:
         # Bez niego `async_stop` nie miał czego pilnować i wyładowywał integrację
         # w środku PARAM_ORDER — falownik zostawał w nowym trybie ze starymi limitami.
         self._inflight: asyncio.Future[GuardResult] | None = None
+        # S-5b: przepustka TRWAJĄCEJ sekwencji — jedyny sposób, żeby ją zatrzymać bez
+        # anulowania jej w środku service calla. `asyncio.shield` chronił sekwencję tak
+        # skutecznie, że przeżywała `async_stop` i pisała do falownika po wyładowaniu
+        # integracji, ścigając się z nowym executorem powołanym przez reload.
+        self._przepustka: WritePermit | None = None
+        # S-5b: po rozpoczęciu `async_stop` executor nie jest już właścicielem falownika.
+        # Przebieg, który czekał na `_write_lock`, nie może po wyładowaniu zacząć NOWEJ
+        # sekwencji — powołałby świeżą przepustkę, której nikt już nie odbierze, czyli
+        # obszedłby tę naprawę bokiem.
+        self._zatrzymany = False
         self._direction = DirectionLimiter(max_changes_per_hour=MAX_DIRECTION_CHANGES_PER_HOUR)
         # S-4: zatrzask progu rezerwy (I-1). Stan MIĘDZY przebiegami, dokładnie jak
         # `_direction` i `_throttle` — bez pamięci histereza jest tylko przesuniętym progiem.
@@ -183,39 +194,78 @@ class VolterExecutor:
         if self._unsub is not None:
             self._unsub()
             self._unsub = None
+        # S-5b: flaga PRZED czekaniem, nie po nim. `async_stop` nie trzyma `_write_lock`,
+        # więc przebieg stojący w kolejce po zamek (tick złapany w locie albo komenda
+        # z chmury) wystartowałby w środku wyładowania i powołał świeżą sekwencję
+        # z przepustką, której nikt by już nie odebrał — dokładnie obejście tej naprawy.
+        self._zatrzymany = True
         # S-5: zatrzymanie executora MUSI poczekać na trwający zapis — inaczej HA
         # wyładowuje integrację w środku sekwencji PARAM_ORDER (ścieżka realna przy
         # KAŻDEJ zmianie opcji: update listener -> async_reload -> async_unload_entry).
-        await self._poczekaj_na_zapis()
+        await self._poczekaj_na_zapis("executor zatrzymany — wyładowanie integracji")
+        # S-5b: bezwarunkowo, na wyjściu — po `async_stop` żadna sekwencja nie ma prawa
+        # dotknąć falownika, niezależnie od tego, czy czekanie skończyło się w limicie.
+        # To jest granica własności: od tej chwili falownikiem rządzi executor powołany
+        # przez reload, a stara sekwencja pisałaby mu pod ręką (S-1 o piętro wyżej).
+        if self._przepustka is not None:
+            self._przepustka.revoke("executor zatrzymany")
         _LOGGER.info("Executor zatrzymany")
 
-    async def _poczekaj_na_zapis(self) -> None:
-        """S-5: poczekaj na dokończenie chronionej sekwencji zapisu (z limitem czasu).
+    async def _poczekaj_na_zapis(self, powod: str) -> None:
+        """S-5/S-5b: poczekaj na sekwencję zapisu, a gdy nie zdąży — ODBIERZ JEJ PRAWO.
 
         Koszt `asyncio.shield` jest realny: opóźnia wyładowanie integracji o czas
         jednej sekwencji nastaw. Jest to jednak koszt OGRANICZONY
         (`STOP_WRITE_TIMEOUT_S`), podczas gdy alternatywa — przerwanie zapisu w połowie
         — zostawia falownik np. w `eco_charge` z limitami z poprzedniego slotu, czyli
-        w stanie, któremu ma zapobiegać PARAM_ORDER, i to na czas nieograniczony
-        (do kolejnego ticku po udanym przeładowaniu, a przy nieudanym — bezterminowo).
+        w stanie, któremu ma zapobiegać PARAM_ORDER.
+
+        S-5b/S-5c — DLACZEGO dwa etapy: samo odpuszczenie czekania (pierwotne S-5)
+        zostawiało sekwencję i przy życiu, i przy prawie do zapisu. Skutek zależał od
+        wołającego: w `async_stop` sekwencja pisała do falownika PO wyładowaniu
+        integracji (S-5b), a w `async_apply` przeplatała się z nowym przebiegiem, czyli
+        znosiła serializację S-1 wewnątrz jednego executora (S-5c). Limit czasu jest
+        więc potrzebny, ale sam w sobie nie może być furtką: po jego upływie ODBIERAMY
+        przepustkę i czekamy drugi raz. Sekwencja przerywa się na najbliższej granicy
+        między nastawami, więc drugie czekanie jest z reguły natychmiastowe.
+
+        Gdy i drugie czekanie minie, sekwencja wisi WEWNĄTRZ jednego service calla,
+        którego i tak nie da się cofnąć — ale bez przepustki nie wykona już żadnej
+        następnej nastawy. Tyle da się obiecać uczciwie i dokładnie tyle obiecujemy.
         """
         zadanie = self._inflight
+        przepustka = self._przepustka
         if zadanie is None or zadanie.done():
             return
+        if await self._czekaj_na_zadanie(zadanie):
+            return
+
+        _LOGGER.error(
+            "Zapis do falownika nie zakończył się w %.0fs (%s) — odbieram sekwencji "
+            "prawo zapisu [S-5b]", STOP_WRITE_TIMEOUT_S, powod,
+        )
+        if przepustka is not None:
+            przepustka.revoke(powod)
+        if not await self._czekaj_na_zadanie(zadanie):
+            _LOGGER.error(
+                "Sekwencja nadal nie oddała sterowania — wisi wewnątrz jednego service "
+                "calla. Przepustka odebrana, więc kolejnych nastaw nie wykona [S-5b]"
+            )
+
+    async def _czekaj_na_zadanie(self, zadanie: asyncio.Future[GuardResult]) -> bool:
+        """Czekaj z limitem. `True` = zadanie się zakończyło, `False` = limit minął."""
         try:
             # `shield` w środku, bo `wait_for` po timeoucie anuluje to, na co czeka —
             # a my chcemy odpuścić CZEKANIE, nie przerwać zapis w połowie.
             await asyncio.wait_for(asyncio.shield(zadanie), timeout=STOP_WRITE_TIMEOUT_S)
         except TimeoutError:
-            _LOGGER.error(
-                "Zapis do falownika nie zakończył się w %.0fs — przestaję czekać [S-5]",
-                STOP_WRITE_TIMEOUT_S,
-            )
+            return False
         # `asyncio.CancelledError` świadomie NIE jest tu łapane: to `BaseException`,
         # więc `except Exception` niżej go nie tknie i poleci dalej. Anulowanie samego
         # zatrzymywania musi dojść do wołającego.
         except Exception as err:  # noqa: BLE001
             _LOGGER.warning("Trwający zapis zakończył się błędem: %s [S-5]", err)
+        return True
 
     # ── harmonogram ──────────────────────────────────────────────────────────
 
@@ -313,10 +363,28 @@ class VolterExecutor:
         gdzie jest wprost zapisana w kodzie, i widać ją w jednym miejscu.
         """
         async with self._write_lock:
+            # S-5b: przebieg, który czekał na zamek przez całe wyładowanie integracji,
+            # nie zaczyna nowej sekwencji — falownik ma już innego właściciela.
+            # Sprawdzenie jest ZA zamkiem, bo dopiero tu wiadomo, że nikt inny nie pisze.
+            # Świadomie BEZ `_remember`, mimo reguły R-12 („każde wyjście przez log
+            # decyzji"): `_last` i anty-spam to stan wyładowanego już executora, którego
+            # nikt nie odczyta, a nadpisanie go zatarłoby ślad po tym, co naprawdę
+            # poszło do falownika przed zatrzymaniem. Widoczność daje WARNING niżej.
+            if self._zatrzymany:
+                _LOGGER.warning(
+                    "[%s] Zapis pominięty — executor zatrzymany, falownikiem rządzi "
+                    "już inny właściciel [S-5b]", source,
+                )
+                wynik = GuardResult(params={}, status=Status.ERROR)
+                wynik.note("S-5b", "executor zatrzymany — zapis nie należy już do niego")
+                return wynik
             # S-5: sekwencja zapisu porzucona przez ANULOWANEGO wołającego leci dalej
             # pod `shield` i już nie trzyma zamka — nowy przebieg musi poczekać na jej
             # koniec, inaczej wracamy do przeplotu z S-1 (tyle że tylko po anulowaniu).
-            await self._poczekaj_na_zapis()
+            # S-5c: to czekanie ma limit czasu, więc SAMO w sobie nie wystarcza —
+            # `_poczekaj_na_zapis` odbiera po nim przepustkę, żeby furtka czasowa nie
+            # przepuszczała nowego przebiegu obok wciąż piszącej sekwencji.
+            await self._poczekaj_na_zapis(f"nowy przebieg ({source}) przejmuje tor zapisu")
             return await self._async_apply_locked(
                 raw_params,
                 price_pln_kwh=price_pln_kwh,
@@ -599,8 +667,15 @@ class VolterExecutor:
         # swoje śledzone zadania przy wyładowaniu, czyli robiłoby dokładnie to, przed
         # czym broni to ustalenie. Zadanie jest za to pilnowane przez `_inflight`
         # i awaitowane w `async_stop`, więc nie jest porzucone.
+        # S-5b: przepustka powstaje razem z sekwencją i jest jej jedyną smyczą.
+        # Sekwencja trzyma ją sama (przeżywa wyzerowanie `self._przepustka`), więc
+        # odebranie prawa działa także wtedy, gdy uchwyt w executorze już nie istnieje.
+        przepustka = WritePermit()
+        self._przepustka = przepustka
         zadanie = asyncio.ensure_future(
-            self._async_zapisz_sekwencje(options, writable, result, act, now_ts, source, _report)
+            self._async_zapisz_sekwencje(
+                options, writable, result, act, now_ts, source, _report, przepustka
+            )
         )
         # S-5: zadanie dziedziczy nazwę wołającego, bo sekwencja zapisu JEST jego
         # kontynuacją — log HA, traceback i „kto pisał do falownika" mają dalej
@@ -626,6 +701,9 @@ class VolterExecutor:
         """S-5: uchwyt do trwającego zapisu żyje dokładnie tyle, ile sam zapis."""
         if self._inflight is zadanie:
             self._inflight = None
+            # S-5b: przepustka idzie w parze z uchwytem — odbieranie prawa zapisu
+            # sekwencji, która już się zakończyła, tylko myliłoby diagnozę.
+            self._przepustka = None
 
     def _stempel_anulowania(
         self,
@@ -671,6 +749,7 @@ class VolterExecutor:
         now_ts: float,
         source: str,
         _report: bool,
+        przepustka: WritePermit,
     ) -> GuardResult:
         """S-5: NIEROZERWALNA sekwencja zapisu + jej księgowanie.
 
@@ -679,13 +758,19 @@ class VolterExecutor:
         stronie anulowanego wołającego, throttle nie zapamiętałby wartości, które
         FIZYCZNIE poszły do falownika — i kolejny przebieg zapisałby je ponownie,
         czyli anulowanie kosztowałoby dodatkowy zapis do pamięci nieulotnej (S-4).
+
+        S-5b: „nierozerwalna" znaczy „nie do przerwania W ŚRODKU service calla", a NIE
+        „nie do zatrzymania". Sekwencja pyta o przepustkę przed każdą nastawą, więc
+        właściciel może ją zatrzymać na granicy między nastawami — w jedynym miejscu,
+        w którym przerwanie da się uczciwie rozliczyć.
         """
         # RR-3: `forced_params` rozstrzyga w `apply_params`, czy brak zmapowanej
         # encji dla danego parametru jest błędem (zabezpieczenie guarda) czy tylko
         # widoczną notą (normalny parametr planu, opcjonalna encja świadomie
         # niezmapowana) — patrz `GuardResult.forced_params` i docstring `apply_params`.
         executed, errors, skip_notes = await apply_params(
-            self.hass, options, writable, forced_params=result.forced_params
+            self.hass, options, writable, forced_params=result.forced_params,
+            permit=przepustka,
         )
         # N-4: raport do chmury musi mówić prawdę — `executed` to to, co naprawdę
         # poszło do falownika, nie to, co przeszło guardy (`result.params`).
@@ -700,6 +785,21 @@ class VolterExecutor:
         for skip in skip_notes:
             result.note("RR-3", f"{skip['entity']}: {skip['note']}")
 
+        if przepustka.aborted:
+            # S-5b: przerwanie w połowie łamie PARAM_ORDER (falownik w nowym trybie ze
+            # starymi limitami) i musi być WIDOCZNE — pierwotne S-5 istniało właśnie
+            # dlatego, że ten stan nie był widoczny nigdzie. Nastawy pominięte siedzą
+            # już w `errors` (`applier`), tu dokładamy jedno zdanie o powodzie.
+            result.note(
+                "S-5b",
+                f"sekwencja nastaw przerwana ({przepustka.reason}) — PARAM_ORDER "
+                f"złamany, do falownika doszło tylko {executed or 'nic'}",
+            )
+
+        # S-5b: commitujemy WYŁĄCZNIE `executed`, więc nastawy przerwane przez
+        # odebranie przepustki nie stają się dla I-6 „wartością bez zmiany". Bez tego
+        # kolejny przebieg nigdy by ich nie dopisał — to ten sam trwały rozjazd
+        # plan/rzeczywistość, który zamyka S-1.
         self._throttle.commit({k: writable[k] for k in executed if k in writable}, now_ts)
         self._direction.record(act, now_ts)
 
