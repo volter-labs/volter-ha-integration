@@ -669,20 +669,41 @@ class DirectionLimiter:
         self._current: Action | None = None
 
     def allows(self, action: Action, now_ts: float) -> tuple[bool, Note | None]:
+        if not self._directional_change(action):
+            return True, None
+
+        self._prune(now_ts)
+        return self._decide(action, len(self._history))
+
+    def would_allow(self, action: Action, now_ts: float) -> tuple[bool, Note | None]:
+        """RR-7: jak `allows`, ale bez efektu ubocznego — dla suchego przebiegu
+        (`async_diagnose`). `allows` woła `_prune`, które PRZYPISUJE `self._history`
+        (nową, przyciętą listę) — mutacja stanu, nawet gdy logiczny wynik się nie
+        zmienia. Ta metoda liczy przycięcie w locie, nie zapisując wyniku, żeby
+        kontrakt "suchy przebieg" (zero mutacji) był prawdziwy."""
+        if not self._directional_change(action):
+            return True, None
+
+        cutoff = now_ts - self.window_s
+        changes = sum(1 for ts, _ in self._history if ts >= cutoff)
+        return self._decide(action, changes)
+
+    def _directional_change(self, action: Action) -> bool:
+        """Czy `action` w ogóle MOŻE zużywać budżet I-8 (patrz `allows`/`would_allow`)."""
         directional = (Action.CHARGE, Action.DISCHARGE)
         if action not in directional:
-            return True, None
+            return False
         if self._current == action:
-            return True, None
+            return False
         # R-13b: `_current is None` znaczy "kierunek jeszcze nigdy nie był ustawiony"
         # — pierwsze ustawienie nie jest ZMIANĄ kierunku (nie ma poprzedniego
         # kierunku, względem którego mogłaby zajść zmiana), więc nie zużywa budżetu.
         # Bez tego wyjątku efektywny budżet po starcie był o 1 mniejszy niż N.
         if self._current is None:
-            return True, None
+            return False
+        return True
 
-        self._prune(now_ts)
-        changes = len(self._history)
+    def _decide(self, action: Action, changes: int) -> tuple[bool, Note | None]:
         if changes >= self.max_changes:
             return False, Note(
                 "I-8",

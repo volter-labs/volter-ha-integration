@@ -99,6 +99,11 @@ class VolterExecutor:
         self._prev_soc_ts: float | None = None
         self._last: dict[str, Any] = {}
         self._last_decision: str | None = None
+        # R-12 (reszta): klucz osobny od `_last_decision` — treść notatek guardów
+        # (np. komunikat I-9) może się zmienić niezależnie od tego, czy `decision`
+        # (akcja/params/status/executed) się zmieniła. `None` na starcie gwarantuje,
+        # że pierwszy przebieg zawsze loguje na INFO/WARNING (nie ma z czym porównać).
+        self._last_notes_key: tuple[tuple[str, str], ...] | None = None
         # RR-2: pamięć ostatnich znanych granic nastaw. Bez niej werdykt I-10 zależał od
         # tego, czy encja `number` akurat odpowiada — ta sama komenda dostawała raz
         # `success`, raz `error`. Cache jest per-executor i ginie z restartem HA.
@@ -167,6 +172,7 @@ class VolterExecutor:
         slot: Slot | None = None,
         _remapped: bool = False,
         _extra_forced_params: frozenset[str] = frozenset(),
+        _report: bool = True,
     ) -> GuardResult:
         """Jedyna droga do falownika: sanityzacja → guardy → throttle → zapis.
 
@@ -181,6 +187,13 @@ class VolterExecutor:
         `result.forced_params` PRZED wywołaniem `apply_params`, inaczej brak
         zmapowanej encji trybu wyglądałby jak zwykła nota, a nie jak zniknięcie
         ochrony I-1 (dokładnie ten wzorzec luki, który zamyka RR-3).
+
+        `_report` (RR-5): `False` wyłącznie dla WEWNĘTRZNEGO rekurencyjnego wywołania
+        po `forced_action` (patrz niżej) — ten przebieg nie loguje ani nie aktualizuje
+        `_last_decision` sam, bo przebieg ZEWNĘTRZNY i tak zrobi to za niego z pełnym,
+        scalonym raportem. Bez tego dwa wywołania `_remember` (wewnętrzne i zewnętrzne)
+        nadpisywały sobie nawzajem `_last_decision` w KAŻDYM ticku, więc anty-spam z
+        R-12 nigdy się nie stabilizował (RR-5).
         """
         options = dict(self._entry.options)
         # RR-2: realny tor zapisu UCZY cache granic (i z niego korzysta, gdy encja
@@ -221,7 +234,9 @@ class VolterExecutor:
             # R-12: wczesny return (I-10) musi przejść przez ten sam log decyzji co
             # ścieżka normalna — inaczej seria odrzuceń nigdy nie zmienia
             # `_last_decision` i powrót do sukcesu po niej nie generuje INFO.
-            self._remember(source, result, [], [], action or infer_action(raw_params))
+            # RR-5: gałąź WEWNĘTRZNA (przemapowanie po forced_action) nie loguje sama.
+            if _report:
+                self._remember(source, result, [], [], action or infer_action(raw_params))
             return result
 
         # I-1…I-9
@@ -257,16 +272,20 @@ class VolterExecutor:
             self._prev_soc = state.soc
             self._prev_soc_ts = time.monotonic()
 
-        for note in result.notes:
-            _LOGGER.info("[%s] guard %s: %s", source, note.invariant, note.message)
-
+        # R-12 (reszta): notatki guardów i WARNING „Zapis wstrzymany" NIE są już
+        # logowane tutaj bezwarunkowo — obie linie przeniesione do `_remember`,
+        # gdzie podlegają TEJ SAMEJ regule anty-spamu co linia „Decyzja" (INFO/WARNING
+        # przy zmianie, DEBUG przy powtórce). Wcześniej ta pętla stała PRZED
+        # sprawdzeniem `result.rejected`, więc ścieżka DEGRADED logowała INFO+WARNING
+        # bezwarunkowo na KAŻDYM ticku, mimo że „Decyzja" już była wyciszona.
         if result.rejected:
-            _LOGGER.warning("[%s] Zapis wstrzymany, status=%s", source, result.status.value)
             # R-12: DEGRADED/ERROR/DUPLICATE to wczesny return — bez aktualizacji
             # `_last_decision` tutaj ścieżka DEGRADED nie ma żadnej ochrony przed
-            # anty-spamem (loguje WARNING+INFO co przebieg pętli), a powrót do sukcesu
-            # po awarii z identyczną decyzją co przed nią wygląda jak "bez zmian".
-            self._remember(source, result, [], [], action or infer_action(clean))
+            # anty-spamem, a powrót do sukcesu po awarii z identyczną decyzją co
+            # przed nią wygląda jak "bez zmian".
+            # RR-5: gałąź WEWNĘTRZNA (przemapowanie po forced_action) nie loguje sama.
+            if _report:
+                self._remember(source, result, [], [], action or infer_action(clean))
             return result
 
         # R-1: guard podmienił intencję planu (np. I-1 zdusiło rozładowanie). Zapis
@@ -296,6 +315,14 @@ class VolterExecutor:
                     # zmapowanej encji trybu musi być głośnym błędem (tak jak
                     # I-4 w R-3), nie cichą notą o opcjonalnej encji.
                     _extra_forced_params=frozenset({"mode"}),
+                    # RR-5: przebieg WEWNĘTRZNY nie loguje ani nie aktualizuje
+                    # `_last_decision`/`_last_notes_key` sam — przebieg ZEWNĘTRZNY
+                    # (kilka linii niżej) i tak woła `_remember` z pełnym, scalonym
+                    # raportem `forced`. Bez tego dwa wywołania `_remember` (z różnymi
+                    # kluczami decyzji: `success` z wewnętrznego, `partial` ze
+                    # scalonego) nadpisywały sobie `_last_decision` na KAŻDYM ticku —
+                    # anty-spam R-12 nigdy się nie stabilizował (sonda P2, RR-5).
+                    _report=False,
                 )
                 # Powód wymuszenia (nota I-1) powstał w PIERWSZYM przebiegu — bez przeniesienia
                 # go dalej raport do chmury nie tłumaczyłby, czemu plan nie został wykonany.
@@ -329,15 +356,26 @@ class VolterExecutor:
         now_ts = time.monotonic()
 
         # I-8 — anty-oscylacja
-        act = action or infer_action(result.params)
+        # RR-6: gdy guard wymusił inną akcję niż żądana (I-1, gałąź bez slotu —
+        # ta ZE slotem wraca wcześniej przez rekurencję z jawnym `action=forced_action`),
+        # DirectionLimiter i throttling I-8 muszą widzieć akcję EFEKTYWNĄ
+        # (`result.forced_action`), a NIE żądaną przez wołającego. Inaczej
+        # `_direction.record()` niżej zapisywałby kierunek, który guard I-1 właśnie
+        # zablokował — nic rozładowującego nie idzie do falownika, a mimo to
+        # `_direction._current` pokazywałby DISCHARGE (sonda P6, RR-6).
+        act = result.forced_action or action or infer_action(result.params)
         allowed, note = self._direction.allows(act, now_ts)
         if not allowed and note is not None:
             result.status = Status.THROTTLED
             result.note(note.invariant, note.message)
-            _LOGGER.info("[%s] guard %s: %s", source, note.invariant, note.message)
-            # R-12: THROTTLED to też wczesny return — musi zaktualizować `_last_decision`
-            # tak samo jak ścieżka normalna.
-            self._remember(source, result, [], [], act)
+            # RR-5: manualny log usunięty — notatka I-8 dołożona linię wyżej trafia
+            # do `result.notes`, więc `_remember` (wołane niżej) ją zaloguje sama,
+            # z anty-spamem R-12 (reszta). Podwójne logowanie (raz tu, raz w
+            # `_remember`) dawałoby dwa wpisy na tę samą notatkę.
+            # RR-5: gałąź WEWNĘTRZNA (przemapowanie po forced_action) nie loguje sama
+            # — `_report=False` w rekurencyjnym wywołaniu, patrz docstring `_report`.
+            if _report:
+                self._remember(source, result, [], [], act)
             return result
 
         # I-6 — throttling zapisów (ochrona pamięci nieulotnej falownika)
@@ -385,7 +423,14 @@ class VolterExecutor:
         # R-12: log decyzji (anty-spam + `_last_decision`) przeniesiony do `_remember`,
         # żeby DZIAŁAŁ TAKŻE na wczesnych returnach (I-10, I-1..I-9, I-8) — patrz
         # komentarz przy `_remember`.
-        self._remember(source, result, executed, errors, act)
+        # RR-5: gałąź WEWNĘTRZNA (przemapowanie po forced_action) nie loguje sama —
+        # bez tej bramki przebieg wewnętrzny (status np. `success`) i przebieg
+        # zewnętrzny scalony (status np. `partial`) wołały `_remember` osobno z
+        # DWOMA różnymi kluczami decyzji, które nadpisywały się nawzajem —
+        # `decision != self._last_decision` było prawdziwe na KAŻDYM ticku, mimo
+        # ustabilizowanego stanu (sonda P2, RR-5).
+        if _report:
+            self._remember(source, result, executed, errors, act)
         return result
 
     # ── pętla ────────────────────────────────────────────────────────────────
@@ -583,10 +628,15 @@ class VolterExecutor:
             # R-7: `async_apply` sprawdza I-8 (anty-oscylacja) PO guardach, a PRZED
             # throttlingiem — diagnose musi odwzorować dokładnie tę kolejność, inaczej
             # raportuje `status='success'` i pełne `would_write` tam, gdzie realny
-            # `async_apply` zwróciłby THROTTLED. `allows`, NIGDY `record`: sam odczyt
-            # nie może zmienić stanu `DirectionLimiter` — to suchy przebieg.
+            # `async_apply` zwróciłby THROTTLED. `would_allow`, NIGDY `allows`/`record`:
+            # sam odczyt nie może zmienić stanu `DirectionLimiter` — to suchy przebieg
+            # (RR-7: `allows` mutuje `self._history` przez `_prune`, mimo że jest
+            # tylko sprawdzeniem — `would_allow` jest jej nie-mutującym odpowiednikiem).
             act = slot_action or infer_action(guarded.params)
-            allowed, direction_note = self._direction.allows(act, time.monotonic())
+            # RR-7: `allows()` woła `_prune`, które PRZYPISUJE `self._history` —
+            # mutacja stanu, nawet gdy wpis jest i tak poza oknem. Suchy przebieg
+            # musi użyć `would_allow`, jego nie-mutującego odpowiednika.
+            allowed, direction_note = self._direction.would_allow(act, time.monotonic())
             if not allowed and direction_note is not None:
                 report["guards"]["status"] = Status.THROTTLED.value
                 report["guards"]["notes"].append(
@@ -630,6 +680,26 @@ class VolterExecutor:
             "errors": errors,
             **result.as_report(),
         }
+
+        # R-12 (reszta): notatki guardów (np. „guard I-9: …") i WARNING „Zapis
+        # wstrzymany" podlegają TEJ SAMEJ regule anty-spamu co linia „Decyzja" niżej —
+        # INFO/WARNING przy zmianie treści, DEBUG przy dokładnym powtórzeniu. Klucz
+        # jest OSOBNY od `_last_decision`: treść notatek (np. inny komunikat I-9) może
+        # się zmienić, mimo że `decision` (akcja/params/status/executed) zostaje ta
+        # sama — i odwrotnie. Wcześniej ta pętla stała PRZED sprawdzeniem
+        # `result.rejected` w `async_apply` i logowała bezwarunkowo na KAŻDYM ticku
+        # ścieżki DEGRADED (reszta R-12 z rundy 2, RR-7-doc pkt „R-12 (reszta)").
+        notes_key = tuple((n.invariant, n.message) for n in result.notes)
+        notes_changed = notes_key != self._last_notes_key
+        note_level = logging.INFO if notes_changed else logging.DEBUG
+        for note in result.notes:
+            _LOGGER.log(note_level, "[%s] guard %s: %s", source, note.invariant, note.message)
+        if result.rejected:
+            warn_level = logging.WARNING if notes_changed else logging.DEBUG
+            _LOGGER.log(
+                warn_level, "[%s] Zapis wstrzymany, status=%s", source, result.status.value
+            )
+        self._last_notes_key = notes_key
 
         # R-12: `_remember` jest jedynym miejscem wołanym z KAŻDEJ ścieżki wyjścia
         # `async_apply` — łącznie z wczesnymi returnami (błąd sanityzacji I-10,
