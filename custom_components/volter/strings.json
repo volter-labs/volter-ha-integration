@@ -52,6 +52,15 @@
           "entity_eco_mode_power": "Eco Mode Power (%)",
           "entity_eco_mode_soc": "Eco Mode SOC Target (%)"
         }
+      },
+      "strategy": {
+        "title": "Strategy — Guard parameters",
+        "description": "These values drive the safety guards. SoC reserve is never crossed in Backup mode.",
+        "data": {
+          "soc_reserve": "Battery reserve (SoC %)",
+          "user_mode": "User mode",
+          "rated_power_w": "Inverter rated power (W)"
+        }
       }
     }
   }

@@ -22,6 +22,8 @@ from .const import (
     CONF_DEVICE_ID,
     CONF_SUPABASE_ANON_KEY,
     CONF_SUPABASE_URL,
+    DEFAULT_RATED_POWER_W,
+    DEFAULT_SOC_RESERVE,
     DEFAULT_SUPABASE_URL,
     DOMAIN,
     OPT_ENTITY_BATTERY_POWER,
@@ -39,6 +41,9 @@ from .const import (
     OPT_ENTITY_PV_ENERGY_TOTAL,
     OPT_ENTITY_PV_POWER,
     OPT_ENTITY_SOC,
+    OPT_RATED_POWER_W,
+    OPT_SOC_RESERVE,
+    OPT_USER_MODE,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -241,7 +246,7 @@ class VolterOptionsFlow(OptionsFlowWithConfigEntry):
             self._options.update(
                 {k: v for k, v in user_input.items() if v}
             )
-            return self.async_create_entry(data=self._options)
+            return await self.async_step_strategy()
 
         return self.async_show_form(
             step_id="control",
@@ -288,6 +293,55 @@ class VolterOptionsFlow(OptionsFlowWithConfigEntry):
                         default=self._options.get(OPT_ENTITY_ECO_MODE_SOC, ""),
                     ): selector.EntitySelector(
                         selector.EntitySelectorConfig(domain="number")
+                    ),
+                }
+            ),
+        )
+
+    async def async_step_strategy(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Krok 4: Strategia — parametry, na których pracują guardy I-1 i I-7.
+
+        Bez tego kroku guardy chodziły na defaultach: rezerwa 20%, tryb autarky,
+        moc znamionowa 10 kW (N-2).
+        """
+        if user_input is not None:
+            self._options.update(user_input)
+            return self.async_create_entry(data=self._options)
+
+        return self.async_show_form(
+            step_id="strategy",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        OPT_SOC_RESERVE,
+                        default=self._options.get(OPT_SOC_RESERVE, DEFAULT_SOC_RESERVE),
+                    ): selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=0, max=100, step=1,
+                            mode=selector.NumberSelectorMode.SLIDER,
+                            unit_of_measurement="%",
+                        )
+                    ),
+                    vol.Required(
+                        OPT_USER_MODE,
+                        default=self._options.get(OPT_USER_MODE, "autarky"),
+                    ): selector.SelectSelector(
+                        selector.SelectSelectorConfig(
+                            options=["earn", "autarky", "backup"],
+                            translation_key="user_mode",
+                        )
+                    ),
+                    vol.Required(
+                        OPT_RATED_POWER_W,
+                        default=self._options.get(OPT_RATED_POWER_W, DEFAULT_RATED_POWER_W),
+                    ): selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=1000, max=50000, step=100,
+                            mode=selector.NumberSelectorMode.BOX,
+                            unit_of_measurement="W",
+                        )
                     ),
                 }
             ),

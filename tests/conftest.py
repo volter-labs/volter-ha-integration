@@ -140,6 +140,24 @@ class _FakeConfigEntry:
     def async_on_unload(self, _fn): ...
 
 
+class _FakeConfigFlow:
+    """Odpowiednik homeassistant.config_entries.ConfigFlow.
+
+    Prawdziwy ConfigFlow obsługuje `class X(ConfigFlow, domain=...)` przez
+    `__init_subclass__` — zwykły `object` tego nie umie i wywala TypeError.
+    """
+
+    def __init_subclass__(cls, *, domain: str | None = None, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+
+
+class _FakeOptionsFlow:
+    """Odpowiednik homeassistant.config_entries.OptionsFlowWithConfigEntry."""
+
+    def __init__(self, config_entry: _FakeConfigEntry) -> None:
+        self.config_entry = config_entry
+
+
 class FakeHass:
     """Minimalny odpowiednik obiektu `hass` — tyle, ile potrzebują nasze moduły."""
 
@@ -181,10 +199,10 @@ _make_module("homeassistant.const", {"Platform": MagicMock()})
 _make_module("homeassistant.exceptions", {"HomeAssistantError": Exception})
 _make_module("homeassistant.config_entries", {
     "ConfigEntry": _FakeConfigEntry,
-    "ConfigFlow": object,
+    "ConfigFlow": _FakeConfigFlow,
     "ConfigFlowResult": dict,
-    "OptionsFlow": object,
-    "OptionsFlowWithConfigEntry": object,
+    "OptionsFlow": _FakeConfigFlow,
+    "OptionsFlowWithConfigEntry": _FakeOptionsFlow,
 })
 _make_module("homeassistant.helpers")
 _make_module("homeassistant.helpers.storage", {"Store": _FakeStore})
