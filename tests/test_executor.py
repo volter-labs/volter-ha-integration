@@ -66,3 +66,23 @@ async def test_n4_blad_zapisu_nie_trafia_do_executed(fake_entry):
 
     assert result.executed == []
     assert result.status is Status.ERROR
+
+
+@pytest.mark.asyncio
+async def test_zmiana_decyzji_loguje_info_powtorka_debug(fake_entry, caplog):
+    import logging
+
+    hass = _hass_ze_swiezym_stanem()
+    fake_entry.options = dict(OPTIONS)
+    executor = VolterExecutor(hass, fake_entry)
+
+    with caplog.at_level(logging.INFO, logger="custom_components.volter.executor"):
+        await executor.async_apply({"eco_soc": 40.0}, source="schedule")
+        pierwszy = [r for r in caplog.records if r.levelno == logging.INFO]
+
+        caplog.clear()
+        await executor.async_apply({"eco_soc": 40.0}, source="schedule")
+        drugi = [r for r in caplog.records if r.levelno == logging.INFO]
+
+    assert pierwszy, "pierwsza decyzja musi byc na INFO"
+    assert not drugi, "powtorzona decyzja nie moze smiecic w logu"

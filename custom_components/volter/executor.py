@@ -71,6 +71,7 @@ class VolterExecutor:
         self._direction = DirectionLimiter(max_changes_per_hour=MAX_DIRECTION_CHANGES_PER_HOUR)
         self._prev_soc: float | None = None
         self._last: dict[str, Any] = {}
+        self._last_decision: str | None = None
 
     # ── cykl życia ───────────────────────────────────────────────────────────
 
@@ -180,23 +181,38 @@ class VolterExecutor:
             result.note(tn.invariant, tn.message)
             _LOGGER.debug("[%s] guard %s: %s", source, tn.invariant, tn.message)
 
+        executed: list[str] = []
+        errors: list[dict[str, str]] = []
+
         if not writable:
-            _LOGGER.debug("[%s] Brak zmian do zapisania", source)
-            self._remember(source, result, [], [])
-            return result
+            result.executed = []
+        else:
+            executed, errors = await apply_params(self.hass, options, writable)
+            # N-4: raport do chmury musi mówić prawdę — `executed` to to, co naprawdę
+            # poszło do falownika, nie to, co przeszło guardy (`result.params`).
+            result.executed = executed
 
-        executed, errors = await apply_params(self.hass, options, writable)
-        # N-4: raport do chmury musi mówić prawdę — `executed` to to, co naprawdę
-        # poszło do falownika, nie to, co przeszło guardy (`result.params`).
-        result.executed = executed
+            self._throttle.commit({k: writable[k] for k in executed if k in writable}, now_ts)
+            self._direction.record(act, now_ts)
 
-        self._throttle.commit({k: writable[k] for k in executed if k in writable}, now_ts)
-        self._direction.record(act, now_ts)
+            if errors and not executed:
+                result.status = Status.ERROR
+            elif errors:
+                result.status = Status.PARTIAL
 
-        if errors and not executed:
-            result.status = Status.ERROR
-        elif errors:
-            result.status = Status.PARTIAL
+        # Log INFO tylko przy zmianie decyzji — pętla chodzi co 60 s i logowanie
+        # każdego przebiegu na INFO uczyniłoby log bezużytecznym. "Brak zmian do
+        # zapisania" to też decyzja i musi przejść przez ten sam mechanizm, inaczej
+        # "nic się nie dzieje" znów staje się niewidoczne.
+        decision = f"{act.value}|{sorted(result.params.items())}|{result.status.value}"
+        if decision != self._last_decision:
+            _LOGGER.info(
+                "[%s] Decyzja: %s, status=%s, zapisano=%s",
+                source, act.value, result.status.value, result.executed or "nic",
+            )
+            self._last_decision = decision
+        else:
+            _LOGGER.debug("[%s] Decyzja bez zmian: %s", source, act.value)
 
         self._remember(source, result, executed, errors)
         return result
