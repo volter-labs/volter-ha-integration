@@ -304,7 +304,16 @@ class VolterCommandHandler:
                         request_id, "error", errors=[{"entity": "schedule", "error": str(err)}]
                     )
                     return
-                await self._report_guard_result(request_id, result)
+                # RR-4: `async_set_schedule` UTRWALA harmonogram w `Store` i podmienia
+                # aktywny plan executora ZANIM cokolwiek zostanie wykonane — to jest trwały
+                # skutek uboczny, niezależny od tego, czy `result.executed` jest puste (I-6
+                # mógł odfiltrować wszystkie zapisy do falownika). `_remember_if_effective`
+                # (R-2) patrzy tylko na `executed`, więc bez tego retransmisja tej samej
+                # komendy po reconnect Realtime nie trafiała w dedup i potrafiła cofnąć
+                # aktywny (nowszy) plan do wersji sprzed niej (sonda P12). Zapamiętujemy
+                # więc od razu, gdy plan naprawdę trafił do Store — niezależnie od executed.
+                self._dedup.remember(request_id)
+                await self._report_guard_result(request_id, result, remember=False)
                 return
 
             if command == "SET_WORK_MODE":
@@ -340,9 +349,17 @@ class VolterCommandHandler:
         if result.status in (Status.SUCCESS, Status.PARTIAL) and result.executed:
             self._dedup.remember(request_id)
 
-    async def _report_guard_result(self, request_id: str, result: GuardResult) -> None:
-        """Zaraportuj wynik razem ze śladem decyzji guardów."""
-        self._remember_if_effective(request_id, result)
+    async def _report_guard_result(
+        self, request_id: str, result: GuardResult, *, remember: bool = True
+    ) -> None:
+        """Zaraportuj wynik razem ze śladem decyzji guardów.
+
+        `remember=False` (RR-4): wołający już zdecydował o zapamiętaniu `request_id`
+        na podstawie trwałego skutku ubocznego komendy (SET_SCHEDULE — plan w Store),
+        a nie na podstawie `result.executed` jak robi to `_remember_if_effective` (R-2).
+        """
+        if remember:
+            self._remember_if_effective(request_id, result)
         # R-9: `errors=[]` było zahardkodowane — realne błędy per-encja z `executor`
         # (m.in. niezmapowana encja, R-3) nigdy nie opuszczały HA. To była regresja
         # wobec implementacji sprzed Fazy A, która przekazywała prawdziwą listę.
