@@ -548,7 +548,21 @@ class VolterExecutor:
         # mogły wpaść w pętlę, gdyby nowa akcja też została zakwestionowana.
         if result.forced_action is not None and not _remapped:
             if slot is not None:
-                forced_slot = replace(slot, action=result.forced_action)
+                # U-1: przemapowanie musi zdjąć TAKŻE kierunek opisowy i moc, nie tylko
+                # `action`. Od rozszerzenia kontraktu (Task 13) mapper czyta kierunek
+                # również z `charge_source`/`discharge_purpose`, więc samo podmienienie
+                # trybu zostawiałoby slot, który wraca do falownika jako
+                # `eco_discharge` tylnymi drzwiami — czyli I-1 zduszone przez guard
+                # wskrzeszone przez pole opisowe. `power_w` znika razem z kierunkiem,
+                # bo wymuszona autokonsumpcja to jawne „bateria decyduje sama":
+                # nastawa mocy bez komendy kierunku jest dokładnie wadą U-1.
+                forced_slot = replace(
+                    slot,
+                    action=result.forced_action,
+                    charge_source=None,
+                    discharge_purpose=None,
+                    power_w=None,
+                )
                 rated = float(options.get(OPT_RATED_POWER_W, DEFAULT_RATED_POWER_W))
                 # RR-10 (ustalenie 2. kontrolera z rundy 2): to był `_LOGGER.warning`
                 # BEZWARUNKOWY, poza anty-spamem `_remember` — 60 WARNING/h w stanie
@@ -1008,6 +1022,13 @@ class VolterExecutor:
                 "action": slot.action.value,
                 "soc_target": slot.soc_target,
                 "price_pln_kwh": slot.price_pln_kwh,
+                # U-1: bez tych trzech pól raport nie odróżnia „slot bez kierunku" od
+                # „kierunek przyszedł, ale mapper go zgubił" — a `diagnose` jest jedynym
+                # oknem, którym potwierdzimy hipotezy mappera na żywym falowniku (Etap 3).
+                "power_w": slot.power_w,
+                "charge_source": slot.charge_source,
+                "discharge_purpose": slot.discharge_purpose,
+                "export_limit_w": slot.export_limit_w,
             }
 
         report: dict[str, Any] = {

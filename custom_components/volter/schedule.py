@@ -102,6 +102,40 @@ def _flaga(raw: dict[str, Any], key: str, domyslna: bool) -> bool:
     return value
 
 
+def _wybor(raw: dict[str, Any], key: str, dozwolone: tuple[str, ...]) -> str | None:
+    """S-2 dla nowych pól opisowych U-1: wartość musi być ze znanego zbioru albo jej nie ma.
+
+    DLACZEGO ta sama surowość co przy `mode`, mimo że pole jest „tylko opisowe":
+    `charge_source` rozstrzyga, czy wolno pobierać energię Z SIECI do baterii, a
+    `discharge_purpose` — czy slot w ogóle jest rozładowaniem. Literówka w chmurze
+    („PV" zamiast „pv") przy cichej akceptacji zniknęłaby bez śladu i zabrała ze sobą
+    kierunek, czyli dokładnie to, czego brak jest treścią U-1. `bool` odrzucamy razem
+    z resztą nie-stringów (ta sama klasa cichej podmiany intencji co w `_liczba`).
+    """
+    value = raw.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or value not in dozwolone:
+        raise InvalidSchedule(
+            key, f"{key}={value!r} nie jest jedną z wartości {list(dozwolone)}"
+        )
+    return value
+
+
+def _moc_nieujemna(raw: dict[str, Any], key: str) -> float | None:
+    """S-2: pułap w watach nie może być ujemny — i musi paść PRZY PARSOWANIU.
+
+    Bez tego wartość ujemna przechodziłaby przez parser do `Store`, a odrzucał ją
+    dopiero `sanitize_params` (dolna granica `PARAM_SPECS`) — czyli JUŻ PO utrwaleniu:
+    każdy kolejny tick wywalałby całą komendę (I-10 jest fail-closed), bezterminowo
+    i po restarcie HA. To jest dosłownie tryb awarii z S-2, tylko na nowym polu.
+    """
+    numeric = _liczba(raw, key)
+    if numeric is not None and numeric < 0:
+        raise InvalidSchedule(key, f"{key}={numeric} nie może być ujemne")
+    return numeric
+
+
 def _akcja(raw: dict[str, Any], key: str = "mode") -> Action:
     """S-2: nazwa akcji musi być znanym stringiem — nieznana unieważnia plan."""
     value = raw.get(key, Action.SELF_CONSUME.value)
@@ -127,6 +161,12 @@ def _znacznik(raw: dict[str, Any], key: str) -> datetime:
         ) from err
 
 
+#: U-1: dopuszczalne wartości pól opisowych kierunku. Kontrakt chmury:
+#: `supabase/functions/energy-optimizer/device-schedule.ts` (`DeviceSlot`).
+CHARGE_SOURCES: tuple[str, ...] = ("pv", "grid")
+DISCHARGE_PURPOSES: tuple[str, ...] = ("self", "sell")
+
+
 @dataclass(frozen=True)
 class Slot:
     """Pojedynczy przedział harmonogramu."""
@@ -138,6 +178,18 @@ class Slot:
     soc_target: float | None = None
     price_pln_kwh: float | None = None
     export_allowed: bool = True
+    #: U-1: skąd ładujemy — 'pv' | 'grid' | None. Kierunek NIEZBĘDNY, a nie ozdobny:
+    #: chmura świadomie zostawia `mode='self_consume'` dla slotów, w których falownik
+    #: fizycznie nigdzie się nie przełącza (żeby nie budzić I-8), więc dla 41% slotów
+    #: z mocą to JEDYNE miejsce, gdzie stoi kierunek. Rozróżnienie pv/grid jest
+    #: krytyczne: 'grid' to zgoda na zakup prądu do baterii, 'pv' — jej brak.
+    charge_source: str | None = None
+    #: U-1: po co rozładowujemy — 'self' | 'sell' | None. Druga połowa tego samego
+    #: kierunku (patrz `charge_source`).
+    discharge_purpose: str | None = None
+    #: N-8/D-5: realny pułap eksportu w watach. Bez niego mapper znał tylko „wolno /
+    #: nie wolno" i przy zgodzie ZDEJMOWAŁ ogranicznik, czyli kasował limit OSD.
+    export_limit_w: float | None = None
 
     def covers(self, moment: datetime) -> bool:
         return self.start <= moment < self.end
@@ -169,6 +221,12 @@ class Slot:
             soc_target=_liczba(raw, "soc_target"),
             price_pln_kwh=_liczba(raw, "price_pln_kwh"),
             export_allowed=_flaga(raw, "export_allowed", True),
+            # U-1: pola opcjonalne — plan sprzed rozszerzenia kontraktu (już utrwalony
+            # w `Store`) musi się dalej wczytywać, inaczej aktualizacja integracji
+            # skasowałaby aktywny harmonogram przy pierwszym starcie.
+            charge_source=_wybor(raw, "charge_source", CHARGE_SOURCES),
+            discharge_purpose=_wybor(raw, "discharge_purpose", DISCHARGE_PURPOSES),
+            export_limit_w=_moc_nieujemna(raw, "export_limit_w"),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -180,6 +238,11 @@ class Slot:
             "soc_target": self.soc_target,
             "price_pln_kwh": self.price_pln_kwh,
             "export_allowed": self.export_allowed,
+            # U-1: nowe pola MUSZĄ iść do `Store` — bez nich restart HA gubiłby kierunek
+            # dokładnie tych slotów, które go potrzebują (`mode` mówi wtedy „self_consume").
+            "charge_source": self.charge_source,
+            "discharge_purpose": self.discharge_purpose,
+            "export_limit_w": self.export_limit_w,
         }
 
 
@@ -336,4 +399,12 @@ class Schedule:
         }
 
 
-__all__ = ["Fallback", "InvalidSchedule", "Schedule", "Slot", "SCHEDULE_VERSION"]
+__all__ = [
+    "CHARGE_SOURCES",
+    "DISCHARGE_PURPOSES",
+    "Fallback",
+    "InvalidSchedule",
+    "Schedule",
+    "Slot",
+    "SCHEDULE_VERSION",
+]
