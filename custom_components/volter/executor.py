@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
+import math
 import time
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -82,6 +83,30 @@ def _mapped_entity(param_key: str, options: dict[str, Any]) -> bool:
     return bool(options.get(opt_key))
 
 
+def _cena_zaufana(value: Any) -> float | None:
+    """S-2c: cena wyciągnięta z aktywnego planu nie może wywalić toru zapisu.
+
+    Ta wartość NIE pochodzi od wołającego — bierze ją sam executor z `self._schedule`
+    (gałąź R-6, żeby I-4 broniło też komendy operatora). Gdy plan jest zatruty,
+    porównanie `cena <= 0` w guardach rzuca `TypeError` na ścieżce, którą awaryjny
+    fallback musiał właśnie ratować — czyli ratunek wybuchał z tego samego powodu co
+    awaria. `None` znaczy „ceny nie znam": I-4 jest wtedy ślepe, ale slot fallbacku
+    i tak ma `export_allowed=False`, więc brak wiedzy o cenie nie otwiera eksportu.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        _LOGGER.warning(
+            "Cena z aktywnego planu ma zły typ (%r) — I-4 pracuje bez ceny [S-2]", value
+        )
+        return None
+    numeric = float(value)
+    if not math.isfinite(numeric):
+        _LOGGER.warning("Cena z aktywnego planu nie jest skończona (%r) — I-4 bez ceny", value)
+        return None
+    return numeric
+
+
 class VolterExecutor:
     """Pętla wykonawcza + wspólna brama zapisu dla harmonogramu i komend."""
 
@@ -145,10 +170,33 @@ class VolterExecutor:
     # ── harmonogram ──────────────────────────────────────────────────────────
 
     async def async_set_schedule(self, raw: dict[str, Any]) -> GuardResult:
-        """Przyjmij i utrwal harmonogram z chmury, potem wykonaj natychmiast."""
+        """Przyjmij i utrwal harmonogram z chmury, potem wykonaj natychmiast.
+
+        S-2: kolejność w tej metodzie jest ochroną, nie stylem. Najpierw PEŁNA
+        walidacja typów (`Schedule.from_dict` jest fail-closed i rzuca
+        `InvalidSchedule`), potem utrwalenie, i dopiero na końcu podmiana aktywnego
+        planu w pamięci procesu. Wcześniej plan lądował w `Store` bez żadnej kontroli
+        typów pól slotu, więc pojedynczy błąd serializacji po stronie chmury (liczba
+        jako string) zatruwał pamięć trwałą: po restarcie HA każdy tick rzucał
+        wyjątkiem PRZED decyzją, urządzenie nie pisało nic i nie wchodziło nawet
+        w fallback I-5.
+
+        S-2: podmiana `self._schedule` PO udanym `async_save`, a nie przed — gdyby
+        zapis do `Store` zawiódł, aktywny plan i pamięć trwała muszą zostać zgodne
+        (stary plan w obu miejscach), zamiast rozjechać się na czas do restartu.
+        """
         schedule = Schedule.from_dict(raw)
-        self._schedule = schedule
         await self._store.async_save(schedule.to_dict())
+        self._schedule = schedule
+        if not schedule.slots:
+            # S-3: pusty plan JEST legalny (chmura mówi „nie mam planu"), ale kasuje
+            # aktywny harmonogram — to musi być widoczne w logu HA, bo z zewnątrz
+            # wygląda identycznie jak awaria łącza z chmurą.
+            _LOGGER.warning(
+                "Harmonogram %s nie ma ani jednego slotu — aktywny plan wycofany, "
+                "urządzenie wchodzi w fallback [I-5]",
+                schedule.schedule_id or "(bez id)",
+            )
         _LOGGER.info(
             "Zapisano harmonogram %s: %s slotów, ważny do %s",
             schedule.schedule_id or "(bez id)",
@@ -289,8 +337,17 @@ class VolterExecutor:
         # martwe dokładnie tam, gdzie miało chronić przed poleceniem z zewnątrz.
         effective_price = price_pln_kwh
         if effective_price is None and self._schedule is not None:
-            current_slot, _ = self._schedule.effective_slot(datetime.now(timezone.utc))
-            effective_price = current_slot.price_pln_kwh
+            # S-2c: sięgnięcie po cenę do aktywnego planu jest tu plumbingiem, a nie
+            # decyzją — nie wolno mu przewrócić całego toru zapisu, bo to ta sama
+            # ścieżka, którą ratuje awaryjny fallback po zatrutym planie.
+            try:
+                current_slot, _ = self._schedule.effective_slot(datetime.now(timezone.utc))
+                effective_price = _cena_zaufana(current_slot.price_pln_kwh)
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.warning(
+                    "Nie udało się odczytać ceny z aktywnego planu (%s) — I-4 bez ceny", err
+                )
+                effective_price = None
 
         # I-10 — fail-closed
         try:
@@ -510,6 +567,61 @@ class VolterExecutor:
         await self._async_execute_now()
 
     async def _async_execute_now(self) -> GuardResult:
+        """S-2c: pętla wykonawcza nie może zostawić urządzenia BEZ DECYZJI.
+
+        Niezależna warstwa obrony, celowo dublująca walidację z `Schedule.from_dict`:
+        nawet gdyby cokolwiek przeciekło przez parser (albo wybuchło w mapperze,
+        odczycie encji czy guardach), wyjątek leciał dotąd PRZED wyborem akcji, więc
+        falownik zostawał na ostatniej nastawie bez żadnego sygnału i BEZ fallbacku
+        I-5 — dokładnie ten tryb awarii opisuje S-2. Wyjątek ma więc prowadzić do
+        bezpiecznej decyzji, a nie do ciszy.
+        """
+        try:
+            return await self._async_execute_planned()
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.exception(
+                "Wyjątek w torze wykonania harmonogramu (%s) — wchodzę w awaryjny "
+                "fallback [I-5]", err,
+            )
+            return await self._async_awaryjny_fallback(err)
+
+    async def _async_awaryjny_fallback(self, powod: BaseException) -> GuardResult:
+        """S-2c: ostatnia deska ratunku — self_consume + rezerwa użytkownika (I-5).
+
+        Świadomie NIE korzysta z `self._schedule` ani z `schedule.fallback`: skoro
+        coś w torze planu właśnie wybuchło, plan jest podejrzany i jedyną zaufaną
+        wiedzą jest konfiguracja użytkownika. Cała metoda jest opakowana w drugi
+        `try`, bo nawet odczyt opcji może być źródłem wyjątku — a metoda, która
+        istnieje po to, żeby wyjątek nie uciszył urządzenia, sama nie może rzucać.
+        """
+        try:
+            options = dict(self._entry.options)
+            reserve = float(options.get(OPT_SOC_RESERVE, DEFAULT_SOC_RESERVE))
+            fallback = Fallback(action=Action.SELF_CONSUME, soc_reserve=reserve)
+            slot = fallback.as_slot(datetime.now(timezone.utc))
+            rated = float(options.get(OPT_RATED_POWER_W, DEFAULT_RATED_POWER_W))
+            result = await self.async_apply(
+                slot_to_params(slot, rated_power_w=rated),
+                price_pln_kwh=slot.price_pln_kwh,
+                action=slot.action,
+                source="fallback-awaryjny",
+                slot=slot,
+            )
+            # Raport do chmury musi mówić, że plan NIE został wykonany — sam zapis
+            # fallbacku mógł się udać, ale wykonanie harmonogramu się nie udało.
+            # `self._last` zostaje przy prawdzie o samym zapisie (SUCCESS), bo to
+            # dwie różne informacje: co poszło do falownika vs czy plan się wykonał.
+            result.note("I-5", f"awaryjny fallback po wyjątku w torze wykonania: {powod}")
+            if result.status is Status.SUCCESS:
+                result.status = Status.PARTIAL
+            return result
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.error("Awaryjny fallback [I-5] też się nie powiódł: %s", err)
+            wynik = GuardResult(params={}, status=Status.ERROR)
+            wynik.note("I-5", f"awaryjny fallback nie powiódł się: {err}")
+            return wynik
+
+    async def _async_execute_planned(self) -> GuardResult:
         options = dict(self._entry.options)
 
         if self._schedule is None:
@@ -679,7 +791,10 @@ class VolterExecutor:
                 state=state,
                 limits=limits,
                 config=cfg,
-                price_pln_kwh=slot_info.get("price_pln_kwh"),
+                # S-2c: diagnoza jest narzędziem do odpowiadania na pytanie „dlaczego
+                # nic się nie dzieje" — nie może się wywalić dokładnie wtedy, gdy plan
+                # jest zatruty, czyli w jedynej sytuacji, w której jest naprawdę potrzebna.
+                price_pln_kwh=_cena_zaufana(slot_info.get("price_pln_kwh")),
                 # R-1: suchy przebieg musi widzieć dokładnie tę samą intencję co realny,
                 # inaczej diagnostyka pokazywałaby zapis, którego I-1 by nie przepuściło.
                 action=slot_action,

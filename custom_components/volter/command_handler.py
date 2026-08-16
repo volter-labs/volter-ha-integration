@@ -23,8 +23,49 @@ from .const import (
 )
 from .executor import VolterExecutor
 from .guards import GuardResult, RequestDeduplicator, Status, infer_action
+from .schedule import InvalidSchedule
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _wybierz_harmonogram(payload: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]:
+    """S-3: jawny, wąski kontrakt wejścia SET_SCHEDULE.
+
+    Poprzednie `payload.get("schedule") or params.get("schedule") or params` miało dwie
+    wady naraz. Po pierwsze `or` zsuwa się dalej przy KAŻDEJ wartości falsy — pusty dict
+    pod właściwym kluczem cicho oddawał sterowanie kolejnemu źródłu. Po drugie ostatnie
+    ogniwo przekazywało do `Schedule.from_dict` DOWOLNY `params`, więc plan przysłany
+    pod innym kluczem (literówka, zmiana kontraktu, inna wersja chmury) kasował aktywny
+    harmonogram i był raportowany jako sukces (sonda D).
+
+    Rozpoznajemy dokładnie trzy kształty, w tej kolejności:
+      1. `payload["schedule"]` — kontrakt bieżący,
+      2. `params["schedule"]` — ten sam plan zagnieżdżony w parametrach,
+      3. `params` niosące klucz `slots` — kontrakt zastany (`params` JEST planem).
+
+    Klucz obecny, ale nie-obiekt, jest BŁĘDEM, a nie powodem do zsunięcia się niżej:
+    inaczej zła serializacja jednego pola po cichu wracałaby na tę samą ścieżkę,
+    którą zamyka to ustalenie. Brak rozpoznawalnego harmonogramu też jest błędem —
+    nigdy pustym planem (o legalności `{"slots": []}` rozstrzyga `Schedule.from_dict`).
+    """
+    for zrodlo, kontener in (("payload['schedule']", payload), ("params['schedule']", params)):
+        if "schedule" in kontener:
+            kandydat = kontener["schedule"]
+            if not isinstance(kandydat, dict):
+                raise InvalidSchedule(
+                    "schedule",
+                    f"{zrodlo} musi być obiektem, jest {type(kandydat).__name__}",
+                )
+            return kandydat
+
+    if "slots" in params:
+        return params
+
+    raise InvalidSchedule(
+        "schedule",
+        "brak rozpoznawalnego harmonogramu — oczekiwano payload['schedule'], "
+        "params['schedule'] albo params z kluczem 'slots'",
+    )
 
 
 class VolterCommandHandler:
@@ -320,8 +361,12 @@ class VolterCommandHandler:
             )
 
             if command == "SET_SCHEDULE":
-                raw = payload.get("schedule") or params.get("schedule") or params
                 try:
+                    # S-3: wybór źródła planu jest WEWNĄTRZ tej bariery, bo od teraz
+                    # sam w sobie może odrzucić wiadomość (zły kształt = błąd komendy,
+                    # nie pusty plan) — i musi zostać zaraportowany do chmury tak samo
+                    # jak błąd parsowania, czyli bez zapamiętania `request_id`.
+                    raw = _wybierz_harmonogram(payload, params)
                     result = await self._executor.async_set_schedule(raw)
                 except Exception as err:  # noqa: BLE001
                     _LOGGER.error("Nie udało się przyjąć harmonogramu: %s", err)

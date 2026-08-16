@@ -11,6 +11,7 @@ Ten sam model implementuje firmware (NVS zamiast helpers.storage).
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -20,12 +21,110 @@ from .guards import Action
 SCHEDULE_VERSION = 1
 
 
+class InvalidSchedule(ValueError):
+    """S-2: harmonogram odrzucony W CAŁOŚCI, bo parsowanie musi być fail-closed.
+
+    Dokładny odpowiednik `guards.InvalidCommand` dla komend, tylko dla planu: plan
+    z chmury to też niezaufane wejście, a częściowo przyjęty harmonogram jest w
+    energetyce groźniejszy niż odrzucony. Dziedziczy po `ValueError`, żeby istniejąca
+    bariera w `command_handler` (`except Exception`) raportowała go do chmury jako
+    błąd komendy, a nie wywalała pętlę Realtime.
+    """
+
+    def __init__(self, field_name: str, message: str) -> None:
+        super().__init__(message)
+        self.field = field_name
+        self.message = message
+
+
 def _parse_dt(value: Any) -> datetime:
     if isinstance(value, datetime):
         return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
     text = str(value).replace("Z", "+00:00")
     parsed = datetime.fromisoformat(text)
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+# ── S-2: walidacja typów pól planu (fail-closed) ─────────────────────────────
+#
+# S-2: `Slot.from_dict` przepisywało `power_w`/`soc_target`/`price_pln_kwh` wprost
+# z JSON-a, bez żadnej kontroli typu — klasyczny błąd serializacji po stronie chmury
+# (liczba jako string) przechodził przez parsowanie, był UTRWALANY w `Store`, a wybuchał
+# dopiero w guardach. Efekt: po restarcie HA każdy tick rzucał wyjątkiem PRZED decyzją,
+# więc urządzenie nie pisało nic i nie wchodziło nawet w fallback I-5 — awaria cicha,
+# trwała i przeżywająca restart. Dlatego parsowanie jest teraz bramą, a nie przepisaniem.
+
+
+def _wymagaj_dict(raw: Any, gdzie: str) -> dict[str, Any]:
+    """S-2: dowolny JSON z chmury może nie być obiektem — sprawdzamy, zanim użyjemy `.get`."""
+    if not isinstance(raw, dict):
+        raise InvalidSchedule(gdzie, f"{gdzie} musi być obiektem, jest {type(raw).__name__}")
+    return raw
+
+
+def _liczba(raw: dict[str, Any], key: str) -> float | None:
+    """S-2: pole liczbowe musi BYĆ liczbą — brak/`None` znaczy „nie podano".
+
+    `bool` odrzucamy jawnie, bo w Pythonie jest podtypem `int` i `True` przeszłoby
+    jako `1.0` — dokładnie ta sama klasa cichej podmiany intencji co `bool("false")`.
+    """
+    value = raw.get(key)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise InvalidSchedule(key, f"{key} musi być liczbą, jest {value!r}")
+    try:
+        numeric = float(value)
+    except OverflowError as err:
+        # JSON nie ogranicza precyzji liczb całkowitych — `float(10**400)` rzuca
+        # wyjątek spoza kontraktu parsera, a fail-closed ma tu ODRZUCIĆ plan.
+        raise InvalidSchedule(key, f"{key}={value!r} nie mieści się w liczbie") from err
+    if not math.isfinite(numeric):
+        # `json.loads` przyjmuje literały NaN/Infinity, a NaN przechodzi każde
+        # porównanie zakresu i szedłby prosto na encję falownika (ten sam wektor co RR-2).
+        raise InvalidSchedule(key, f"{key}={value!r} nie jest liczbą skończoną (NaN/inf)")
+    return numeric
+
+
+def _flaga(raw: dict[str, Any], key: str, domyslna: bool) -> bool:
+    """S-2: pole logiczne musi BYĆ bool — `bool("false")` to `True`.
+
+    To groźniejszy wariant braku walidacji niż zły typ liczby: nie rzuca wyjątkiem,
+    tylko po cichu ODWRACA intencję planu (zakaz eksportu staje się zgodą).
+    """
+    value = raw.get(key)
+    if value is None:
+        return domyslna
+    if not isinstance(value, bool):
+        raise InvalidSchedule(
+            key, f"{key} musi być wartością logiczną (true/false), jest {value!r}"
+        )
+    return value
+
+
+def _akcja(raw: dict[str, Any], key: str = "mode") -> Action:
+    """S-2: nazwa akcji musi być znanym stringiem — nieznana unieważnia plan."""
+    value = raw.get(key, Action.SELF_CONSUME.value)
+    if not isinstance(value, str) or not value:
+        raise InvalidSchedule(key, f"{key} musi być niepustym stringiem, jest {value!r}")
+    try:
+        return Action(value)
+    except ValueError as err:
+        znane = [a.value for a in Action]
+        raise InvalidSchedule(key, f"{key}={value!r} nie jest znaną akcją: {znane}") from err
+
+
+def _znacznik(raw: dict[str, Any], key: str) -> datetime:
+    """S-2: granica slotu bez poprawnego znacznika czasu to plan bez sensu czasowego."""
+    value = raw.get(key)
+    if value is None:
+        raise InvalidSchedule(key, f"slot bez pola {key!r}")
+    try:
+        return _parse_dt(value)
+    except (TypeError, ValueError) as err:
+        raise InvalidSchedule(
+            key, f"{key}={value!r} nie jest poprawnym znacznikiem czasu ISO-8601"
+        ) from err
 
 
 @dataclass(frozen=True)
@@ -45,14 +144,31 @@ class Slot:
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "Slot":
+        """S-2: parsowanie jest BRAMĄ, nie przepisaniem JSON-a do dataklasy.
+
+        Każde pole przechodzi przez kontrolę typu, bo zły typ przepuszczony tutaj
+        trafiał do `Store` i wybuchał dopiero w guardach — już po utrwaleniu, czyli
+        w miejscu, z którego nie ma powrotu bez ingerencji w pliki HA.
+        """
+        _wymagaj_dict(raw, "slot")
+        start = _znacznik(raw, "from")
+        end = _znacznik(raw, "to")
+        if end <= start:
+            # Slot pusty lub odwrócony nigdy nie zostanie wybrany przez `covers()`,
+            # więc bez tej kontroli plan wyglądałby na przyjęty, a w praktyce
+            # oznaczał ciszę w tym oknie czasowym.
+            raise InvalidSchedule(
+                "to", f"slot kończy się ({end.isoformat()}) nie później niż zaczyna "
+                f"({start.isoformat()})"
+            )
         return cls(
-            start=_parse_dt(raw["from"]),
-            end=_parse_dt(raw["to"]),
-            action=Action(str(raw.get("mode", "self_consume"))),
-            power_w=raw.get("power_w"),
-            soc_target=raw.get("soc_target"),
-            price_pln_kwh=raw.get("price_pln_kwh"),
-            export_allowed=bool(raw.get("export_allowed", True)),
+            start=start,
+            end=end,
+            action=_akcja(raw),
+            power_w=_liczba(raw, "power_w"),
+            soc_target=_liczba(raw, "soc_target"),
+            price_pln_kwh=_liczba(raw, "price_pln_kwh"),
+            export_allowed=_flaga(raw, "export_allowed", True),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -81,11 +197,18 @@ class Fallback:
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any] | None) -> "Fallback":
+        if raw is None:
+            return cls()
+        # S-2: `float("abc")` rzucał ValueError, ale `float("30")` przechodził po
+        # cichu — fallback jest ostatnią linią obrony (I-5), więc nie może zależeć
+        # od tego, czy chmura akurat zserializowała liczbę jako string.
+        _wymagaj_dict(raw, "fallback")
         if not raw:
             return cls()
+        rezerwa = _liczba(raw, "soc_reserve")
         return cls(
-            action=Action(str(raw.get("mode", "self_consume"))),
-            soc_reserve=float(raw.get("soc_reserve", 20.0)),
+            action=_akcja(raw),
+            soc_reserve=20.0 if rezerwa is None else rezerwa,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -151,12 +274,54 @@ class Schedule:
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "Schedule":
-        slots = [Slot.from_dict(s) for s in raw.get("slots", [])]
+        """S-3: brak `slots` to BŁĄD kształtu, a nie „plan bez slotów".
+
+        `raw.get("slots", [])` sprawiało, że DOWOLNY dict był legalnym (pustym)
+        harmonogramem — więc plan przysłany pod innym kluczem kasował aktywny plan
+        i był raportowany do chmury jako sukces (sonda D).
+
+        DECYZJA: pusta lista slotów JEST legalna — to sposób, w jaki chmura mówi
+        „nie mam dla ciebie planu, wejdź w fallback". Odróżnienie od złego kształtu
+        jest strukturalne, nie heurystyczne: liczy się OBECNOŚĆ klucza `slots`.
+        Wycofanie planu trzeba powiedzieć wprost (`{"slots": []}`); przypadkowy śmieć
+        nie ma jak tego udać, bo tego klucza po prostu nie ma.
+        """
+        _wymagaj_dict(raw, "harmonogram")
+        if "slots" not in raw:
+            raise InvalidSchedule(
+                "slots",
+                "harmonogram bez pola 'slots' — wycofanie planu musi być JAWNE "
+                "(\"slots\": []), a dict bez tego pola nie jest harmonogramem",
+            )
+        surowe = raw["slots"]
+        if not isinstance(surowe, list):
+            raise InvalidSchedule(
+                "slots", f"'slots' musi być listą, jest {type(surowe).__name__}"
+            )
+
+        slots: list[Slot] = []
+        for i, s in enumerate(surowe):
+            try:
+                slots.append(Slot.from_dict(s))
+            except InvalidSchedule as err:
+                # S-2 fail-closed: JEDEN zły slot unieważnia CAŁY harmonogram —
+                # nie ma tu "częściowego planu", tak samo jak nie ma częściowo
+                # zastosowanej komendy w I-10. Numer slotu w komunikacie, bo bez
+                # niego chmura nie ma jak znaleźć swojego błędu serializacji.
+                raise InvalidSchedule(
+                    f"slots[{i}].{err.field}", f"slot #{i}: {err.message}"
+                ) from err
         slots.sort(key=lambda s: s.start)
+
+        schedule_id = raw.get("schedule_id", "")
+        if not isinstance(schedule_id, str):
+            raise InvalidSchedule(
+                "schedule_id", f"schedule_id musi być stringiem, jest {schedule_id!r}"
+            )
         generated = raw.get("generated_at")
         return cls(
-            schedule_id=str(raw.get("schedule_id", "")),
-            generated_at=_parse_dt(generated) if generated else None,
+            schedule_id=schedule_id,
+            generated_at=_znacznik(raw, "generated_at") if generated is not None else None,
             slots=slots,
             fallback=Fallback.from_dict(raw.get("fallback")),
         )
@@ -171,4 +336,4 @@ class Schedule:
         }
 
 
-__all__ = ["Fallback", "Schedule", "Slot", "SCHEDULE_VERSION"]
+__all__ = ["Fallback", "InvalidSchedule", "Schedule", "Slot", "SCHEDULE_VERSION"]
