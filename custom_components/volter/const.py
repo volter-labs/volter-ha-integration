@@ -67,3 +67,35 @@ MONITORING_ENTITY_MAP = {
     OPT_ENTITY_GRID_EXPORT_TOTAL: "grid_export_total_kwh",
     OPT_ENTITY_EMS_MODE: "ems_mode",
 }
+
+# ── Executor, harmonogram i guardy ──────────────────────────────────────────
+# Specyfikacja: Volter-BOX/03-produkt/guardy-i-inwarianty.md
+
+STORAGE_VERSION = 1
+STORAGE_KEY = f"{DOMAIN}.schedule"
+
+#: Interwał pętli wykonawczej. Wymóg ze specyfikacji: <= 60 s.
+EXECUTOR_INTERVAL = 60
+
+#: I-6 — minimalny odstęp między zapisami tego samego parametru.
+#: Nastawy eco mode w GoodWe idą do pamięci nieulotnej falownika: częste zapisy
+#: zużywają sprzęt. Nie zmniejszać bez potwierdzenia w Etapie 1.
+WRITE_MIN_INTERVAL_S = 60
+
+#: I-9 — maksymalny wiek odczytu telemetrii i maksymalny sensowny skok SoC.
+MAX_STATE_AGE_S = 300
+MAX_SOC_JUMP_PP = 20
+
+#: I-8 — maksymalna liczba zmian kierunku ładowanie<->rozładowanie na godzinę.
+MAX_DIRECTION_CHANGES_PER_HOUR = 4
+
+#: T-14 — liczba prób zapisu przed zgłoszeniem błędu (bez pętli).
+WRITE_RETRIES = 3
+
+# ── Options: konfiguracja użytkownika dla guardów ───────────────────────────
+OPT_SOC_RESERVE = "soc_reserve"
+OPT_USER_MODE = "user_mode"          # earn | autarky | backup
+OPT_RATED_POWER_W = "rated_power_w"  # moc znamionowa falownika, do przeliczenia eco_power
+
+DEFAULT_SOC_RESERVE = 20.0
+DEFAULT_RATED_POWER_W = 10000.0

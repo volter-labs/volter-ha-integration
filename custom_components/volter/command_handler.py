@@ -21,6 +21,8 @@ from .const import (
     REALTIME_RECONNECT_BASE,
     REALTIME_RECONNECT_MAX,
 )
+from .executor import VolterExecutor
+from .guards import GuardResult, RequestDeduplicator, infer_action
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -43,9 +45,12 @@ class VolterCommandHandler:
         supabase_url: str,
         anon_key: str,
         api_key: str,
+        executor: VolterExecutor,
     ) -> None:
         """Inicjalizacja."""
         self.hass = hass
+        self._executor = executor
+        self._dedup = RequestDeduplicator()
         self._entry = entry
         self._device_id = device_id
         self._anon_key = anon_key
@@ -237,89 +242,62 @@ class VolterCommandHandler:
                 await self._execute_command(broadcast_payload)
 
     async def _execute_command(self, payload: dict) -> None:
-        """Wykonaj komendę z chmury — routuj do odpowiednich service calls HA."""
+        """Zrouj komendę z chmury przez executor (guardy + throttle + zapis).
+
+        Zmiana wobec pierwotnej implementacji: handler NIE pisze już bezpośrednio
+        do encji. Wszystko idzie przez `VolterExecutor.async_apply`, czyli przez
+        sanityzację (I-10), inwarianty I-1…I-9, anty-oscylację (I-8) i throttling (I-6).
+        Handler odpowiada tylko za transport i raportowanie.
+        """
         command = payload.get("command", "")
-        params = payload.get("params", {})
+        params = payload.get("params", {}) or {}
         request_id = payload.get("request_id", "unknown")
 
+        # L-4: idempotencja — ponownie dostarczony broadcast nie wykonuje się dwa razy.
+        if self._dedup.is_duplicate(request_id):
+            _LOGGER.info("Komenda %s już wykonana — pomijam [L-4]", request_id)
+            await self._report_result(request_id, "duplicate")
+            return
+        self._dedup.remember(request_id)
+
         _LOGGER.info(
-            "Executing command: %s (request_id=%s, params=%s)",
-            command, request_id, params,
+            "Komenda: %s (request_id=%s, params=%s)", command, request_id, params
         )
 
-        if command != "SET_WORK_MODE":
-            _LOGGER.warning("Unknown command: %s", command)
-            await self._report_result(request_id, "error", errors=[
-                {"entity": "command", "error": f"Unknown command: {command}"}
-            ])
+        if command == "SET_SCHEDULE":
+            raw = payload.get("schedule") or params.get("schedule") or params
+            try:
+                result = await self._executor.async_set_schedule(raw)
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.error("Nie udało się przyjąć harmonogramu: %s", err)
+                await self._report_result(
+                    request_id, "error", errors=[{"entity": "schedule", "error": str(err)}]
+                )
+                return
+            await self._report_guard_result(request_id, result)
             return
 
-        options = self._entry.options
-        executed: list[str] = []
-        errors: list[dict[str, str]] = []
+        if command == "SET_WORK_MODE":
+            result = await self._executor.async_apply(
+                params, action=infer_action(params), source="cloud"
+            )
+            await self._report_guard_result(request_id, result)
+            return
 
-        # Iteruj po parametrach komendy i wywołuj odpowiednie service calls
-        for param_key, value in params.items():
-            mapping = COMMAND_ENTITY_MAP.get(param_key)
-            if not mapping:
-                continue
-
-            opt_key, ha_domain, ha_service, data_key = mapping
-            entity_id = options.get(opt_key, "")
-
-            if not entity_id:
-                _LOGGER.debug("Param %s: entity not mapped, skip", param_key)
-                continue
-
-            try:
-                await self.hass.services.async_call(
-                    ha_domain,
-                    ha_service,
-                    {"entity_id": entity_id, data_key: value},
-                    blocking=True,
-                )
-                executed.append(param_key)
-                _LOGGER.info(
-                    "Executed: %s.%s on %s = %s",
-                    ha_domain, ha_service, entity_id, value,
-                )
-            except Exception as err:
-                errors.append({"entity": param_key, "error": str(err)})
-                _LOGGER.error(
-                    "Failed: %s.%s on %s: %s",
-                    ha_domain, ha_service, entity_id, err,
-                )
-
-        # export_limit_switch — obsługa osobna (on/off)
-        if "export_limit_enabled" in params:
-            switch_entity = options.get(OPT_ENTITY_EXPORT_LIMIT_SWITCH, "")
-            if switch_entity:
-                try:
-                    service = "turn_on" if params["export_limit_enabled"] else "turn_off"
-                    await self.hass.services.async_call(
-                        "switch",
-                        service,
-                        {"entity_id": switch_entity},
-                        blocking=True,
-                    )
-                    executed.append("export_limit_switch")
-                except Exception as err:
-                    errors.append({"entity": "export_limit_switch", "error": str(err)})
-
-        # Określ status
-        if errors and not executed:
-            status = "error"
-        elif errors:
-            status = "partial"
-        else:
-            status = "success"
-
-        _LOGGER.info(
-            "Command %s result: %s (executed=%s, errors=%d)",
-            request_id, status, executed, len(errors),
+        _LOGGER.warning("Nieznana komenda: %s", command)
+        await self._report_result(
+            request_id, "error", errors=[{"entity": "command", "error": f"Unknown command: {command}"}]
         )
 
-        await self._report_result(request_id, status, executed, errors)
+    async def _report_guard_result(self, request_id: str, result: GuardResult) -> None:
+        """Zaraportuj wynik razem ze śladem decyzji guardów."""
+        await self._report_result(
+            request_id,
+            result.status.value,
+            executed=list(result.params.keys()),
+            errors=[],
+            notes=[{"invariant": n.invariant, "message": n.message} for n in result.notes],
+        )
 
     async def _report_result(
         self,
@@ -327,13 +305,19 @@ class VolterCommandHandler:
         status: str,
         executed: list[str] | None = None,
         errors: list[dict[str, str]] | None = None,
+        notes: list[dict[str, str]] | None = None,
     ) -> None:
-        """Wyślij wynik komendy z powrotem do chmury jako telemetria z extra."""
+        """Wyślij wynik komendy z powrotem do chmury jako telemetria z extra.
+
+        `notes` to ślad decyzji guardów — dzięki temu w chmurze widać nie tylko
+        "co się nie udało", ale "który inwariant to zablokował i dlaczego".
+        """
         result = {
             "request_id": request_id,
             "status": status,
             "executed": executed or [],
             "errors": errors or [],
+            "notes": notes or [],
         }
 
         try:

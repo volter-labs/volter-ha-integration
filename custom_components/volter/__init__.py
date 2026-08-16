@@ -10,6 +10,7 @@ from homeassistant.core import HomeAssistant
 from .command_handler import VolterCommandHandler
 from .const import CONF_API_KEY, CONF_DEVICE_ID, CONF_SUPABASE_ANON_KEY, CONF_SUPABASE_URL, DOMAIN
 from .coordinator import VolterTelemetryCoordinator
+from .executor import VolterExecutor
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -32,7 +33,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: VolterConfigEntry) -> bo
         supabase_url=supabase_url,
     )
 
-    # Command handler — subskrybuje kanał Realtime i wykonuje service calls
+    # Executor — pętla wykonawcza harmonogramu + jedyna brama zapisu do falownika
+    executor = VolterExecutor(hass=hass, entry=entry)
+
+    # Command handler — subskrybuje kanał Realtime i deleguje do executora
     command_handler = VolterCommandHandler(
         hass=hass,
         entry=entry,
@@ -40,15 +44,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: VolterConfigEntry) -> bo
         supabase_url=supabase_url,
         anon_key=anon_key,
         api_key=api_key,
+        executor=executor,
     )
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
         "coordinator": coordinator,
         "command_handler": command_handler,
+        "executor": executor,
     }
 
-    # Uruchom coordinator i command handler
+    # Uruchom coordinator, executor i command handler
     await coordinator.async_start()
+    await executor.async_start()
     await command_handler.async_start()
 
     # Reaguj na zmiany w Options Flow (przeładuj encje)
@@ -67,12 +74,16 @@ async def async_unload_entry(hass: HomeAssistant, entry: VolterConfigEntry) -> b
 
     coordinator: VolterTelemetryCoordinator | None = data.get("coordinator")
     command_handler: VolterCommandHandler | None = data.get("command_handler")
+    executor: VolterExecutor | None = data.get("executor")
 
     if coordinator:
         await coordinator.async_stop()
 
     if command_handler:
         await command_handler.async_stop()
+
+    if executor:
+        await executor.async_stop()
 
     _LOGGER.info("Volter Energy integration unloaded")
     return True
