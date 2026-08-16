@@ -13,6 +13,7 @@ Odpowiednik w firmware: `components/executor/`. Ta sama maszyna, inna warstwa wy
 
 from __future__ import annotations
 
+import copy
 import logging
 import time
 from dataclasses import replace
@@ -450,7 +451,13 @@ class VolterExecutor:
             "slot": slot_info,
             "raw_params": raw_params,
             "would_write": {},
-            "last": self._last,
+            # R-14: kopia obronna — `async_diagnose` obiecuje ZERO mutacji stanu
+            # wewnętrznego ("suchy przebieg"). Żywa referencja do `self._last`
+            # przekazywana dalej do konsumenta (serwis HA -> chmura) łamałaby tę
+            # obietnicę w chwili, gdy ktoś zmodyfikowałby odpowiedź w miejscu.
+            # Głęboka kopia, bo `self._last` zawiera zagnieżdżone listy (`executed`,
+            # `errors`, `notes`) — płytki `dict(...)` dzieliłby te listy z oryginałem.
+            "last": copy.deepcopy(self._last),
         }
 
         # Guardy liczymy ZAWSZE, także bez harmonogramu — bo najczęstsze pytanie brzmi

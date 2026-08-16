@@ -75,8 +75,35 @@ def test_t1_soc_ponizej_rezerwy_zeruje_rozladowanie():
 # ── T-2: I-2 sprzeczna intencja ──────────────────────────────────────────────
 
 
-def test_t2_jednoczesne_ladowanie_i_rozladowanie_odrzucone():
+def test_t2_guard_bezposrednio_sprzeczna_intencja_odrzucona():
+    """Wywołuje `apply_guards` BEZPOŚREDNIO na już-"czystych" parametrach, z
+    pominięciem `sanitize_params` — sprawdza wyłącznie logikę I-2 w guardzie,
+    w oderwaniu od realnego toru komendy (`sanitize_params -> apply_guards`).
+
+    R-13c: dosłowne wartości z wektora T-2 specyfikacji (`charge_limit=3000`,
+    `discharge_limit=2000`) w realnym torze zostałyby odrzucone przez I-10
+    (zakres `charge_limit` to 0..200 A) ZANIM guard w ogóle zobaczyłby I-2 — ten
+    test celowo tego nie odzwierciedla. Realny tor pokrywa
+    `test_t2_pelny_tor_sanitize_i_guardy_sprzeczna_intencja_odrzucona` niżej.
+    """
     result = apply_guards({"charge_limit": 20.0, "discharge_limit": 30.0}, ctx())
+
+    assert result.status is Status.ERROR
+    assert result.params == {}
+    assert "I-2" in invariants(result)
+
+
+def test_t2_pelny_tor_sanitize_i_guardy_sprzeczna_intencja_odrzucona():
+    """R-13c: wektor T-2 pokryty REALNYM torem komendy — `sanitize_params`, potem
+    dopiero `apply_guards`. Wartości muszą mieścić się w `PARAM_SPECS` (I-10),
+    żeby sprzeczność faktycznie dotarła do I-2, a nie została odrzucona wcześniej
+    z mylącym powodem `I-10` zamiast `I-2` (dosłowne wartości z tabeli
+    specyfikacji, `charge_limit=3000`/`discharge_limit=2000`, tego testu by NIE
+    przeszły — `charge_limit` ma zakres 0..200 A)."""
+    limits = InverterLimits()
+    clean = sanitize_params({"charge_limit": 20.0, "discharge_limit": 30.0}, limits)
+
+    result = apply_guards(clean, ctx(limits=limits))
 
     assert result.status is Status.ERROR
     assert result.params == {}
@@ -220,8 +247,21 @@ def test_t7_tryb_backup_nie_pozwala_obnizyc_rezerwy():
 
 
 def test_t8_piata_zmiana_kierunku_w_godzinie_zignorowana():
+    """R-13b: `_current` startuje z `None`, więc PIERWSZE ustawienie kierunku nie
+    jest jeszcze "zmianą" (nie ma poprzedniego kierunku, względem którego mogłaby
+    zajść zmiana) — nie zużywa budżetu. Sekwencja niżej to: 1 darmowe ustawienie
+    startowe + 4 faktyczne odwrócenia, dokładnie w limicie N=4; dopiero PIĄTE
+    odwrócenie ma zostać zignorowane. Test wcześniej utrwalał off-by-one (budżet
+    efektywnie 3 zamiast 4), bo liczył ustawienie startowe jako pierwszą zmianę.
+    """
     limiter = DirectionLimiter(max_changes_per_hour=4)
-    sequence = [Action.CHARGE, Action.DISCHARGE, Action.CHARGE, Action.DISCHARGE]
+    sequence = [
+        Action.CHARGE,  # ustawienie startowe — darmowe
+        Action.DISCHARGE,  # zmiana 1
+        Action.CHARGE,  # zmiana 2
+        Action.DISCHARGE,  # zmiana 3
+        Action.CHARGE,  # zmiana 4 — ostatnia w budżecie
+    ]
 
     for i, action in enumerate(sequence):
         allowed, note = limiter.allows(action, now_ts=float(i))
@@ -229,18 +269,22 @@ def test_t8_piata_zmiana_kierunku_w_godzinie_zignorowana():
         assert note is None
         limiter.record(action, now_ts=float(i))
 
-    allowed, note = limiter.allows(Action.CHARGE, now_ts=5.0)
+    # Piąta faktyczna zmiana kierunku (DISCHARGE) przekracza budżet N=4.
+    allowed, note = limiter.allows(Action.DISCHARGE, now_ts=6.0)
     assert allowed is False
     assert note is not None and note.invariant == "I-8"
 
 
 def test_t8b_po_wyjsciu_z_okna_zmiany_znowu_dozwolone():
+    """R-13b: ustawienie startowe (CHARGE) darmowe, potem 2 faktyczne odwrócenia
+    wyczerpują budżet `max_changes_per_hour=2` — trzecie jest blokowane, dopóki
+    okno 1h się nie przesunie."""
     limiter = DirectionLimiter(max_changes_per_hour=2, window_s=3600.0)
-    for i, action in enumerate([Action.CHARGE, Action.DISCHARGE]):
+    for i, action in enumerate([Action.CHARGE, Action.DISCHARGE, Action.CHARGE]):
         limiter.record(action, now_ts=float(i))
 
-    assert limiter.allows(Action.CHARGE, now_ts=10.0)[0] is False
-    assert limiter.allows(Action.CHARGE, now_ts=4000.0)[0] is True
+    assert limiter.allows(Action.DISCHARGE, now_ts=10.0)[0] is False
+    assert limiter.allows(Action.DISCHARGE, now_ts=4000.0)[0] is True
 
 
 # ── T-9 / T-10: I-9 świeżość i wiarygodność telemetrii ───────────────────────

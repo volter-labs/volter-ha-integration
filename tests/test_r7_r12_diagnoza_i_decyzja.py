@@ -81,12 +81,21 @@ async def test_r7_diagnose_ignoruje_i8_throttled(fake_entry):
     `throttled`, zero zapisów. Ustawiamy `max_changes_per_hour=0`, żeby KAŻDA
     zmiana kierunku była zablokowana od razu — deterministyczne odwzorowanie T-8
     bez budowania historii. Realny `async_apply` zwróciłby THROTTLED, więc
-    `async_diagnose` nie może raportować `status='success'` i pełnego `would_write`."""
+    `async_diagnose` nie może raportować `status='success'` i pełnego `would_write`.
+
+    R-13b: pierwsze ustawienie kierunku (z `_current is None`) samo w sobie NIE
+    jest już zmianą (nie zużywa budżetu — patrz `test_guards.py::test_t8_*`), więc
+    same `max_changes_per_hour=0` by nie wystarczyło: kierunek slotu (`charge`)
+    startowałby jako darmowe pierwsze ustawienie i przeszedłby mimo zerowego
+    budżetu. Ustawiamy więc `_current` na przeciwny kierunek (`discharge`) z góry,
+    żeby zmiana na `charge` była FAKTYCZNĄ zmianą kierunku, a nie ustawieniem
+    startowym."""
     hass = _hass_ze_swiezym_stanem()
     fake_entry.options = dict(OPTIONS)
     executor = VolterExecutor(hass, fake_entry)
     executor._schedule = Schedule.from_dict(_schedule_charge())
     executor._direction = DirectionLimiter(max_changes_per_hour=0)
+    executor._direction._current = Action.DISCHARGE
     history_before = list(executor._direction._history)
     current_before = executor._direction._current
 

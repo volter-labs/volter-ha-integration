@@ -212,9 +212,13 @@ class GuardResult:
         self.notes.append(Note(invariant, message))
 
     def as_report(self) -> dict[str, Any]:
+        # R-14: kopia obronna. `params` bez `dict(...)` to żywa referencja do stanu
+        # guarda — konsument modyfikujący odpowiedź serwisu w miejscu (np. chmura
+        # albo test) mógłby podmienić `GuardResult.params`, mimo że kontrakt "raport"
+        # ma być migawką, nie uchwytem do stanu wewnętrznego.
         return {
             "status": self.status.value,
-            "params": self.params,
+            "params": dict(self.params),
             "executed": list(self.executed),
             # R-1: chmura musi widzieć, że guard podmienił intencję planu — inaczej
             # „plan mówił sprzedawaj, a falownik stoi" wygląda na awarię łącza.
@@ -367,7 +371,11 @@ def apply_guards(params: dict[str, Any], ctx: GuardContext) -> GuardResult:
     # I-1: SoC >= rezerwa użytkownika. Zeruj rozładowanie i podnieś dolny próg.
     # Rezerwa broni wyłącznie przed rozładowaniem — ładowanie poniżej rezerwy jest
     # dokładnie tym, czego użytkownik chce, więc nie wolno go tu blokować.
-    if state.soc <= cfg.soc_reserve:
+    #
+    # R-13a: inwariant brzmi `SoC >= soc_reserve` — przy SoC RÓWNYM rezerwie
+    # inwariant jest spełniony, więc warunek musi być ostry (`<`), nie `<=`.
+    # Dawne `<=` traktowało dokładną równość jako naruszenie.
+    if state.soc < cfg.soc_reserve:
         removed: list[str] = []
         for key in _DISCHARGE_HINTS:
             if out.pop(key, None) is not None:
@@ -377,13 +385,18 @@ def apply_guards(params: dict[str, Any], ctx: GuardContext) -> GuardResult:
             # falownik dostałby (albo zachował) tryb rozładowania i zjadł rezerwę
             # backup mimo zadziałania guarda.
             result.forced_action = Action.SELF_CONSUME
-        if out.get("eco_soc", 0) < cfg.soc_reserve:
+        # R-13a: PARTIAL ma znaczyć "coś realnie zmieniłem", nie "wynikowy eco_soc
+        # wypadł równy rezerwie". Bez osobnej flagi `eco_soc_raised` guard fałszywie
+        # zgłaszał PARTIAL, gdy komenda już niosła `eco_soc == soc_reserve` i nic
+        # więcej nie było do zrobienia.
+        eco_soc_raised = out.get("eco_soc", 0) < cfg.soc_reserve
+        if eco_soc_raised:
             out["eco_soc"] = cfg.soc_reserve
-        if removed or wants_discharge or out.get("eco_soc") == cfg.soc_reserve:
+        if removed or wants_discharge or eco_soc_raised:
             result.status = Status.PARTIAL
             result.note(
                 "I-1",
-                f"SoC={state.soc}% <= rezerwa {cfg.soc_reserve}%: "
+                f"SoC={state.soc}% < rezerwa {cfg.soc_reserve}%: "
                 f"rozładowanie zablokowane={wants_discharge}, usunięto {removed or 'brak'}, "
                 f"eco_soc podniesiony do {cfg.soc_reserve}%",
             )
@@ -518,6 +531,12 @@ class DirectionLimiter:
             return True, None
         if self._current == action:
             return True, None
+        # R-13b: `_current is None` znaczy "kierunek jeszcze nigdy nie był ustawiony"
+        # — pierwsze ustawienie nie jest ZMIANĄ kierunku (nie ma poprzedniego
+        # kierunku, względem którego mogłaby zajść zmiana), więc nie zużywa budżetu.
+        # Bez tego wyjątku efektywny budżet po starcie był o 1 mniejszy niż N.
+        if self._current is None:
+            return True, None
 
         self._prune(now_ts)
         changes = len(self._history)
@@ -530,7 +549,13 @@ class DirectionLimiter:
         return True, None
 
     def record(self, action: Action, now_ts: float) -> None:
-        if action in (Action.CHARGE, Action.DISCHARGE) and self._current != action:
+        # R-13b: symetrycznie do `allows` — pierwsze ustawienie kierunku (z
+        # `_current is None`) nie trafia do historii zmian, bo nią nie jest.
+        if (
+            action in (Action.CHARGE, Action.DISCHARGE)
+            and self._current is not None
+            and self._current != action
+        ):
             self._history.append((now_ts, action))
         self._current = action
 

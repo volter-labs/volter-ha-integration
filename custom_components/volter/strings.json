@@ -62,6 +62,15 @@
           "rated_power_w": "Inverter rated power (W)"
         }
       }
+    },
+    "selector": {
+      "user_mode": {
+        "options": {
+          "earn": "Earn — maximize arbitrage",
+          "autarky": "Autarky — maximize self-consumption",
+          "backup": "Backup — protect reserve"
+        }
+      }
     }
   }
 }
