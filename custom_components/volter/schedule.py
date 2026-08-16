@@ -246,6 +246,72 @@ class Slot:
         }
 
 
+def kierunek_slotu(slot: Slot) -> Action | None:
+    """Jednoznaczny kierunek przepływu baterii dla slotu albo `None` (U-1/U-6).
+
+    U-6: ta funkcja stoi TUTAJ, a nie w `mappers.py`, bo kierunek musi być znany
+    PRZED guardami. Dopóki wyprowadzał go wyłącznie mapper (za guardami), executor
+    podawał do `GuardContext` `action=slot.action` — czyli dla 41% slotów z mocą
+    zawsze `SELF_CONSUME` — i I-1 (rezerwa backup) oraz I-8 (anty-oscylacja) były
+    ślepe na kierunek opisowy. Mapper ma TŁUMACZYĆ intencję na nastawy, a nie ją
+    wyprowadzać; warstwa nad nim rozstrzyga, co slot naprawdę znaczy.
+    Moduł jest wolny od importów HA, więc funkcja przepisuje się na C razem
+    z resztą `schedule.py`/`guards.py`.
+
+    Chmura świadomie NIE podnosi do `mode='discharge'` slotów, w których falownik
+    fizycznie nigdzie się nie przełącza (GoodWe drenuje baterię natywnie). Kierunek
+    jedzie wtedy WYŁĄCZNIE w polach `discharge_purpose` / `charge_source` — zmierzone
+    41% slotów z mocą.
+
+    U-7: pierwotnym motywem chmury było też „nie budzić I-8". Od Tasku 13 (hipoteza
+    H-2) mapper oddaje takie sloty falownikowi jako `eco_discharge`/`eco_charge`, więc
+    przełączenie trybu JEST fizyczne — i musi zużywać budżet anty-oscylacyjny tak samo
+    jak jawne `mode='discharge'`. Inaczej naprzemienne plany przerzucały falownik bez
+    żadnego ograniczenia (zmierzone: 12 przełączeń w 24 minuty).
+
+    Rozstrzygnięcie `charge_source='pv'` → BRAK kierunku (wymóg 4 zadania U-1):
+    `eco_charge` realizuje zadaną moc ładowania i brakującą część dobiera Z SIECI
+    (hipoteza H-1), a slot `CHARGE_FROM_PV` mówi wprost „ładuj NADWYŻKĄ" — planer ma
+    osobny `CHARGE_FROM_GRID` na wypadek, gdy zakup jest zamierzony. Ładowanie
+    nadwyżką PV falownik robi natywnie w trybie neutralnym; tracimy nastawę mocy, ale
+    nie kupujemy prądu, o który nikt nie prosił. Ceną pomyłki w drugą stronę byłyby
+    realne pieniądze.
+
+    Brak `charge_source` przy `mode='charge'` zostawia stare zachowanie (ładowanie):
+    plan sprzed rozszerzenia kontraktu nie może przez tę zmianę stracić ładowania.
+    """
+    if slot.action is Action.CHARGE:
+        return None if slot.charge_source == "pv" else Action.CHARGE
+    if slot.action is Action.DISCHARGE:
+        return Action.DISCHARGE
+    # SELF_CONSUME / IDLE — kierunek może siedzieć wyłącznie w polach opisowych.
+    if slot.discharge_purpose is not None:
+        return Action.DISCHARGE
+    if slot.charge_source == "grid":
+        # Dziś nieosiągalne z chmury (`chargeSourceForAction` daje przy self_consume
+        # tylko 'pv'), ale gdy kontrakt to kiedyś dopuści, zgoda na pobór z sieci
+        # musi znaczyć to samo w obu miejscach.
+        return Action.CHARGE
+    return None
+
+
+def akcja_efektywna(slot: Slot) -> Action:
+    """Intencja slotu dla guardów (U-6) — to, co FAKTYCZNIE pojedzie na falownik.
+
+    `GuardContext.action` nie może być „może None": I-1 rozstrzyga po niej, czy
+    zdusić rozładowanie, a I-8 liczy po niej budżet zmian kierunku. Gdy kierunku
+    nie ma (`kierunek_slotu` → `None`), mapper zejdzie do trybu neutralnego i nie
+    zapisze mocy — więc jedyną prawdziwą odpowiedzią jest `SELF_CONSUME`, a dla
+    jawnego „stój" `IDLE`. Podanie tu `CHARGE` dla slotu, który kończy się trybem
+    `general` (`charge_source='pv'`), zużywałoby budżet I-8 na przełączenie, którego
+    falownik nigdy nie zobaczy — czyli dokładnie odwrotność wady U-7.
+    """
+    kierunek = kierunek_slotu(slot)
+    if kierunek is not None:
+        return kierunek
+    return Action.IDLE if slot.action is Action.IDLE else Action.SELF_CONSUME
+
+
 @dataclass(frozen=True)
 class Fallback:
     """Zachowanie po wygaśnięciu planu (I-5).
@@ -418,4 +484,6 @@ __all__ = [
     "Schedule",
     "Slot",
     "SCHEDULE_VERSION",
+    "akcja_efektywna",
+    "kierunek_slotu",
 ]

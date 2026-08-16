@@ -36,7 +36,7 @@ import logging
 from typing import Any
 
 from .guards import Action
-from .schedule import Slot
+from .schedule import Slot, akcja_efektywna, kierunek_slotu
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -61,55 +61,23 @@ _ostatnie_ostrzezenie_o_mocy: tuple | None = None
 DEFAULT_RATED_POWER_W = 10000.0
 
 
-def _kierunek(slot: Slot) -> Action | None:
-    """Jednoznaczny kierunek przepływu baterii dla slotu albo `None` (U-1).
+def _tryb_falownika(slot: Slot, modes: dict[Action, str]) -> str:
+    """Tryb falownika = TŁUMACZENIE akcji efektywnej na nazwę opcji encji select.
 
-    Liczony RAZ i sterujący i trybem, i mocą — te dwie nastawy muszą opisywać ten sam
-    przepływ, inaczej wraca dokładnie wada U-1 (moc bez komendy kierunku).
+    U-6: to jest cała rola mappera — przekład, nie decyzja. Skoro guardy pracują na
+    `schedule.akcja_efektywna(slot)`, to tryb wysłany na falownik musi być funkcją
+    DOKŁADNIE tej samej wartości; własna gałąź decyzyjna w mapperze mogłaby się z nią
+    rozjechać, a rozjazd tych dwóch miejsc jest dosłowną treścią U-6 (guard chroni
+    jedną intencję, falownik wykonuje inną).
 
-    Chmura świadomie NIE podnosi do `mode='discharge'` slotów, w których falownik
-    fizycznie nigdzie się nie przełącza (GoodWe drenuje baterię natywnie), żeby nie
-    budzić guarda anty-oscylacyjnego I-8. Kierunek jedzie wtedy WYŁĄCZNIE w polach
-    `discharge_purpose` / `charge_source` — zmierzone 41% slotów z mocą.
-
-    Rozstrzygnięcie `charge_source='pv'` → BRAK kierunku (wymóg 4 zadania): `eco_charge`
-    realizuje zadaną moc ładowania i brakującą część dobiera Z SIECI (hipoteza H-1),
-    a slot `CHARGE_FROM_PV` mówi wprost „ładuj NADWYŻKĄ" — planer ma osobny
-    `CHARGE_FROM_GRID` na wypadek, gdy zakup jest zamierzony. Ładowanie nadwyżką PV
-    falownik robi natywnie w trybie neutralnym; tracimy nastawę mocy, ale nie kupujemy
-    prądu, o który nikt nie prosił. Ceną pomyłki w drugą stronę byłyby realne pieniądze.
-
-    Brak `charge_source` przy `mode='charge'` zostawia stare zachowanie (ładowanie):
-    plan sprzed rozszerzenia kontraktu nie może przez tę zmianę stracić ładowania.
-    """
-    if slot.action is Action.CHARGE:
-        return None if slot.charge_source == "pv" else Action.CHARGE
-    if slot.action is Action.DISCHARGE:
-        return Action.DISCHARGE
-    # SELF_CONSUME / IDLE — kierunek może siedzieć wyłącznie w polach opisowych.
-    if slot.discharge_purpose is not None:
-        return Action.DISCHARGE
-    if slot.charge_source == "grid":
-        # Dziś nieosiągalne z chmury (`chargeSourceForAction` daje przy self_consume
-        # tylko 'pv'), ale gdy kontrakt to kiedyś dopuści, zgoda na pobór z sieci
-        # musi znaczyć to samo w obu miejscach.
-        return Action.CHARGE
-    return None
-
-
-def _tryb_falownika(slot: Slot, modes: dict[Action, str], kierunek: Action | None) -> str:
-    """Tryb pracy falownika: z kierunku, gdy jest jednoznaczny; neutralny, gdy go nie ma.
+    Brak jednoznacznego kierunku daje akcję neutralną (`SELF_CONSUME`, a dla jawnego
+    „stój" `IDLE`) — dotyczy to także slotu `charge` z PV: bez zgody na pobór z sieci
+    nie ma komendy ładowania (patrz `schedule.kierunek_slotu`).
 
     Tryb bierzemy zawsze z `modes`, nigdy z literału — `mode_map` jest parametrem
     właśnie po to, żeby dało się podmienić nazwy opcji encji select po Etapie 3.
     """
-    if kierunek is not None:
-        return modes[kierunek]
-    if slot.action is Action.IDLE:
-        return modes[Action.IDLE]
-    # Także dla slotu `charge` z PV: bez zgody na pobór z sieci nie ma komendy
-    # ładowania, a falownik ma pracować neutralnie (patrz `_kierunek`).
-    return modes[Action.SELF_CONSUME]
+    return modes[akcja_efektywna(slot)]
 
 
 def _moc_dla_kierunku(
@@ -164,8 +132,12 @@ def slot_to_params(
     zwolniony z guardów.
     """
     modes = mode_map or GOODWE_MODE_MAP
-    kierunek = _kierunek(slot)
-    tryb = _tryb_falownika(slot, modes, kierunek)
+    # U-6: kierunek bierzemy z `schedule.kierunek_slotu` — JEDNEGO źródła prawdy,
+    # z którego korzysta też executor PRZED guardami. Własne wyprowadzanie kierunku
+    # w mapperze (za guardami) było dokładnie przyczyną U-6 i U-7: I-1 i I-8 nie
+    # miały jak zobaczyć kierunku opisowego, bo powstawał on dopiero po nich.
+    kierunek = kierunek_slotu(slot)
+    tryb = _tryb_falownika(slot, modes)
     params: dict[str, Any] = {"mode": tryb}
 
     if slot.soc_target is not None:

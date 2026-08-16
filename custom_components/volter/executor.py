@@ -68,7 +68,7 @@ from .guards import (
 )
 from .ha_state import ParamBoundsCache, read_device_state, read_inverter_limits
 from .mappers import slot_to_params
-from .schedule import Fallback, Schedule, Slot
+from .schedule import Fallback, Schedule, Slot, akcja_efektywna
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -889,7 +889,10 @@ class VolterExecutor:
             result = await self.async_apply(
                 slot_to_params(slot, rated_power_w=rated),
                 price_pln_kwh=slot.price_pln_kwh,
-                action=slot.action,
+                # U-6: ten sam sposób wyprowadzenia intencji co na ścieżce planu —
+                # slot fallbacku dziś kierunku nie niesie, ale gałąź ratunkowa nie może
+                # być jedynym miejscem, które liczy akcję po staremu.
+                action=akcja_efektywna(slot),
                 source="fallback-awaryjny",
                 slot=slot,
             )
@@ -929,7 +932,9 @@ class VolterExecutor:
             return await self.async_apply(
                 params,
                 price_pln_kwh=slot.price_pln_kwh,
-                action=slot.action,
+                # U-6: jak wyżej — jedna reguła wyprowadzania intencji na wszystkich
+                # ścieżkach wykonania, żeby żadna nie została z własną wersją prawdy.
+                action=akcja_efektywna(slot),
                 source="fallback",
                 slot=slot,
             )
@@ -950,7 +955,15 @@ class VolterExecutor:
         return await self.async_apply(
             params,
             price_pln_kwh=slot.price_pln_kwh,
-            action=slot.action,
+            # U-6: do guardów idzie kierunek EFEKTYWNY, nie surowe `slot.action`.
+            # Chmura zostawia `mode='self_consume'` dla 41% slotów z mocą i wiezie
+            # kierunek w `discharge_purpose`/`charge_source`, więc `slot.action` mówił
+            # guardom „nic się nie dzieje" dokładnie tam, gdzie bateria się rozładowuje:
+            # I-1 nie dusiło rozładowania poniżej rezerwy (R-1 wskrzeszone nową ścieżką),
+            # a I-8 nie liczyło zmian kierunku (U-7). Rozstrzyga o tym funkcja czysta,
+            # z której korzysta też mapper — jedno źródło prawdy, bo rozjazd tych dwóch
+            # miejsc to natychmiastowy powrót U-6.
+            action=akcja_efektywna(slot),
             source="fallback" if is_fallback else "schedule",
             # R-1: slot jedzie dalej, żeby guardy mogły kazać przemapować go na tryb
             # bezpieczny bez wiedzy o nazwach trybów falownika.
@@ -1012,7 +1025,10 @@ class VolterExecutor:
         slot_action: Action | None = None
         if self._schedule is not None:
             slot, is_fallback = self._schedule.effective_slot(now)
-            slot_action = slot.action
+            # U-6/R-7: suchy przebieg musi liczyć intencję DOKŁADNIE tak samo jak realny
+            # tor zapisu — inaczej diagnoza pokazuje `forced_action=None` i pełne
+            # `would_write` tam, gdzie realny przebieg dusi rozładowanie przez I-1.
+            slot_action = akcja_efektywna(slot)
             rated = float(options.get(OPT_RATED_POWER_W, DEFAULT_RATED_POWER_W))
             raw_params = slot_to_params(slot, rated_power_w=rated)
             slot_info = {
@@ -1020,6 +1036,12 @@ class VolterExecutor:
                 "from": slot.start.isoformat(),
                 "to": slot.end.isoformat(),
                 "action": slot.action.value,
+                # U-6: `action` to DOSŁOWNE pole planu, a `action_efektywna` to intencja,
+                # na której naprawdę pracują guardy. Dla 41% slotów z mocą te dwie
+                # wartości się różnią (`self_consume` vs `discharge`) i bez pokazania
+                # obok siebie nie da się na żywym sprzęcie odróżnić „plan tak mówił"
+                # od „urządzenie tak zrozumiało" — a po to ten raport istnieje.
+                "action_efektywna": slot_action.value,
                 "soc_target": slot.soc_target,
                 "price_pln_kwh": slot.price_pln_kwh,
                 # U-1: bez tych trzech pól raport nie odróżnia „slot bez kierunku" od
