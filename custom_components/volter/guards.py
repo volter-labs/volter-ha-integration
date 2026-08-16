@@ -68,13 +68,16 @@ PARAM_SPECS: dict[str, ParamSpec] = {
     "export_limit": ParamSpec(0, 30000, "W", to_confirm=True),
 }
 
-#: Parametry, których obecność oznacza intencję ładowania / rozładowania.
-#: Używane przez I-2 do wykrycia sprzeczności i przez I-1 do zerowania rozładowania.
+#: Parametry, których obecność sugeruje intencję ładowania / rozładowania.
 #:
-#: TODO(Etap-1): ta heurystyka jest słaba, bo w GoodWe `discharge_limit` to głębokość
-#: rozładowania (DoD, %), czyli limit, a nie intencja. Docelowo intencja przychodzi
-#: wprost w harmonogramie (`schedule.Slot.action`) i heurystyka jest potrzebna wyłącznie
-#: dla starego kontraktu SET_WORK_MODE z surowymi parametrami. Potwierdzić semantykę
+#: R-1: to jest WYŁĄCZNIE fallback dla starego kontraktu SET_WORK_MODE z surowymi
+#: parametrami — czyli dla `GuardContext.action is None`. Na ścieżce harmonogramu
+#: heurystyka jest ślepa, bo `slot_to_params` tych kluczy nigdy nie emituje (intencja
+#: slotu siedzi w nieprzezroczystej dla guardów nazwie trybu), więc I-1 i I-2 były tam
+#: martwe. Pierwszeństwo ma zawsze jawna intencja z planu.
+#:
+#: TODO(Etap-1): heurystyka jest dodatkowo słaba, bo w GoodWe `discharge_limit` to
+#: głębokość rozładowania (DoD, %), czyli limit, a nie intencja. Potwierdzić semantykę
 #: przy okazji mapy nastaw GoodWe.
 _CHARGE_HINTS = ("charge_limit",)
 _DISCHARGE_HINTS = ("discharge_limit",)
@@ -130,6 +133,11 @@ class GuardContext:
     limits: InverterLimits = field(default_factory=InverterLimits)
     config: UserConfig = field(default_factory=UserConfig)
     price_pln_kwh: float | None = None
+    #: Jawna intencja planu (R-1). Gdy podana, I-1 i I-2 pracują na niej, bo tylko ona
+    #: przetrwa mapowanie na nastawy falownika — nazwa trybu jest dla guardów
+    #: nieprzezroczysta. `None` oznacza stary kontrakt SET_WORK_MODE z surowymi
+    #: parametrami i włącza heurystykę po kluczach.
+    action: "Action | None" = None
     #: Maksymalny dopuszczalny wiek odczytu (I-9).
     max_state_age_s: float = 300.0
     #: Maksymalny sensowny skok SoC między odczytami w punktach procentowych (I-9).
@@ -164,6 +172,12 @@ class GuardResult:
     #: mógł część pominąć, a zapis mógł się nie powieść. Raport do chmury musi
     #: opierać się na tym polu, nie na `params` (N-4).
     executed: list[str] = field(default_factory=list)
+    #: Akcja, którą guardy WYMUSZAJĄ zamiast intencji planu (R-1). Ustawiana, gdy I-1
+    #: blokuje rozładowanie: samo usunięcie parametrów nie wystarcza, bo falownik
+    #: zostałby w trybie z poprzedniego slotu. Guardy nie znają nazw trybów falownika,
+    #: więc zwracają samą intencję — przetłumaczy ją mapper, jedyne miejsce, które te
+    #: nazwy zna.
+    forced_action: "Action | None" = None
 
     @property
     def rejected(self) -> bool:
@@ -177,6 +191,9 @@ class GuardResult:
             "status": self.status.value,
             "params": self.params,
             "executed": list(self.executed),
+            # R-1: chmura musi widzieć, że guard podmienił intencję planu — inaczej
+            # „plan mówił sprzedawaj, a falownik stoi" wygląda na awarię łącza.
+            "forced_action": self.forced_action.value if self.forced_action else None,
             "notes": [{"invariant": n.invariant, "message": n.message} for n in self.notes],
         }
 
@@ -283,9 +300,16 @@ def apply_guards(params: dict[str, Any], ctx: GuardContext) -> GuardResult:
         result.params = {}
         return result
 
+    # Intencja komendy. R-1: pierwszeństwo ma to, co powiedział plan (`ctx.action`),
+    # bo tylko ono przeżywa mapowanie na nastawy falownika. Heurystyka po kluczach
+    # dokłada się do intencji (a nie zastępuje jej), żeby I-2 wyłapało sprzeczność
+    # między planem a surowymi parametrami; bez `ctx.action` zostaje jedynym źródłem.
+    hint_charge = any(out.get(k, 0) for k in _CHARGE_HINTS)
+    hint_discharge = any(out.get(k, 0) for k in _DISCHARGE_HINTS)
+    wants_charge = hint_charge or ctx.action is Action.CHARGE
+    wants_discharge = hint_discharge or ctx.action is Action.DISCHARGE
+
     # I-2: sprzeczna intencja (jednoczesne ładowanie i rozładowanie).
-    wants_charge = any(out.get(k, 0) for k in _CHARGE_HINTS)
-    wants_discharge = any(out.get(k, 0) for k in _DISCHARGE_HINTS)
     if wants_charge and wants_discharge:
         result.status = Status.ERROR
         result.note("I-2", "komenda żąda jednocześnie ładowania i rozładowania")
@@ -303,19 +327,27 @@ def apply_guards(params: dict[str, Any], ctx: GuardContext) -> GuardResult:
         return result
 
     # I-1: SoC >= rezerwa użytkownika. Zeruj rozładowanie i podnieś dolny próg.
+    # Rezerwa broni wyłącznie przed rozładowaniem — ładowanie poniżej rezerwy jest
+    # dokładnie tym, czego użytkownik chce, więc nie wolno go tu blokować.
     if state.soc <= cfg.soc_reserve:
         removed: list[str] = []
         for key in _DISCHARGE_HINTS:
             if out.pop(key, None) is not None:
                 removed.append(key)
+        if wants_discharge:
+            # R-1: intencja rozładowania musi zostać wygaszona u źródła. Bez tego
+            # falownik dostałby (albo zachował) tryb rozładowania i zjadł rezerwę
+            # backup mimo zadziałania guarda.
+            result.forced_action = Action.SELF_CONSUME
         if out.get("eco_soc", 0) < cfg.soc_reserve:
             out["eco_soc"] = cfg.soc_reserve
-        if removed or out.get("eco_soc") == cfg.soc_reserve:
+        if removed or wants_discharge or out.get("eco_soc") == cfg.soc_reserve:
             result.status = Status.PARTIAL
             result.note(
                 "I-1",
                 f"SoC={state.soc}% <= rezerwa {cfg.soc_reserve}%: "
-                f"usunięto {removed or 'brak'}, eco_soc podniesiony do {cfg.soc_reserve}%",
+                f"rozładowanie zablokowane={wants_discharge}, usunięto {removed or 'brak'}, "
+                f"eco_soc podniesiony do {cfg.soc_reserve}%",
             )
 
     # I-3: przycięcie do granic sprzętowych.

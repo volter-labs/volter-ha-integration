@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import time
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -53,7 +54,7 @@ from .guards import (
 )
 from .ha_state import read_device_state, read_inverter_limits
 from .mappers import slot_to_params
-from .schedule import Schedule
+from .schedule import Schedule, Slot
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -123,8 +124,15 @@ class VolterExecutor:
         price_pln_kwh: float | None = None,
         action: Action | None = None,
         source: str = "cloud",
+        slot: Slot | None = None,
+        _remapped: bool = False,
     ) -> GuardResult:
-        """Jedyna droga do falownika: sanityzacja → guardy → throttle → zapis."""
+        """Jedyna droga do falownika: sanityzacja → guardy → throttle → zapis.
+
+        `slot` podaje ścieżka harmonogramu. Jest potrzebny wyłącznie po to, żeby przy
+        `GuardResult.forced_action` dało się przemapować slot na tryb bezpieczny (R-1);
+        `_remapped` gwarantuje, że dzieje się to najwyżej raz.
+        """
         options = dict(self._entry.options)
         limits = read_inverter_limits(self.hass, options)
         state = read_device_state(self.hass, options, self._prev_soc)
@@ -149,6 +157,10 @@ class VolterExecutor:
             limits=limits,
             config=cfg,
             price_pln_kwh=price_pln_kwh,
+            # R-1: bez jawnej intencji guardy musiałyby zgadywać kierunek z nazw trybów
+            # falownika, których świadomie nie znają — I-1 i I-2 były przez to martwe
+            # na całej ścieżce harmonogramu.
+            action=action,
             max_state_age_s=MAX_STATE_AGE_S,
             max_soc_jump_pp=MAX_SOC_JUMP_PP,
         )
@@ -162,6 +174,52 @@ class VolterExecutor:
             _LOGGER.warning("[%s] Zapis wstrzymany, status=%s", source, result.status.value)
             self._remember(source, result, [], [])
             return result
+
+        # R-1: guard podmienił intencję planu (np. I-1 zdusiło rozładowanie). Zapis
+        # ORYGINALNYCH parametrów byłby wtedy szkodliwy, bo `mode` nadal niesie tryb
+        # rozładowania — wracamy więc do mappera po komplet nastaw dla trybu bezpiecznego.
+        # Przemapowanie robimy najwyżej raz (`_remapped`), żeby mapper i guardy nie
+        # mogły wpaść w pętlę, gdyby nowa akcja też została zakwestionowana.
+        if result.forced_action is not None and not _remapped:
+            if slot is not None:
+                forced_slot = replace(slot, action=result.forced_action)
+                rated = float(options.get(OPT_RATED_POWER_W, DEFAULT_RATED_POWER_W))
+                _LOGGER.warning(
+                    "[%s] Guardy wymusiły akcję %s zamiast %s — przemapowuję slot",
+                    source,
+                    result.forced_action.value,
+                    (action.value if action else "?"),
+                )
+                forced = await self.async_apply(
+                    slot_to_params(forced_slot, rated_power_w=rated),
+                    price_pln_kwh=price_pln_kwh,
+                    action=result.forced_action,
+                    source=source,
+                    slot=forced_slot,
+                    _remapped=True,
+                )
+                # Powód wymuszenia (nota I-1) powstał w PIERWSZYM przebiegu — bez przeniesienia
+                # go dalej raport do chmury nie tłumaczyłby, czemu plan nie został wykonany.
+                forced.notes = list(result.notes) + list(forced.notes)
+                forced.forced_action = result.forced_action
+                if forced.status is Status.SUCCESS:
+                    forced.status = Status.PARTIAL
+                self._remember(source, forced, list(forced.executed), self._last.get("errors", []))
+                return forced
+
+            if "mode" in result.params:
+                # Stary kontrakt bez slotu: nie ma z czego zbudować kompletu nastaw dla
+                # trybu bezpiecznego, ale wepchnięcie falownika w rozładowanie poniżej
+                # rezerwy byłoby wprost naruszeniem I-1. Zostawiamy resztę parametrów
+                # (m.in. podniesiony eco_soc) — pętla harmonogramu poprawi tryb w ≤60 s.
+                pominiety = result.params.pop("mode")
+                result.note(
+                    "I-1",
+                    f"tryb {pominiety!r} pominięty — komenda bez slotu nie może wymusić "
+                    f"{result.forced_action.value}",
+                )
+                if result.status is Status.SUCCESS:
+                    result.status = Status.PARTIAL
 
         now_ts = time.monotonic()
 
@@ -246,6 +304,9 @@ class VolterExecutor:
             price_pln_kwh=slot.price_pln_kwh,
             action=slot.action,
             source="fallback" if is_fallback else "schedule",
+            # R-1: slot jedzie dalej, żeby guardy mogły kazać przemapować go na tryb
+            # bezpieczny bez wiedzy o nazwach trybów falownika.
+            slot=slot,
         )
 
     # ── diagnostyka ──────────────────────────────────────────────────────────
@@ -287,8 +348,10 @@ class VolterExecutor:
         now = datetime.now(timezone.utc)
         slot_info: dict[str, Any] = {"source": "brak harmonogramu"}
         raw_params: dict[str, Any] = {}
+        slot_action: Action | None = None
         if self._schedule is not None:
             slot, is_fallback = self._schedule.effective_slot(now)
+            slot_action = slot.action
             rated = float(options.get(OPT_RATED_POWER_W, DEFAULT_RATED_POWER_W))
             raw_params = slot_to_params(slot, rated_power_w=rated)
             slot_info = {
@@ -342,6 +405,9 @@ class VolterExecutor:
                 limits=limits,
                 config=cfg,
                 price_pln_kwh=slot_info.get("price_pln_kwh"),
+                # R-1: suchy przebieg musi widzieć dokładnie tę samą intencję co realny,
+                # inaczej diagnostyka pokazywałaby zapis, którego I-1 by nie przepuściło.
+                action=slot_action,
                 max_state_age_s=MAX_STATE_AGE_S,
                 max_soc_jump_pp=MAX_SOC_JUMP_PP,
             ),
