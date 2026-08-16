@@ -251,7 +251,12 @@ class VolterCommandHandler:
         """
         command = payload.get("command", "")
         params = payload.get("params", {}) or {}
-        request_id = payload.get("request_id", "unknown")
+        # R-4: `payload.get('request_id', 'unknown')` sprawiało, że WSZYSTKIE komendy
+        # bez request_id (ręczny broadcast — smoke test Fazy C) dzieliły jeden wspólny,
+        # truthy klucz dedup. Po pierwszej udanej każda następna była cicho odrzucana
+        # jako duplikat aż do restartu HA. `None` + `RequestDeduplicator` (guards.py)
+        # nigdy nie dedukuje `None` — więc brak request_id oznacza "nigdy nie deduplikuj".
+        request_id = payload.get("request_id")
 
         # L-4: idempotencja. Zapamiętujemy DOPIERO po wykonaniu i tylko gdy komenda
         # nie skończyła się błędem — inaczej nieudana próba blokowałaby retry z chmury
@@ -261,43 +266,83 @@ class VolterCommandHandler:
             await self._report_result(request_id, "duplicate")
             return
 
+        # R-10: `params` z chmury to dowolny JSON. `infer_action`/`sanitize_params`
+        # zakładają dict (`.get`, `.items`) — cokolwiek innego (np. lista) wywala
+        # AttributeError. Walidujemy jawnie zamiast czekać na crash w głębi guardów,
+        # żeby powód błędu w raporcie do chmury był czytelny.
+        if not isinstance(params, dict):
+            _LOGGER.warning(
+                "Komenda %s odrzucona: params nie jest obiektem (jest %s)",
+                request_id, type(params).__name__,
+            )
+            await self._report_result(
+                request_id, "error",
+                errors=[{
+                    "entity": "params",
+                    "error": f"params musi być obiektem, jest {type(params).__name__}",
+                }],
+            )
+            return
+
         _LOGGER.info(
             "Komenda: %s (request_id=%s, params=%s)", command, request_id, params
         )
 
-        if command == "SET_SCHEDULE":
-            raw = payload.get("schedule") or params.get("schedule") or params
-            try:
-                result = await self._executor.async_set_schedule(raw)
-            except Exception as err:  # noqa: BLE001
-                _LOGGER.error("Nie udało się przyjąć harmonogramu: %s", err)
-                await self._report_result(
-                    request_id, "error", errors=[{"entity": "schedule", "error": str(err)}]
-                )
+        # R-10: bariera na wyjątki. Bez niej cokolwiek wywali się w treści komendy
+        # (dziś to głównie zła forma `params`, jutro może być cokolwiek innego)
+        # propaguje przez `_handle_message` do `_connect_and_listen`, którego `finally`
+        # zamyka WebSocket — zrywając Realtime i wpychając integrację w exponential
+        # backoff zamiast po prostu zaraportować błąd JEDNEJ komendy.
+        try:
+            if command == "SET_SCHEDULE":
+                raw = payload.get("schedule") or params.get("schedule") or params
+                try:
+                    result = await self._executor.async_set_schedule(raw)
+                except Exception as err:  # noqa: BLE001
+                    _LOGGER.error("Nie udało się przyjąć harmonogramu: %s", err)
+                    await self._report_result(
+                        request_id, "error", errors=[{"entity": "schedule", "error": str(err)}]
+                    )
+                    return
+                await self._report_guard_result(request_id, result)
                 return
-            await self._report_guard_result(request_id, result)
-            return
 
-        if command == "SET_WORK_MODE":
-            result = await self._executor.async_apply(
-                params, action=infer_action(params), source="cloud"
+            if command == "SET_WORK_MODE":
+                result = await self._executor.async_apply(
+                    params, action=infer_action(params), source="cloud"
+                )
+                await self._report_guard_result(request_id, result)
+                return
+
+            _LOGGER.warning("Nieznana komenda: %s", command)
+            await self._report_result(
+                request_id, "error",
+                errors=[{"entity": "command", "error": f"Unknown command: {command}"}],
             )
-            await self._report_guard_result(request_id, result)
-            return
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.error("Nieoczekiwany błąd wykonania komendy %s: %s", command, err)
+            await self._report_result(
+                request_id, "error", errors=[{"entity": "command", "error": str(err)}]
+            )
 
-        _LOGGER.warning("Nieznana komenda: %s", command)
-        await self._report_result(
-            request_id, "error", errors=[{"entity": "command", "error": f"Unknown command: {command}"}]
-        )
+    def _remember_if_effective(self, request_id: str, result: GuardResult) -> None:
+        """Zapamiętaj request_id TYLKO gdy komenda faktycznie coś zapisała (R-2).
 
-    def _remember_unless_error(self, request_id: str, status: str) -> None:
-        """Zapamiętaj request_id, chyba że komenda skończyła się błędem (N-5)."""
-        if status != Status.ERROR.value:
+        `Status.ERROR` (odrzucone) dotąd był jedynym wykluczeniem, ale `THROTTLED`
+        (I-8) i `DEGRADED` (I-9) są z definicji równie przejściowe — w obu do falownika
+        nie poszło nic, a mimo to były zapamiętywane, więc retry z chmury po ustaniu
+        przyczyny trafiał w "duplicate" i komenda przepadała na stałe.
+        `SUCCESS`/`PARTIAL` z pustym `executed` (np. wszystko odfiltrował throttle I-6,
+        bo wartość się nie zmieniła albo minął zbyt krótki czas od ostatniego zapisu)
+        to ten sam przypadek "nic nie poszło do falownika" — świadomie traktujemy go
+        tak samo: brak zapisu nie blokuje retry, niezależnie od statusu guardów.
+        """
+        if result.status in (Status.SUCCESS, Status.PARTIAL) and result.executed:
             self._dedup.remember(request_id)
 
     async def _report_guard_result(self, request_id: str, result: GuardResult) -> None:
         """Zaraportuj wynik razem ze śladem decyzji guardów."""
-        self._remember_unless_error(request_id, result.status.value)
+        self._remember_if_effective(request_id, result)
         await self._report_result(
             request_id,
             result.status.value,

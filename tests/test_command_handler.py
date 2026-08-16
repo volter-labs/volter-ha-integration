@@ -38,9 +38,14 @@ async def test_n5_retry_po_bledzie_jest_wykonywany_ponownie():
 
 @pytest.mark.asyncio
 async def test_t12_powtorka_po_sukcesie_jest_pomijana():
+    # R-2: dedup ma pamiętać TYLKO komendy, które faktycznie coś zapisały do falownika —
+    # `executed` musi być niepuste, inaczej ten test modelowałby dokładnie przypadek
+    # "SUCCESS bez zapisu", który zgodnie z R-2 MUSI zostać retryowalny (patrz
+    # tests/test_r2_r4_r10_command_handler.py::test_r2_success_z_pustym_executed_nie_blokuje_retry).
     executor = AsyncMock()
     executor.async_apply.return_value = GuardResult(params={"eco_soc": 30.0},
-                                                    status=Status.SUCCESS)
+                                                    status=Status.SUCCESS,
+                                                    executed=["eco_soc"])
     handler = _handler(executor)
 
     payload = {"command": "SET_WORK_MODE", "request_id": "req-2", "params": {"eco_soc": 30}}
