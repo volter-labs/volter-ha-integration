@@ -103,6 +103,20 @@ MAX_SOC_RATE_PP_PER_MIN = 4.0
 #: poniżej rozdzielczości czujnika i degradował instalację na zaokrągleniu.
 MIN_SOC_JUMP_TOLERANCE_PP = 5.0
 
+#: RR-2 (reszta R-8) — czas życia zapamiętanych granic `min`/`max` encji `number`.
+#:
+#: Po co w ogóle pamięć: bez niej werdykt I-10 zależał od DOSTĘPNOŚCI encji — ta sama
+#: komenda dostawała raz `success`, raz `error`, zależnie od tego, czy integracja
+#: falownika akurat odpowiada. To niedeterminizm widoczny dla użytkownika.
+#:
+#: Dlaczego 6 h: `min`/`max` to zakres rejestru falownika, czyli właściwość sprzętu —
+#: zmienia się przy rekonfiguracji, aktualizacji firmware albo wymianie urządzenia,
+#: a nie w czasie pracy. TTL musi być DŁUŻSZY niż realna przerwa w telemetrii (sonda
+#: RR-1: 40 min niedostępności; restart HA/falownika: minuty) i KRÓTSZY niż czas,
+#: w którym sprzęt mógłby się realnie zmienić bez restartu HA. Cache żyje wyłącznie
+#: w pamięci procesu, więc górną granicą ryzyka i tak jest jedna sesja HA.
+PARAM_BOUNDS_CACHE_TTL_S = 21600.0
+
 #: I-8 — maksymalna liczba zmian kierunku ładowanie<->rozładowanie na godzinę.
 MAX_DIRECTION_CHANGES_PER_HOUR = 4
 

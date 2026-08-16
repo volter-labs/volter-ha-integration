@@ -114,29 +114,33 @@ def test_t2_pelny_tor_sanitize_i_guardy_sprzeczna_intencja_odrzucona():
 
 
 def test_t3_setpoint_powyzej_granicy_falownika_przyciety_a_nie_odrzucony():
-    """T-3 dosłownie: `max_charge_w=5000`, komenda `charge_limit=8000` → zapis 5000,
-    status `success` z adnotacją o przycięciu, powód I-3.
+    """T-3: `max_charge_w=5000`, komenda `charge_limit=8000` → zapis 5000 z adnotacją I-3.
 
     R-8: ten test asertował wcześniej ODRZUCENIE przez I-10 — czyli opisywał ówczesną
     implementację (I-3 w części mocowej było martwe), a nie wymaganie ze specyfikacji.
     Granica bierze się dziś z atrybutu `max` encji `number` (`InverterLimits.param_bounds`).
+
+    RR-2: status to `partial`, nie `success`. Specyfikacja mówi „success z adnotacją",
+    ale wtedy chmura nie odróżnia „zastosowano 8000" od „zastosowano 5000 zamiast 8000" —
+    informacja o niezrealizowanym setpoincie jest ważniejsza niż litera T-3.
     """
     limits = InverterLimits(param_bounds={"charge_limit": ParamBounds(0.0, 5000.0)})
 
     result = apply_guards(sanitize_params({"charge_limit": 8000.0}, limits), ctx(limits=limits))
 
     assert result.params["charge_limit"] == 5000.0
-    assert result.status is Status.SUCCESS
+    assert result.status is Status.PARTIAL
     assert "I-3" in invariants(result)
 
 
 def test_t3_eco_soc_przyciety_do_limitu_sprzetowego():
+    """RR-2: jak wyżej — przycięcie jest sygnalizowane statusem, nie tylko notą."""
     result = apply_guards(
         {"eco_soc": 95.0}, ctx(limits=InverterLimits(soc_max_hw=90.0))
     )
 
     assert result.params["eco_soc"] == 90.0
-    assert result.status is Status.SUCCESS
+    assert result.status is Status.PARTIAL
     assert "I-3" in invariants(result)
 
 

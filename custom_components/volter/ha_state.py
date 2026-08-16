@@ -7,6 +7,7 @@ i testowalne na hoście (a docelowo przepisywalne na C).
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timezone
 
 from homeassistant.core import HomeAssistant, State
@@ -18,6 +19,7 @@ from .const import (
     OPT_ENTITY_GRID_POWER,
     OPT_ENTITY_PV_POWER,
     OPT_ENTITY_SOC,
+    PARAM_BOUNDS_CACHE_TTL_S,
 )
 from .guards import DeviceState, InverterLimits, ParamBounds
 
@@ -125,7 +127,57 @@ def _bounds(state: State | None) -> ParamBounds | None:
     return ParamBounds(lo=lo, hi=hi)
 
 
-def read_inverter_limits(hass: HomeAssistant, options: dict) -> InverterLimits:
+class ParamBoundsCache:
+    """RR-2 (reszta R-8): ostatnie ZNANE granice nastaw, per parametr.
+
+    Powód: bez pamięci werdykt I-10 zależał od DOSTĘPNOŚCI encji — ta sama komenda
+    dostawała raz `success` (encja podała `max`), raz `error` (encja `unavailable`,
+    więc `_bounds` zwracało `None` i wracał zgadywany zakres z `PARAM_SPECS`).
+    Dla użytkownika wyglądało to na losowe odrzucanie poleceń.
+
+    Granice `min`/`max` encji `number` to właściwość SPRZĘTU (zakres rejestru), a nie
+    jego stan — chwilowa niedostępność integracji nie zmienia tego, co falownik
+    przyjmie. Pamięć jest jednak ograniczona w czasie (`ttl_s`), bo po wymianie albo
+    przekonfigurowaniu falownika stara granica byłaby groźniejsza niż jej brak.
+    Cache żyje wyłącznie w pamięci procesu — restart HA i tak go czyści.
+    """
+
+    def __init__(self, ttl_s: float = PARAM_BOUNDS_CACHE_TTL_S) -> None:
+        self.ttl_s = ttl_s
+        self._entries: dict[str, tuple[ParamBounds, float]] = {}
+
+    def remember(self, param: str, bounds: ParamBounds, now: float) -> None:
+        self._entries[param] = (bounds, now)
+
+    def get(self, param: str, now: float) -> ParamBounds | None:
+        entry = self._entries.get(param)
+        if entry is None:
+            return None
+        bounds, ts = entry
+        if now - ts > self.ttl_s:
+            # Wygasłego wpisu nie usuwamy w miejscu: `snapshot()` ma być tanią kopią,
+            # a wygaśnięcie i tak liczy się od znacznika, nie od obecności w słowniku.
+            return None
+        return bounds
+
+    def snapshot(self) -> "ParamBoundsCache":
+        """Kopia do SUCHEGO przebiegu (`async_diagnose`).
+
+        RR-2: diagnoza musi widzieć te same granice co realny tor zapisu, ale nie wolno
+        jej niczego zapamiętać — kontrakt „zero mutacji stanu" z R-7/R-14. Zapisy lądują
+        na kopii i giną razem z nią.
+        """
+        kopia = ParamBoundsCache(self.ttl_s)
+        kopia._entries = dict(self._entries)
+        return kopia
+
+
+def read_inverter_limits(
+    hass: HomeAssistant,
+    options: dict,
+    bounds_cache: "ParamBoundsCache | None" = None,
+    now: float | None = None,
+) -> InverterLimits:
     """Odczytaj to, co da się odczytać z HA.
 
     `allowed_modes` bierzemy z atrybutu `options` encji select trybu pracy — dzięki temu
@@ -134,7 +186,13 @@ def read_inverter_limits(hass: HomeAssistant, options: dict) -> InverterLimits:
     `param_bounds` bierzemy z atrybutów `min`/`max` encji `number` (R-8). To jedyne
     źródło realnych granic dostępne przed mapą nastaw z Etapu 3, a bez nich część mocowa
     I-3 była martwa: wektor T-3 („przytnij do granicy") nie miał do czego przycinać.
+
+    RR-2: `bounds_cache` przechowuje ostatnie znane granice i wchodzi WYŁĄCZNIE wtedy,
+    gdy encja akurat nic sensownego nie podaje — dzięki temu werdykt I-10 nie zmienia
+    się w zależności od tego, czy integracja falownika chwilowo odpowiada. Świeży odczyt
+    ma zawsze pierwszeństwo (cache jest awaryjny, nie autorytatywny).
     """
+    timestamp = time.monotonic() if now is None else now
     allowed: tuple[str, ...] | None = None
     mode_entity = options.get(OPT_ENTITY_EMS_MODE)
     if mode_entity:
@@ -152,8 +210,22 @@ def read_inverter_limits(hass: HomeAssistant, options: dict) -> InverterLimits:
         found = _bounds(hass.states.get(entity_id))
         if found is not None:
             bounds[param] = found
+            if bounds_cache is not None:
+                bounds_cache.remember(param, found, timestamp)
+            continue
+        if bounds_cache is not None:
+            # RR-2: encja chwilowo nie odpowiada — sięgamy po ostatnią znaną granicę
+            # zamiast udawać, że sprzęt nagle przestał mieć zakres. Bez pamięci ta sama
+            # komenda dostawała raz `success`, raz `error`, zależnie od stanu encji.
+            zapamietana = bounds_cache.get(param, timestamp)
+            if zapamietana is not None:
+                bounds[param] = zapamietana
+                _LOGGER.debug(
+                    "Granice %s z pamięci (encja %s niedostępna): %s..%s [RR-2]",
+                    param, entity_id, zapamietana.lo, zapamietana.hi,
+                )
 
     return InverterLimits(allowed_modes=allowed, param_bounds=bounds)
 
 
-__all__ = ["read_device_state", "read_inverter_limits"]
+__all__ = ["ParamBoundsCache", "read_device_state", "read_inverter_limits"]

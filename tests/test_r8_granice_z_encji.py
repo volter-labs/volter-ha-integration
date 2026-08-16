@@ -50,15 +50,18 @@ def invariants(result) -> set[str]:
 
 
 def test_r8_t3_charge_limit_przyciety_do_granicy_falownika():
-    """T-3: `max_charge_w=5000`, komenda `charge_limit=8000` → zapis 5000,
-    status `success` z adnotacją o przycięciu, powód I-3."""
+    """T-3: `max_charge_w=5000`, komenda `charge_limit=8000` → zapis 5000 z adnotacją I-3.
+
+    RR-2: status zmieniony na `partial` decyzją właściciela — patrz
+    `test_rr2_przyciecie_do_granicy_encji_daje_partial`. Sedno R-8 (przycinamy zamiast
+    odrzucać przez I-10) zostaje nietknięte: wartość jest ZASTOSOWANA na granicy."""
     limits = InverterLimits(param_bounds={"charge_limit": ParamBounds(0.0, 5000.0)})
 
     clean = sanitize_params({"charge_limit": 8000.0}, limits)
     result = apply_guards(clean, ctx(limits))
 
     assert result.params["charge_limit"] == 5000.0
-    assert result.status is Status.SUCCESS
+    assert result.status is Status.PARTIAL
     assert "I-3" in invariants(result)
 
 
@@ -73,15 +76,17 @@ def test_r8_wartosc_ponizej_dolnej_granicy_encji_podniesiona():
     assert "I-3" in invariants(result)
 
 
-def test_r8_przyciecie_nie_zmienia_statusu_na_partial():
-    """Decyzja spójności: przycięcie to `success` z adnotacją (litera T-3).
-    `partial` rezerwujemy dla sytuacji, w której parametru NIE zastosowano."""
+def test_r8_przyciecie_jest_raportowane_statusem_partial():
+    """RR-2 odwraca wcześniejszą decyzję spójności (było: „przycięcie to `success`
+    z adnotacją, litera T-3"). Powód: `success` sprawiał, że chmura nie odróżniała
+    „zastosowano 95" od „zastosowano 90 zamiast 95" — status niesie sygnał,
+    nota niesie szczegół. Sama nastawa nadal JEST stosowana, tyle że na granicy."""
     limits = InverterLimits(soc_max_hw=90.0)
 
     result = apply_guards({"eco_soc": 95.0}, ctx(limits))
 
     assert result.params["eco_soc"] == 90.0
-    assert result.status is Status.SUCCESS
+    assert result.status is Status.PARTIAL
     assert "I-3" in invariants(result)
 
 

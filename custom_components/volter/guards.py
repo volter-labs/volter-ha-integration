@@ -17,6 +17,7 @@ Hierarchia priorytetów (wygrywa wyższy):
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Iterable
@@ -292,21 +293,49 @@ def sanitize_params(params: dict[str, Any], limits: InverterLimits) -> dict[str,
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise InvalidCommand("I-10", f"{key} musi być liczbą, jest {value!r}")
 
-        # R-8: gdy znamy REALNĄ granicę z encji, zgadywany zakres z `PARAM_SPECS`
+        # RR-2: skończoność sprawdzamy ZAWSZE i PRZED jakąkolwiek ścieżką skróconą,
+        # bo NaN/inf przechodzą `isinstance(value, (int, float))`, a przycinanie do
+        # granicy w I-3 (`min(max(nan, lo), hi)`) zwraca NaN — wartość szła prosto
+        # na encję falownika. Osiągalne z chmury: `json.loads` przyjmuje literał `NaN`.
+        try:
+            numeric = float(value)
+        except OverflowError as err:
+            # Druga postać tego samego wektora: JSON nie ogranicza precyzji liczb
+            # całkowitych, a `float(10**400)` rzuca wyjątek spoza kontraktu guarda.
+            # Fail-closed ma tu ODRZUCIĆ komendę, nie wysypać sanityzację.
+            raise InvalidCommand(
+                "I-10", f"{key}={value!r} nie mieści się w liczbie zmiennoprzecinkowej"
+            ) from err
+        if not math.isfinite(numeric):
+            raise InvalidCommand(
+                "I-10", f"{key}={value!r} nie jest liczbą skończoną (NaN/inf)"
+            )
+
+        # R-8: gdy znamy REALNĄ granicę z encji, zgadywany GÓRNY zakres z `PARAM_SPECS`
         # (`to_confirm=True`) musi ustąpić — inaczej I-10 odrzuca całą komendę tam,
         # gdzie specyfikacja (T-3) każe przyciąć do granicy sprzętu. Przycięciem
-        # zajmuje się I-3 w `apply_guards`, tu tylko przepuszczamy wartość dalej.
+        # zajmuje się I-3 w `apply_guards`, które od RR-2 raportuje je jako PARTIAL.
         # Zakresów pewnych (`to_confirm=False`, np. procenty 0..100) nie rozmiękczamy:
         # to fizyczna domena parametru, której żadna encja nie poszerzy (T-11).
+        #
+        # RR-2: granica z encji ZASTĘPUJE zgadywany zakres, ale nie zwalnia z walidacji.
+        # Dolna granica z `PARAM_SPECS` (0 A / 0 W) to domena fizyczna, nie zgadywanie,
+        # więc obowiązuje dalej: wartość ujemna nie ma sensu niezależnie od tego, co
+        # wystawia encja, i nie wolno jej "naprawiać" cichym przycięciem do zera.
         if spec.to_confirm and key in limits.param_bounds:
-            clean[key] = float(value)
+            if numeric < spec.lo:
+                raise InvalidCommand(
+                    "I-10",
+                    f"{key}={value} poniżej fizycznej dolnej granicy {spec.lo} {spec.unit}",
+                )
+            clean[key] = numeric
             continue
 
-        if not (spec.lo <= float(value) <= spec.hi):
+        if not (spec.lo <= numeric <= spec.hi):
             raise InvalidCommand(
                 "I-10", f"{key}={value} poza zakresem {spec.lo}..{spec.hi} {spec.unit}"
             )
-        clean[key] = float(value)
+        clean[key] = numeric
 
     return clean
 
@@ -474,10 +503,26 @@ def apply_guards(params: dict[str, Any], ctx: GuardContext) -> GuardResult:
     # I-3 była martwa (literalne `pass` dla `max_charge_w`, a `read_inverter_limits`
     # i tak nigdy żadnej granicy mocowej nie ustawiało).
     #
-    # Status pozostaje `success` — litera wektora T-3 („status success z adnotacją
-    # o przycięciu"). `partial` znaczy „części komendy NIE zastosowano" i chmura
-    # traktuje go jako sygnał do ponowienia; przycięta nastawa została zastosowana,
-    # tyle że na granicy sprzętu, i ponawianie jej niczego nie poprawi.
+    # RR-2: druga linia obrony przed NaN/inf. `sanitize_params` już je odrzuca, ale to
+    # TUTAJ rodził się zapis na encję i żadna gałąź I-3 sama go nie zatrzyma:
+    # `min(max(nan, lo), hi)` zwraca NaN, a `soc_max_hw < nan` jest fałszem, więc bez
+    # jawnego testu wartość przechodziła przez cały guard nietknięta. Sprawdzamy CAŁY
+    # zestaw, nie tylko parametry z granicami — wołający spoza executora (albo przyszła
+    # ścieżka omijająca I-10) nie może tego obejść.
+    for key, raw in out.items():
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            continue
+        if not math.isfinite(float(raw)):
+            result.status = Status.ERROR
+            result.note("I-3", f"{key}={raw!r} nie jest liczbą skończoną — odrzucam komendę")
+            result.params = {}
+            return result
+
+    # RR-2 (decyzja właściciela): przycięcie daje `partial`, nie `success`. Litera
+    # wektora T-3 mówi „success z adnotacją", ale wtedy chmura nie odróżnia
+    # „zastosowano 3000" od „zastosowano 100 zamiast 3000" — a informacja
+    # o NIEZREALIZOWANYM setpoincie jest ważniejsza niż litera specyfikacji.
+    # Podział ról: status niesie sygnał, nota niesie szczegół.
     for key, bounds in limits.param_bounds.items():
         raw = out.get(key)
         if raw is None or isinstance(raw, bool) or not isinstance(raw, (int, float)):
@@ -489,11 +534,17 @@ def apply_guards(params: dict[str, Any], ctx: GuardContext) -> GuardResult:
                 f"{key} przycięty {raw}->{clipped} (granica encji {bounds.lo}..{bounds.hi})",
             )
             out[key] = clipped
+            if result.status is Status.SUCCESS:
+                result.status = Status.PARTIAL
 
     if limits.soc_max_hw < out.get("eco_soc", 0):
         clipped = limits.soc_max_hw
         result.note("I-3", f"eco_soc przycięty {out['eco_soc']}->{clipped} (limit sprzętowy)")
         out["eco_soc"] = clipped
+        # RR-2: ta sama zasada dla drugiej gałęzi I-3 — chmura nie może zgadywać,
+        # którym torem poszło przycięcie, żeby wiedzieć, czy plan się wykonał.
+        if result.status is Status.SUCCESS:
+            result.status = Status.PARTIAL
 
     # I-4: nie eksportuj przy cenie <= 0.
     if ctx.price_pln_kwh is not None and ctx.price_pln_kwh <= 0:

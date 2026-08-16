@@ -58,7 +58,7 @@ from .guards import (
     infer_action,
     sanitize_params,
 )
-from .ha_state import read_device_state, read_inverter_limits
+from .ha_state import ParamBoundsCache, read_device_state, read_inverter_limits
 from .mappers import slot_to_params
 from .schedule import Fallback, Schedule, Slot
 
@@ -99,6 +99,10 @@ class VolterExecutor:
         self._prev_soc_ts: float | None = None
         self._last: dict[str, Any] = {}
         self._last_decision: str | None = None
+        # RR-2: pamięć ostatnich znanych granic nastaw. Bez niej werdykt I-10 zależał od
+        # tego, czy encja `number` akurat odpowiada — ta sama komenda dostawała raz
+        # `success`, raz `error`. Cache jest per-executor i ginie z restartem HA.
+        self._bounds_cache = ParamBoundsCache()
 
     # ── cykl życia ───────────────────────────────────────────────────────────
 
@@ -170,7 +174,12 @@ class VolterExecutor:
         `_remapped` gwarantuje, że dzieje się to najwyżej raz.
         """
         options = dict(self._entry.options)
-        limits = read_inverter_limits(self.hass, options)
+        # RR-2: realny tor zapisu UCZY cache granic (i z niego korzysta, gdy encja
+        # chwilowo nie odpowiada). Znacznik bierzemy z tego samego zegara co I-6/I-8,
+        # żeby cały przebieg był czasowo spójny.
+        limits = read_inverter_limits(
+            self.hass, options, self._bounds_cache, now=time.monotonic()
+        )
         state = read_device_state(
             self.hass,
             options,
@@ -417,12 +426,19 @@ class VolterExecutor:
         Twarde reguły tej metody:
           * ZERO zapisów — żadnego `hass.services.async_call`,
           * podgląd throttlingu przez `filter`, nigdy `commit` — stan I-6 zostaje nietknięty,
+          * cache granic z encji widziany przez KOPIĘ (`snapshot`) — suchy przebieg
+            niczego nie zapamiętuje (RR-2),
           * `self._prev_soc`, `self._prev_soc_ts` i `self._last` pozostają bez zmian
             (to suchy przebieg,
             nie przebieg — nie wolno mu zafałszować kolejnego realnego wykonania).
         """
         options = dict(self._entry.options)
-        limits = read_inverter_limits(self.hass, options)
+        # RR-2: suchy przebieg widzi te same zapamiętane granice co realny tor zapisu,
+        # ale pisze na KOPII cache — inaczej diagnoza uczyłaby executor granic, czyli
+        # łamała własny kontrakt „zero mutacji stanu" (R-7/R-14).
+        limits = read_inverter_limits(
+            self.hass, options, self._bounds_cache.snapshot(), now=time.monotonic()
+        )
         # RR-1: suchy przebieg musi widzieć ten sam odstęp próbek co realny — inaczej
         # diagnoza pokazywałaby I-9 tam, gdzie `async_apply` przyjmuje nowy baseline.
         # Sam ODCZYT `_prev_soc_ts` niczego nie mutuje, więc kontrakt „zero mutacji" stoi.
