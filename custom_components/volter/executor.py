@@ -13,6 +13,7 @@ Odpowiednik w firmware: `components/executor/`. Ta sama maszyna, inna warstwa wy
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import logging
 import time
@@ -91,6 +92,12 @@ class VolterExecutor:
         self._schedule: Schedule | None = None
         self._unsub: CALLBACK_TYPE | None = None
         self._throttle = WriteThrottle(min_interval_s=WRITE_MIN_INTERVAL_S)
+        # S-1: jeden zamek na CAŁY tor zapisu, bo `async_apply` woła tick co 60 s
+        # ORAZ `command_handler` z chmury — bez niego przeplot na `await` w
+        # `apply_params` zostawiał na falowniku wartość jednego przebiegu, a w
+        # `_throttle` wartość drugiego (rozjazd TRWAŁY: I-6 uznaje potem wartość
+        # planu za „bez zmiany" i nigdy jej nie dopisuje).
+        self._write_lock = asyncio.Lock()
         self._direction = DirectionLimiter(max_changes_per_hour=MAX_DIRECTION_CHANGES_PER_HOUR)
         self._prev_soc: float | None = None
         # RR-1: znacznik czasu przyjęcia baseline'u SoC. I-9 testuje TEMPO zmiany, więc
@@ -174,7 +181,68 @@ class VolterExecutor:
         _extra_forced_params: frozenset[str] = frozenset(),
         _report: bool = True,
     ) -> GuardResult:
-        """Jedyna droga do falownika: sanityzacja → guardy → throttle → zapis.
+        """Publiczna brama zapisu — serializuje przebiegi obu pętli (S-1).
+
+        S-1: `async_apply` wołają DWIE niezależne pętle: tick co 60 s i
+        `command_handler` obsługujący komendy z chmury. `apply_params` ma w środku
+        `await` na każdym service callu, więc bez zamka przebiegi przeplatały się
+        parametr po parametrze: na falowniku zostawała wartość tego, kto pisał
+        fizycznie jako ostatni, a w `_throttle` wartość tego, kto commitował jako
+        ostatni. Rozjazd jest TRWAŁY — od tej chwili I-6 widzi wartość planu jako
+        „bez zmiany" i nigdy jej nie dopisze, bez żadnego sygnału. Przy okazji
+        znikał drugi skutek: podwójny zapis tej samej encji w oknie I-6 (zużycie
+        NVM) i złamanie PARAM_ORDER MIĘDZY przebiegami (`mode` jednego lądował po
+        limitach drugiego).
+
+        S-1 — DLACZEGO zamek jest tutaj, a nie wokół samego `apply_params`:
+        odczyt stanu (`read_inverter_limits`, `read_device_state`, cena z aktualnego
+        slotu) siedzi w `_async_apply_locked`, czyli już ZA zamkiem. Przebieg, który
+        czekał w kolejce, przelicza więc guardy na rzeczywistości PO cudzym zapisie,
+        a nie na migawce sprzed czekania — w międzyczasie SoC mógł spaść poniżej
+        rezerwy i I-1 musi to zobaczyć. Odświeżamy STAN ŚWIATA, ale NIE intencję:
+        `raw_params` zostają takie, jakie podał wołający (komendy operatora nie
+        wolno po cichu przepisać, a slot z ticku i tak zostanie poprawiony w ≤60 s
+        przez kolejny przebieg pętli).
+
+        S-1 — DLACZEGO rozdzielenie na dwie metody, a nie `asyncio.Lock` wprost na
+        tej: ścieżka `forced_action` (naprawa R-1) woła tor zapisu REKURENCYJNIE ze
+        swojego wnętrza. `asyncio.Lock` nie jest reentrantny, więc zamek założony na
+        tej metodzie zakleszczyłby przemapowanie na tryb bezpieczny na zawsze —
+        czyli dokładnie ścieżkę ochronną. Licznik reentrancji odrzucony świadomie:
+        wymaga `contextvars` albo trzymania „właściciela" i cicho przepuszcza także
+        przypadkowe zagnieżdżenie z innego miejsca. Wydzielenie
+        `_async_apply_locked` sprawia, że reentrancja jest MOŻLIWA WYŁĄCZNIE tam,
+        gdzie jest wprost zapisana w kodzie, i widać ją w jednym miejscu.
+        """
+        async with self._write_lock:
+            return await self._async_apply_locked(
+                raw_params,
+                price_pln_kwh=price_pln_kwh,
+                action=action,
+                source=source,
+                slot=slot,
+                _remapped=_remapped,
+                _extra_forced_params=_extra_forced_params,
+                _report=_report,
+            )
+
+    async def _async_apply_locked(
+        self,
+        raw_params: dict[str, Any],
+        *,
+        price_pln_kwh: float | None = None,
+        action: Action | None = None,
+        source: str = "cloud",
+        slot: Slot | None = None,
+        _remapped: bool = False,
+        _extra_forced_params: frozenset[str] = frozenset(),
+        _report: bool = True,
+    ) -> GuardResult:
+        """Właściwy tor zapisu: sanityzacja → guardy → throttle → zapis.
+
+        S-1: WOŁAĆ WYŁĄCZNIE spod `self._write_lock` — publicznym wejściem jest
+        `async_apply`. Jedyne dozwolone wywołanie bezpośrednie to rekurencja po
+        `forced_action` niżej, która z definicji już trzyma zamek.
 
         `slot` podaje ścieżka harmonogramu. Jest potrzebny wyłącznie po to, żeby przy
         `GuardResult.forced_action` dało się przemapować slot na tryb bezpieczny (R-1);
@@ -303,7 +371,10 @@ class VolterExecutor:
                     result.forced_action.value,
                     (action.value if action else "?"),
                 )
-                forced = await self.async_apply(
+                # S-1: rekurencja idzie do części BEZ zamka — ten przebieg już go
+                # trzyma (`asyncio.Lock` nie jest reentrantny, więc `async_apply`
+                # zakleszczyłoby tu ścieżkę ochronną R-1 na zawsze).
+                forced = await self._async_apply_locked(
                     slot_to_params(forced_slot, rated_power_w=rated),
                     price_pln_kwh=price_pln_kwh,
                     action=result.forced_action,
