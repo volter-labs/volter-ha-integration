@@ -99,7 +99,14 @@ class Fallback:
             end=moment + timedelta(seconds=horizon_s),
             action=self.action,
             soc_target=self.soc_reserve,
-            export_allowed=True,
+            # R-6 (reszta): fallback (brak harmonogramu w ogóle / plan wygasł) nie
+            # niesie `price_pln_kwh` i nie ma skąd jej wziąć — integracja nie mapuje
+            # żadnej encji cenowej, cena istnieje wyłącznie w slotach z chmury. I-4
+            # ("nie eksportuj przy cenie <= 0") jest więc na tej ścieżce ślepe z
+            # definicji, nie tylko dziś. Świadomy wybór: skoro nie da się
+            # ZWERYFIKOWAĆ, że cena jest dodatnia, fallback musi być zachowawczy i
+            # blokować eksport całkowicie, zamiast domyślnie na niego zezwalać.
+            export_allowed=False,
         )
 
 

@@ -738,7 +738,13 @@ class VolterExecutor:
                 else None
             ),
             "slots": len(self._schedule.slots) if self._schedule else 0,
-            "last": self._last,
+            # R-14 (reszta): kopia obronna — ten sam błąd co pierwotne R-14
+            # w `async_diagnose` (już naprawione), tylko w tej property nikt go
+            # dotąd nie domknął. Żywa referencja do `self._last` pozwoliłaby
+            # konsumentowi modyfikującemu odpowiedź w miejscu podmienić stan
+            # wewnętrzny executora. Głęboka kopia, bo `self._last` zawiera
+            # zagnieżdżone listy (`executed`, `errors`, `notes`).
+            "last": copy.deepcopy(self._last),
         }
 
 

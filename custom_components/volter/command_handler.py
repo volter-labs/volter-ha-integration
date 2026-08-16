@@ -249,51 +249,76 @@ class VolterCommandHandler:
         sanityzację (I-10), inwarianty I-1…I-9, anty-oscylację (I-8) i throttling (I-6).
         Handler odpowiada tylko za transport i raportowanie.
         """
-        command = payload.get("command", "")
-        params = payload.get("params", {}) or {}
-        # R-4: `payload.get('request_id', 'unknown')` sprawiało, że WSZYSTKIE komendy
-        # bez request_id (ręczny broadcast — smoke test Fazy C) dzieliły jeden wspólny,
-        # truthy klucz dedup. Po pierwszej udanej każda następna była cicho odrzucana
-        # jako duplikat aż do restartu HA. `None` + `RequestDeduplicator` (guards.py)
-        # nigdy nie dedukuje `None` — więc brak request_id oznacza "nigdy nie deduplikuj".
-        request_id = payload.get("request_id")
+        # R-10 (reszta): `command`/`request_id` startują jako `None` PRZED barierą,
+        # bo `payload` sam może mieć zły kształt — jeśli wybuchnie zanim je wydobędziemy,
+        # blok `except` niżej musi mieć czym zalogować/zaraportować (request_id=None
+        # jest dla RequestDeduplicator/`_report_result` bezpieczne: `None` nigdy nie
+        # dedukuje, patrz R-4).
+        command: str | None = None
+        request_id: str | None = None
 
-        # L-4: idempotencja. Zapamiętujemy DOPIERO po wykonaniu i tylko gdy komenda
-        # nie skończyła się błędem — inaczej nieudana próba blokowałaby retry z chmury
-        # na zawsze (N-5).
-        if self._dedup.is_duplicate(request_id):
-            _LOGGER.info("Komenda %s już wykonana — pomijam [L-4]", request_id)
-            await self._report_result(request_id, "duplicate")
-            return
-
-        # R-10: `params` z chmury to dowolny JSON. `infer_action`/`sanitize_params`
-        # zakładają dict (`.get`, `.items`) — cokolwiek innego (np. lista) wywala
-        # AttributeError. Walidujemy jawnie zamiast czekać na crash w głębi guardów,
-        # żeby powód błędu w raporcie do chmury był czytelny.
-        if not isinstance(params, dict):
-            _LOGGER.warning(
-                "Komenda %s odrzucona: params nie jest obiektem (jest %s)",
-                request_id, type(params).__name__,
-            )
-            await self._report_result(
-                request_id, "error",
-                errors=[{
-                    "entity": "params",
-                    "error": f"params musi być obiektem, jest {type(params).__name__}",
-                }],
-            )
-            return
-
-        _LOGGER.info(
-            "Komenda: %s (request_id=%s, params=%s)", command, request_id, params
-        )
-
-        # R-10: bariera na wyjątki. Bez niej cokolwiek wywali się w treści komendy
-        # (dziś to głównie zła forma `params`, jutro może być cokolwiek innego)
-        # propaguje przez `_handle_message` do `_connect_and_listen`, którego `finally`
-        # zamyka WebSocket — zrywając Realtime i wpychając integrację w exponential
-        # backoff zamiast po prostu zaraportować błąd JEDNEJ komendy.
+        # R-10 (reszta): bariera na wyjątki musi objąć CAŁĄ obsługę wiadomości,
+        # ŁĄCZNIE z wydobyciem pól z payloadu — nie tylko treść komendy. Wcześniej
+        # `command = payload.get(...)` / `params = payload.get(...)` / `request_id =
+        # payload.get(...)` stały PRZED tym try/except: payload z chmury w kształcie
+        # innym niż dict (lista/string/liczba/None) wywalał `AttributeError` już na
+        # pierwszym z tych wywołań, więc bariera zaczynająca się dopiero PO nich nic
+        # nie łapała — wyjątek propagował przez `_handle_message` do
+        # `_connect_and_listen`, którego `finally` zamyka WebSocket (backoff 2->120s).
         try:
+            if not isinstance(payload, dict):
+                _LOGGER.warning(
+                    "Komenda odrzucona: payload nie jest obiektem (jest %s)",
+                    type(payload).__name__,
+                )
+                await self._report_result(
+                    request_id, "error",
+                    errors=[{
+                        "entity": "payload",
+                        "error": f"payload musi być obiektem, jest {type(payload).__name__}",
+                    }],
+                )
+                return
+
+            command = payload.get("command", "")
+            params = payload.get("params", {}) or {}
+            # R-4: `payload.get('request_id', 'unknown')` sprawiało, że WSZYSTKIE komendy
+            # bez request_id (ręczny broadcast — smoke test Fazy C) dzieliły jeden wspólny,
+            # truthy klucz dedup. Po pierwszej udanej każda następna była cicho odrzucana
+            # jako duplikat aż do restartu HA. `None` + `RequestDeduplicator` (guards.py)
+            # nigdy nie dedukuje `None` — więc brak request_id oznacza "nigdy nie deduplikuj".
+            request_id = payload.get("request_id")
+
+            # L-4: idempotencja. Zapamiętujemy DOPIERO po wykonaniu i tylko gdy komenda
+            # nie skończyła się błędem — inaczej nieudana próba blokowałaby retry z chmury
+            # na zawsze (N-5).
+            if self._dedup.is_duplicate(request_id):
+                _LOGGER.info("Komenda %s już wykonana — pomijam [L-4]", request_id)
+                await self._report_result(request_id, "duplicate")
+                return
+
+            # R-10: `params` z chmury to dowolny JSON. `infer_action`/`sanitize_params`
+            # zakładają dict (`.get`, `.items`) — cokolwiek innego (np. lista) wywala
+            # AttributeError. Walidujemy jawnie zamiast czekać na crash w głębi guardów,
+            # żeby powód błędu w raporcie do chmury był czytelny.
+            if not isinstance(params, dict):
+                _LOGGER.warning(
+                    "Komenda %s odrzucona: params nie jest obiektem (jest %s)",
+                    request_id, type(params).__name__,
+                )
+                await self._report_result(
+                    request_id, "error",
+                    errors=[{
+                        "entity": "params",
+                        "error": f"params musi być obiektem, jest {type(params).__name__}",
+                    }],
+                )
+                return
+
+            _LOGGER.info(
+                "Komenda: %s (request_id=%s, params=%s)", command, request_id, params
+            )
+
             if command == "SET_SCHEDULE":
                 raw = payload.get("schedule") or params.get("schedule") or params
                 try:
