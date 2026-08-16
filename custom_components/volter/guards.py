@@ -151,6 +151,63 @@ class DeviceState:
     previous_soc_age_s: float | None = None
 
 
+#: S-4 — domyślna szerokość histerezy progu rezerwy (I-1), w punktach procentowych.
+#:
+#: DLACZEGO 3 pp: sensory SoC raportują wartość skwantowaną (zwykle co 1 pp), a estymata
+#: SoC z BMS dodatkowo faluje o ułamki punktu. Pasmo RÓWNE rozdzielczości niczego nie
+#: rozwiązuje — oscylacja 19/21 wokół progu 20 nadal przekraczałaby punkt zwolnienia.
+#: Pasmo musi być więc wielokrotnością rozdzielczości: przy 3 pp zwolnienie zatrzasku
+#: wymaga REALNEGO naładowania (na typowym magazynie 10 kWh to ~0,3 kWh), czego szum
+#: czujnika nie podrobi. Górne ograniczenie: w oknie zatrzasku bateria jest trzymana
+#: na rezerwie, mimo że SoC jest już do `band_pp` ponad nią — zbyt szerokie pasmo
+#: podnosiłoby efektywną rezerwę i marnowało pojemność. 3 pp to mniej niż jeden tick
+#: typowego poboru domowego, więc plan wraca praktycznie natychmiast po realnym ładowaniu.
+RESERVE_HYSTERESIS_PP: float = 3.0
+
+
+class ReserveHysteresis:
+    """S-4: zatrzask progu rezerwy dla I-1 — chroni pamięć nieulotną falownika.
+
+    Sam warunek `state.soc < cfg.soc_reserve` nie ma histerezy, a I-6 go nie ratuje:
+    przy baterii stojącej dokładnie na progu `eco_soc` REALNIE zmienia wartość w każdym
+    tiku (raz `soc_target` z planu, raz rezerwa użytkownika), więc throttle „bez zmiany"
+    nie ma czego pominąć. I-8 też nie łapie, bo akcja pozostaje `SELF_CONSUME` — to nie
+    jest zmiana kierunku. Efekt: jeden zapis do NVM na tick, ~1440 na dobę, bezterminowo.
+
+    Kontrakt zatrzasku: załóż się przy `soc < reserve`, a zwolnij DOPIERO przy
+    `soc >= reserve + band_pp`. Pierwszy odczyt powyżej progu nie zwalnia niczego —
+    dokładnie dlatego, że to on jest szumem, przed którym się bronimy.
+    """
+
+    def __init__(self, band_pp: float = RESERVE_HYSTERESIS_PP) -> None:
+        self.band_pp = band_pp
+        self._engaged = False
+
+    def engaged(self, soc: float, reserve: float) -> bool:
+        """Czy I-1 ma zadziałać. Aktualizuje zatrzask — wołać tylko z REALNEGO przebiegu."""
+        self._engaged = self._decide(soc, reserve)
+        return self._engaged
+
+    def _decide(self, soc: float, reserve: float) -> bool:
+        if self._engaged:
+            return soc < reserve + self.band_pp
+        return soc < reserve
+
+    def snapshot(self) -> "ReserveHysteresis":
+        """Kopia dla SUCHEGO przebiegu (`executor.async_diagnose`).
+
+        Ten sam kontrakt co `ha_state.ParamBoundsCache.snapshot` (RR-2) i co
+        `DirectionLimiter.would_allow` (RR-7): diagnoza musi widzieć dokładnie ten
+        sam zatrzask co realny tor zapisu, ale nie wolno jej go założyć ani zwolnić —
+        inaczej pytanie „co byś teraz zrobił" ZMIENIAŁOBY kolejny realny przebieg.
+        Kopia zamiast osobnej metody `would_*`, bo to `apply_guards` decyduje o I-1
+        i musiałoby wtedy znać tryb wołania.
+        """
+        kopia = ReserveHysteresis(self.band_pp)
+        kopia._engaged = self._engaged
+        return kopia
+
+
 @dataclass
 class GuardContext:
     """Kontekst wykonania guardów."""
@@ -159,6 +216,10 @@ class GuardContext:
     limits: InverterLimits = field(default_factory=InverterLimits)
     config: UserConfig = field(default_factory=UserConfig)
     price_pln_kwh: float | None = None
+    #: S-4: zatrzask progu rezerwy (I-1). `None` = wołający nie ma stanu między
+    #: przebiegami (testy jednostkowe, stary kontrakt) — wtedy zostaje goły próg,
+    #: bo histereza bez pamięci byłaby tylko przesuniętym progiem.
+    reserve_hysteresis: "ReserveHysteresis | None" = None
     #: Jawna intencja planu (R-1). Gdy podana, I-1 i I-2 pracują na niej, bo tylko ona
     #: przetrwa mapowanie na nastawy falownika — nazwa trybu jest dla guardów
     #: nieprzezroczysta. `None` oznacza stary kontrakt SET_WORK_MODE z surowymi
@@ -485,7 +546,16 @@ def apply_guards(params: dict[str, Any], ctx: GuardContext) -> GuardResult:
     # R-13a: inwariant brzmi `SoC >= soc_reserve` — przy SoC RÓWNYM rezerwie
     # inwariant jest spełniony, więc warunek musi być ostry (`<`), nie `<=`.
     # Dawne `<=` traktowało dokładną równość jako naruszenie.
-    if state.soc < cfg.soc_reserve:
+    #
+    # S-4: goły próg zużywał pamięć nieulotną falownika, bo przy baterii stojącej na
+    # progu każdy tick przerzucał `eco_soc` między planem a rezerwą (~1440 zapisów/dobę).
+    # Zatrzask utrzymuje raz uruchomioną ochronę aż do WYRAŹNEGO powrotu ponad próg.
+    if ctx.reserve_hysteresis is not None:
+        ponizej_rezerwy = ctx.reserve_hysteresis.engaged(state.soc, cfg.soc_reserve)
+    else:
+        ponizej_rezerwy = state.soc < cfg.soc_reserve
+
+    if ponizej_rezerwy:
         removed: list[str] = []
         for key in _DISCHARGE_HINTS:
             if out.pop(key, None) is not None:
@@ -509,9 +579,20 @@ def apply_guards(params: dict[str, Any], ctx: GuardContext) -> GuardResult:
             result.forced_params.add("eco_soc")
         if removed or wants_discharge or eco_soc_raised:
             result.status = Status.PARTIAL
+            # S-4: komunikat musi rozróżniać „SoC pod rezerwą" od „zatrzask jeszcze
+            # trzyma" — inaczej log twierdzi `SoC=21% < rezerwa 20%`, czyli kłamie
+            # dokładnie tam, gdzie ma tłumaczyć decyzję.
+            powod = (
+                f"SoC={state.soc}% < rezerwa {cfg.soc_reserve}%"
+                if state.soc < cfg.soc_reserve
+                else (
+                    f"SoC={state.soc}% w paśmie histerezy rezerwy {cfg.soc_reserve}% "
+                    f"(zatrzask trzyma do powrotu wyraźnie ponad próg) [S-4]"
+                )
+            )
             result.note(
                 "I-1",
-                f"SoC={state.soc}% < rezerwa {cfg.soc_reserve}%: "
+                f"{powod}: "
                 f"rozładowanie zablokowane={wants_discharge}, usunięto {removed or 'brak'}, "
                 f"eco_soc podniesiony do {cfg.soc_reserve}%",
             )
@@ -786,7 +867,9 @@ __all__ = [
     "PARAM_ORDER",
     "PARAM_SPECS",
     "ParamBounds",
+    "RESERVE_HYSTERESIS_PP",
     "RequestDeduplicator",
+    "ReserveHysteresis",
     "Status",
     "UserConfig",
     "WriteThrottle",

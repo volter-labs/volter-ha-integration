@@ -42,6 +42,8 @@ from .const import (
     OPT_RATED_POWER_W,
     OPT_SOC_RESERVE,
     OPT_USER_MODE,
+    RESERVE_HYSTERESIS_PP,
+    STOP_WRITE_TIMEOUT_S,
     STORAGE_KEY,
     STORAGE_VERSION,
     WRITE_MIN_INTERVAL_S,
@@ -53,6 +55,7 @@ from .guards import (
     GuardResult,
     InvalidCommand,
     Note,
+    ReserveHysteresis,
     Status,
     UserConfig,
     WriteThrottle,
@@ -123,7 +126,14 @@ class VolterExecutor:
         # `_throttle` wartość drugiego (rozjazd TRWAŁY: I-6 uznaje potem wartość
         # planu za „bez zmiany" i nigdy jej nie dopisuje).
         self._write_lock = asyncio.Lock()
+        # S-5: uchwyt do TRWAJĄCEJ sekwencji zapisu (chronionej `asyncio.shield`).
+        # Bez niego `async_stop` nie miał czego pilnować i wyładowywał integrację
+        # w środku PARAM_ORDER — falownik zostawał w nowym trybie ze starymi limitami.
+        self._inflight: asyncio.Future[GuardResult] | None = None
         self._direction = DirectionLimiter(max_changes_per_hour=MAX_DIRECTION_CHANGES_PER_HOUR)
+        # S-4: zatrzask progu rezerwy (I-1). Stan MIĘDZY przebiegami, dokładnie jak
+        # `_direction` i `_throttle` — bez pamięci histereza jest tylko przesuniętym progiem.
+        self._reserve = ReserveHysteresis(band_pp=RESERVE_HYSTERESIS_PP)
         self._prev_soc: float | None = None
         # RR-1: znacznik czasu przyjęcia baseline'u SoC. I-9 testuje TEMPO zmiany, więc
         # sama wartość poprzedniej próbki nie wystarcza — bez czasu 35 pp po 40 minutach
@@ -165,7 +175,39 @@ class VolterExecutor:
         if self._unsub is not None:
             self._unsub()
             self._unsub = None
+        # S-5: zatrzymanie executora MUSI poczekać na trwający zapis — inaczej HA
+        # wyładowuje integrację w środku sekwencji PARAM_ORDER (ścieżka realna przy
+        # KAŻDEJ zmianie opcji: update listener -> async_reload -> async_unload_entry).
+        await self._poczekaj_na_zapis()
         _LOGGER.info("Executor zatrzymany")
+
+    async def _poczekaj_na_zapis(self) -> None:
+        """S-5: poczekaj na dokończenie chronionej sekwencji zapisu (z limitem czasu).
+
+        Koszt `asyncio.shield` jest realny: opóźnia wyładowanie integracji o czas
+        jednej sekwencji nastaw. Jest to jednak koszt OGRANICZONY
+        (`STOP_WRITE_TIMEOUT_S`), podczas gdy alternatywa — przerwanie zapisu w połowie
+        — zostawia falownik np. w `eco_charge` z limitami z poprzedniego slotu, czyli
+        w stanie, któremu ma zapobiegać PARAM_ORDER, i to na czas nieograniczony
+        (do kolejnego ticku po udanym przeładowaniu, a przy nieudanym — bezterminowo).
+        """
+        zadanie = self._inflight
+        if zadanie is None or zadanie.done():
+            return
+        try:
+            # `shield` w środku, bo `wait_for` po timeoucie anuluje to, na co czeka —
+            # a my chcemy odpuścić CZEKANIE, nie przerwać zapis w połowie.
+            await asyncio.wait_for(asyncio.shield(zadanie), timeout=STOP_WRITE_TIMEOUT_S)
+        except TimeoutError:
+            _LOGGER.error(
+                "Zapis do falownika nie zakończył się w %.0fs — przestaję czekać [S-5]",
+                STOP_WRITE_TIMEOUT_S,
+            )
+        # `asyncio.CancelledError` świadomie NIE jest tu łapane: to `BaseException`,
+        # więc `except Exception` niżej go nie tknie i poleci dalej. Anulowanie samego
+        # zatrzymywania musi dojść do wołającego.
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning("Trwający zapis zakończył się błędem: %s [S-5]", err)
 
     # ── harmonogram ──────────────────────────────────────────────────────────
 
@@ -263,6 +305,10 @@ class VolterExecutor:
         gdzie jest wprost zapisana w kodzie, i widać ją w jednym miejscu.
         """
         async with self._write_lock:
+            # S-5: sekwencja zapisu porzucona przez ANULOWANEGO wołającego leci dalej
+            # pod `shield` i już nie trzyma zamka — nowy przebieg musi poczekać na jej
+            # koniec, inaczej wracamy do przeplotu z S-1 (tyle że tylko po anulowaniu).
+            await self._poczekaj_na_zapis()
             return await self._async_apply_locked(
                 raw_params,
                 price_pln_kwh=price_pln_kwh,
@@ -374,6 +420,9 @@ class VolterExecutor:
             # falownika, których świadomie nie znają — I-1 i I-2 były przez to martwe
             # na całej ścieżce harmonogramu.
             action=action,
+            # S-4: REALNY przebieg dostaje żywy zatrzask — tylko on ma prawo go
+            # zakładać i zwalniać (suchy przebieg dostaje kopię, patrz `async_diagnose`).
+            reserve_hysteresis=self._reserve,
             max_state_age_s=MAX_STATE_AGE_S,
             max_soc_jump_pp=MAX_SOC_JUMP_PP,
             max_soc_rate_pp_per_min=MAX_SOC_RATE_PP_PER_MIN,
@@ -512,51 +561,137 @@ class VolterExecutor:
             result.note(tn.invariant, tn.message)
             _LOGGER.debug("[%s] guard %s: %s", source, tn.invariant, tn.message)
 
-        executed: list[str] = []
-        errors: list[dict[str, str]] = []
-
         if not writable:
             result.executed = []
-        else:
-            # RR-3: `forced_params` rozstrzyga w `apply_params`, czy brak zmapowanej
-            # encji dla danego parametru jest błędem (zabezpieczenie guarda) czy tylko
-            # widoczną notą (normalny parametr planu, opcjonalna encja świadomie
-            # niezmapowana) — patrz `GuardResult.forced_params` i docstring
-            # `apply_params`.
-            executed, errors, skip_notes = await apply_params(
-                self.hass, options, writable, forced_params=result.forced_params
+            # R-12: log decyzji (anty-spam + `_last_decision`) siedzi w `_remember`,
+            # żeby DZIAŁAŁ TAKŻE na wczesnych returnach (I-10, I-1..I-9, I-8).
+            # RR-5: gałąź WEWNĘTRZNA (przemapowanie po forced_action) nie loguje sama.
+            if _report:
+                self._remember(source, result, [], [], act)
+            return result
+
+        # S-5: właściwa sekwencja nastaw idzie w OSOBNYM zadaniu i jest awaitowana
+        # przez `asyncio.shield`. Anulowanie tego przebiegu (przeładowanie integracji
+        # po zmianie opcji) przerywa CZEKANIE, ale nie sam zapis — inaczej falownik
+        # zostawał w nowym trybie ze starymi limitami, czyli w stanie, któremu ma
+        # zapobiegać PARAM_ORDER, i nie było tego widać ani w HA, ani w chmurze.
+        # Świadomie `asyncio.ensure_future`, a nie `hass.async_create_task`: HA anuluje
+        # swoje śledzone zadania przy wyładowaniu, czyli robiłoby dokładnie to, przed
+        # czym broni to ustalenie. Zadanie jest za to pilnowane przez `_inflight`
+        # i awaitowane w `async_stop`, więc nie jest porzucone.
+        zadanie = asyncio.ensure_future(
+            self._async_zapisz_sekwencje(options, writable, result, act, now_ts, source, _report)
+        )
+        # S-5: zadanie dziedziczy nazwę wołającego, bo sekwencja zapisu JEST jego
+        # kontynuacją — log HA, traceback i „kto pisał do falownika" mają dalej
+        # wskazywać na pętlę, która zapis zleciła, a nie na anonimowy `Task-17`.
+        biezace = asyncio.current_task()
+        if biezace is not None:
+            zadanie.set_name(biezace.get_name())
+        self._inflight = zadanie
+        zadanie.add_done_callback(self._zwolnij_zapis)
+        try:
+            return await asyncio.shield(zadanie)
+        except asyncio.CancelledError:
+            _LOGGER.warning(
+                "[%s] Przebieg anulowany w trakcie zapisu — sekwencja nastaw dokańcza "
+                "się pod ochroną [S-5]", source,
             )
-            # N-4: raport do chmury musi mówić prawdę — `executed` to to, co naprawdę
-            # poszło do falownika, nie to, co przeszło guardy (`result.params`).
-            result.executed = executed
-            # R-9: bez tego przypisania realne błędy per-encja (m.in. niezmapowana
-            # encja z R-3) ginęły — command_handler raportował do chmury errors=[]
-            # na sztywno, niezależnie od tego, co faktycznie zawiodło.
-            result.errors = errors
-            # RR-3: parametry z normalnego mapowania planu bez zmapowanej encji nie
-            # są błędem, ale nie mogą też zniknąć bez śladu — trafiają do `notes`,
-            # więc chmura i log HA nadal je widzą (zgodnie z zasadą "nota widoczna,
-            # nie błąd" dla tej kategorii).
-            for skip in skip_notes:
-                result.note("RR-3", f"{skip['entity']}: {skip['note']}")
+            self._stempel_anulowania(source, act, result, zadanie)
+            # Anulowania NIE WOLNO połknąć: zamiana go na zwykły wynik zablokowałaby
+            # zatrzymywanie Home Assistanta.
+            raise
 
-            self._throttle.commit({k: writable[k] for k in executed if k in writable}, now_ts)
-            self._direction.record(act, now_ts)
+    def _zwolnij_zapis(self, zadanie: asyncio.Future) -> None:
+        """S-5: uchwyt do trwającego zapisu żyje dokładnie tyle, ile sam zapis."""
+        if self._inflight is zadanie:
+            self._inflight = None
 
-            if errors and not executed:
-                result.status = Status.ERROR
-            elif errors:
-                result.status = Status.PARTIAL
+    def _stempel_anulowania(
+        self,
+        source: str,
+        act: Action,
+        result: GuardResult,
+        zadanie: asyncio.Future,
+    ) -> None:
+        """S-5: anulowanie MUSI zostawić ślad w `_last` — i to ślad PRAWDZIWY.
 
-        # R-12: log decyzji (anty-spam + `_last_decision`) przeniesiony do `_remember`,
-        # żeby DZIAŁAŁ TAKŻE na wczesnych returnach (I-10, I-1..I-9, I-8) — patrz
-        # komentarz przy `_remember`.
+        Sonda E pokazała `diagnostics['last'] == {}`: stan połowiczny falownika nie
+        był widoczny nigdzie, więc pytanie „co poszło do falownika" nie miało
+        odpowiedzi dokładnie wtedy, gdy poszło coś nietypowego. Stempel jest odroczony
+        do zakończenia chronionego zadania, bo dopiero wtedy `result.executed` mówi,
+        co naprawdę zostało zapisane; `result` to ten sam obiekt, który zadanie
+        uzupełnia, więc nie trzeba niczego przepisywać.
+        """
+
+        def _stempel(_zadanie: asyncio.Future | None = None) -> None:
+            try:
+                result.note(
+                    "S-5",
+                    "przebieg anulowany w trakcie zapisu — sekwencja nastaw dokończona "
+                    "pod ochroną (asyncio.shield)",
+                )
+                self._remember(source, result, list(result.executed), list(result.errors), act)
+                self._last["cancelled"] = True
+            except Exception as err:  # noqa: BLE001
+                # Ślad po anulowaniu nie może sam wywalić callbacku pętli zdarzeń.
+                _LOGGER.error("Nie udało się zapisać śladu po anulowaniu: %s [S-5]", err)
+
+        if zadanie.done():
+            _stempel()
+        else:
+            zadanie.add_done_callback(_stempel)
+
+    async def _async_zapisz_sekwencje(
+        self,
+        options: dict[str, Any],
+        writable: dict[str, Any],
+        result: GuardResult,
+        act: Action,
+        now_ts: float,
+        source: str,
+        _report: bool,
+    ) -> GuardResult:
+        """S-5: NIEROZERWALNA sekwencja zapisu + jej księgowanie.
+
+        Wszystko, co musi zajść razem, siedzi w jednym zadaniu: zapis w PARAM_ORDER,
+        commit throttle'a I-6 i zapis kierunku I-8. Gdyby księgowanie zostało po
+        stronie anulowanego wołającego, throttle nie zapamiętałby wartości, które
+        FIZYCZNIE poszły do falownika — i kolejny przebieg zapisałby je ponownie,
+        czyli anulowanie kosztowałoby dodatkowy zapis do pamięci nieulotnej (S-4).
+        """
+        # RR-3: `forced_params` rozstrzyga w `apply_params`, czy brak zmapowanej
+        # encji dla danego parametru jest błędem (zabezpieczenie guarda) czy tylko
+        # widoczną notą (normalny parametr planu, opcjonalna encja świadomie
+        # niezmapowana) — patrz `GuardResult.forced_params` i docstring `apply_params`.
+        executed, errors, skip_notes = await apply_params(
+            self.hass, options, writable, forced_params=result.forced_params
+        )
+        # N-4: raport do chmury musi mówić prawdę — `executed` to to, co naprawdę
+        # poszło do falownika, nie to, co przeszło guardy (`result.params`).
+        result.executed = executed
+        # R-9: bez tego przypisania realne błędy per-encja (m.in. niezmapowana
+        # encja z R-3) ginęły — command_handler raportował do chmury errors=[]
+        # na sztywno, niezależnie od tego, co faktycznie zawiodło.
+        result.errors = errors
+        # RR-3: parametry z normalnego mapowania planu bez zmapowanej encji nie
+        # są błędem, ale nie mogą też zniknąć bez śladu — trafiają do `notes`,
+        # więc chmura i log HA nadal je widzą.
+        for skip in skip_notes:
+            result.note("RR-3", f"{skip['entity']}: {skip['note']}")
+
+        self._throttle.commit({k: writable[k] for k in executed if k in writable}, now_ts)
+        self._direction.record(act, now_ts)
+
+        if errors and not executed:
+            result.status = Status.ERROR
+        elif errors:
+            result.status = Status.PARTIAL
+
         # RR-5: gałąź WEWNĘTRZNA (przemapowanie po forced_action) nie loguje sama —
         # bez tej bramki przebieg wewnętrzny (status np. `success`) i przebieg
         # zewnętrzny scalony (status np. `partial`) wołały `_remember` osobno z
-        # DWOMA różnymi kluczami decyzji, które nadpisywały się nawzajem —
-        # `decision != self._last_decision` było prawdziwe na KAŻDYM ticku, mimo
-        # ustabilizowanego stanu (sonda P2, RR-5).
+        # DWOMA różnymi kluczami decyzji, które nadpisywały się nawzajem (sonda P2).
         if _report:
             self._remember(source, result, executed, errors, act)
         return result
@@ -798,6 +933,12 @@ class VolterExecutor:
                 # R-1: suchy przebieg musi widzieć dokładnie tę samą intencję co realny,
                 # inaczej diagnostyka pokazywałaby zapis, którego I-1 by nie przepuściło.
                 action=slot_action,
+                # S-4: diagnoza widzi TEN SAM zatrzask co realny tor zapisu, ale pracuje
+                # na KOPII — inaczej suche pytanie „co byś teraz zrobił" zakładałoby
+                # ochronę I-1 i zmieniało zachowanie kolejnego realnego przebiegu
+                # (ten sam kontrakt „zero mutacji" co RR-2 dla cache granic i RR-7
+                # dla DirectionLimiter).
+                reserve_hysteresis=self._reserve.snapshot(),
                 max_state_age_s=MAX_STATE_AGE_S,
                 max_soc_jump_pp=MAX_SOC_JUMP_PP,
                 max_soc_rate_pp_per_min=MAX_SOC_RATE_PP_PER_MIN,

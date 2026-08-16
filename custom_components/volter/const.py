@@ -123,6 +123,30 @@ MAX_DIRECTION_CHANGES_PER_HOUR = 4
 #: T-14 — liczba prób zapisu przed zgłoszeniem błędu (bez pętli).
 WRITE_RETRIES = 3
 
+#: S-4 — szerokość histerezy progu rezerwy (I-1) w punktach procentowych.
+#: Pełne uzasadnienie doboru przy `guards.RESERVE_HYSTERESIS_PP`. W skrócie: sensor SoC
+#: ma rozdzielczość ~1 pp, więc pasmo musi być jej wielokrotnością, inaczej zatrzask
+#: zwalniałby na samym zaokrągleniu i zapisy do NVM wracałyby.
+RESERVE_HYSTERESIS_PP = 3.0
+
+#: S-5 — ile `executor.async_stop()` czeka na TRWAJĄCY zapis, zanim odpuści.
+#:
+#: Dobór: sekwencja PARAM_ORDER to najwyżej 7 nastaw, każda z `WRITE_RETRIES=3` próbami
+#: i backoffem 1 s + 2 s. Zdrowy falownik odpowiada w milisekundach, jeden ponowiony zapis
+#: to ~3 s. 10 s pokrywa więc realny najgorszy przypadek zdrowego sprzętu i JEDNOCZEŚNIE
+#: stawia twardą granicę: zablokowana integracja nie może wstrzymywać wyładowania ani
+#: restartu Home Assistanta w nieskończoność. Po przekroczeniu logujemy błąd i puszczamy.
+STOP_WRITE_TIMEOUT_S = 10.0
+
+#: S-5 — ile `command_handler.async_stop()` czeka na anulowany task nasłuchu.
+#: Krócej niż zapis, bo tu chodzi wyłącznie o to, żeby obsługa anulowania (raport
+#: do chmury) w ogóle dostała szansę się wykonać, a nie o fizyczny zapis do falownika.
+STOP_LISTEN_TIMEOUT_S = 5.0
+
+#: S-5 — budżet na raport do chmury o anulowanej komendzie. Raport jest „best effort":
+#: wyładowanie integracji nie może na niego czekać dłużej, niż trwa zwykły POST.
+CANCEL_REPORT_TIMEOUT_S = 3.0
+
 # ── Options: konfiguracja użytkownika dla guardów ───────────────────────────
 OPT_SOC_RESERVE = "soc_reserve"
 OPT_USER_MODE = "user_mode"          # earn | autarky | backup

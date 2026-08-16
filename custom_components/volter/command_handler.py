@@ -14,12 +14,14 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
 from .const import (
+    CANCEL_REPORT_TIMEOUT_S,
     COMMAND_ENTITY_MAP,
     DEVICE_TELEMETRY_PATH,
     OPT_ENTITY_EXPORT_LIMIT_SWITCH,
     REALTIME_HEARTBEAT_INTERVAL,
     REALTIME_RECONNECT_BASE,
     REALTIME_RECONNECT_MAX,
+    STOP_LISTEN_TIMEOUT_S,
 )
 from .executor import VolterExecutor
 from .guards import GuardResult, RequestDeduplicator, Status, infer_action
@@ -133,6 +135,15 @@ class VolterCommandHandler:
 
         if self._listen_task and not self._listen_task.done():
             self._listen_task.cancel()
+            # S-5: `cancel()` bez `await` tylko WYSYŁA anulowanie i natychmiast je
+            # porzuca — obsługa anulowania w `_execute_command` (raport do chmury,
+            # ślad w executorze) nigdy nie dostawała szansy się wykonać, bo HA szedł
+            # dalej z wyładowaniem integracji. Czekamy z twardym limitem, żeby zawieszony
+            # nasłuch nie blokował przeładowania.
+            try:
+                await asyncio.wait_for(self._listen_task, timeout=STOP_LISTEN_TIMEOUT_S)
+            except (asyncio.CancelledError, TimeoutError):
+                pass
 
         await self._close_ws()
         _LOGGER.debug("Command handler stopped")
@@ -398,11 +409,70 @@ class VolterCommandHandler:
                 request_id, "error",
                 errors=[{"entity": "command", "error": f"Unknown command: {command}"}],
             )
+        except asyncio.CancelledError:
+            # S-5: `CancelledError` dziedziczy po `BaseException`, więc `except Exception`
+            # niżej go NIE łapie — do chmury nie szło NIC, a chmura rozlicza i planuje
+            # kolejną dobę zakładając, że komenda się wykonała. Ścieżka jest realna przy
+            # KAŻDEJ zmianie opcji integracji (update listener -> reload -> unload ->
+            # `async_stop`), więc nie jest to przypadek teoretyczny.
+            _LOGGER.warning(
+                "Komenda %s (request_id=%s) anulowana — zatrzymanie/przeładowanie "
+                "integracji [S-5]", command, request_id,
+            )
+            await self._raportuj_anulowanie(request_id)
+            # Anulowania NIE WOLNO połknąć — inaczej wyładowanie integracji się zawiesza.
+            raise
         except Exception as err:  # noqa: BLE001
             _LOGGER.error("Nieoczekiwany błąd wykonania komendy %s: %s", command, err)
             await self._report_result(
                 request_id, "error", errors=[{"entity": "command", "error": str(err)}]
             )
+
+    async def _raportuj_anulowanie(self, request_id: str | None) -> None:
+        """S-5: best-effort raport do chmury o anulowanym przebiegu.
+
+        Status `partial`, a nie `error` ani `success`: zapis do falownika mógł zostać
+        dokończony pod ochroną (`executor._async_zapisz_sekwencje`), ale przebieg
+        komendy się nie domknął — chmura musi dostać obie te informacje naraz.
+        `request_id` świadomie NIE trafia do dedupu (ta sama zasada co R-2): anulowanie
+        jest przejściowe, więc retransmisja po przeładowaniu musi działać.
+
+        Cały raport ma twardy budżet czasu, bo to jest ścieżka WYŁĄCZANIA integracji —
+        nie może jej opóźniać bardziej niż zwykły POST.
+        """
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(
+                    asyncio.ensure_future(
+                        self._report_result(
+                            request_id,
+                            Status.PARTIAL.value,
+                            errors=[{
+                                "entity": "command",
+                                "error": (
+                                    "przebieg anulowany (zatrzymanie lub przeładowanie "
+                                    "integracji) — wynik zapisu nieznany"
+                                ),
+                            }],
+                            notes=[{
+                                "invariant": "S-5",
+                                "message": (
+                                    "komenda przerwana anulowaniem; sekwencja nastaw "
+                                    "dokańczana pod ochroną, request_id pozostaje "
+                                    "retryowalny"
+                                ),
+                            }],
+                        )
+                    )
+                ),
+                timeout=CANCEL_REPORT_TIMEOUT_S,
+            )
+        except (TimeoutError, asyncio.CancelledError):
+            # Powtórne anulowanie/timeout: raport przepada, ale anulowanie i tak leci
+            # dalej z wołającego — nie zamieniamy tego na cichy sukces.
+            _LOGGER.warning("Nie udało się zaraportować anulowania komendy [S-5]")
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning("Błąd raportu o anulowaniu komendy: %s [S-5]", err)
 
     def _remember_if_effective(self, request_id: str, result: GuardResult) -> None:
         """Zapamiętaj request_id TYLKO gdy komenda faktycznie coś zapisała (R-2).
