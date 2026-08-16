@@ -1,13 +1,20 @@
-"""Ładuje czyste moduły (`guards`, `schedule`) bez importowania Home Assistanta.
+"""Wspólny harness testowy integracji Volter.
 
-`custom_components/volter/__init__.py` importuje HA, więc zwykłe
-`from custom_components.volter.guards import ...` wymagałoby zainstalowanego HA.
-A `guards.py` i `schedule.py` są świadomie wolne od zależności od HA — chcemy je
-testować zwykłym `pytest`, tak jak później firmware będzie testowane na hoście.
+Robi dwie rzeczy:
 
-Dlatego rejestrujemy je pod sztucznym pakietem `volter_pure`, pomijając `__init__.py`
-prawdziwego komponentu. Kolejność ładowania ma znaczenie: `schedule` robi
-`from .guards import Action`.
+1. **Stubuje moduły `homeassistant`** w `sys.modules`, dzięki czemu moduły
+   komponentu (`executor`, `applier`, `ha_state`, `command_handler`) dają się
+   importować i testować **bez zainstalowanego Home Assistanta** — te same testy
+   uruchomi CI i laptop. Wzorzec z `volcast-ha-integration/tests/conftest.py`.
+
+2. **Ładuje czyste moduły** (`guards`, `schedule`, `mappers`) pod sztucznym
+   pakietem `volter_pure`, z pominięciem `custom_components/volter/__init__.py`.
+   Te moduły są świadomie wolne od zależności od HA — chcemy je testować zwykłym
+   `pytest`, tak jak później firmware będzie testowane na hoście.
+
+Kolejność w tym pliku ma znaczenie: stuby HA muszą wylądować w `sys.modules`
+**zanim** cokolwiek zaimportuje `custom_components.volter.*`, bo te moduły robią
+`from homeassistant... import ...` już w czasie importu.
 """
 
 from __future__ import annotations
@@ -16,6 +23,183 @@ import importlib.util
 import pathlib
 import sys
 import types
+from datetime import datetime, timezone
+from typing import Any
+from unittest.mock import MagicMock
+
+import pytest
+
+# ── Stuby Home Assistanta ───────────────────────────────────────────────────
+# Wzorzec z volcast-ha-integration/tests/conftest.py. Pozwala importować moduły
+# komponentu bez instalacji HA — te same testy uruchomi CI i laptop.
+
+
+def _make_module(name: str, attrs: dict[str, Any] | None = None) -> types.ModuleType:
+    """Zarejestruj sztuczny moduł w `sys.modules` (z opcjonalnymi atrybutami)."""
+    mod = types.ModuleType(name)
+    for key, value in (attrs or {}).items():
+        setattr(mod, key, value)
+    sys.modules[name] = mod
+    return mod
+
+
+class _FakeState:
+    """Odpowiednik homeassistant.core.State."""
+
+    def __init__(self, state: Any, attributes: dict | None = None, last_updated=None):
+        self.state = state
+        self.attributes = attributes or {}
+        self.last_updated = last_updated or datetime.now(timezone.utc)
+
+
+class _FakeStates:
+    """hass.states — słownik encja → _FakeState."""
+
+    def __init__(self) -> None:
+        self._data: dict[str, _FakeState] = {}
+
+    def set(
+        self,
+        entity_id: str,
+        state: Any,
+        attributes: dict | None = None,
+        last_updated=None,
+    ) -> None:
+        self._data[entity_id] = _FakeState(state, attributes, last_updated)
+
+    def get(self, entity_id: str) -> _FakeState | None:
+        return self._data.get(entity_id) if entity_id else None
+
+
+class _FakeServices:
+    """hass.services — rejestruje wywołania, może symulować błąd zapisu."""
+
+    def __init__(self) -> None:
+        self.registered: dict[tuple[str, str], Any] = {}
+        self.calls: list[tuple[str, str, dict]] = []
+        self.fail_with: Exception | None = None
+
+    def has_service(self, domain: str, service: str) -> bool:
+        return (domain, service) in self.registered
+
+    def async_register(self, domain, service, handler, schema=None, supports_response=None):
+        self.registered[(domain, service)] = handler
+
+    def async_remove(self, domain: str, service: str) -> None:
+        self.registered.pop((domain, service), None)
+
+    async def async_call(self, domain, service, data, blocking=False, **_kwargs):
+        self.calls.append((domain, service, dict(data)))
+        if self.fail_with is not None:
+            raise self.fail_with
+
+
+class _FakeBus:
+    """hass.bus — zapamiętuje wystrzelone zdarzenia i nasłuchy."""
+
+    def __init__(self) -> None:
+        self.fired: list[tuple[str, dict]] = []
+        self.listeners: list[tuple[str, Any]] = []
+
+    def async_fire(self, event_type: str, data: dict | None = None) -> None:
+        self.fired.append((event_type, data or {}))
+
+    def async_listen_once(self, event_type: str, listener) -> Any:
+        self.listeners.append((event_type, listener))
+        return lambda: None
+
+
+class _FakeStore:
+    """helpers.storage.Store — trzyma dane w pamięci."""
+
+    def __init__(self, hass=None, version: int = 1, key: str = ""):
+        self._version = version
+        self._key = key
+        self._data: Any = None
+
+    async def async_load(self) -> Any:
+        return self._data
+
+    async def async_save(self, data: Any) -> None:
+        self._data = data
+
+    async def async_remove(self) -> None:
+        self._data = None
+
+
+class _FakeConfigEntry:
+    """Odpowiednik homeassistant.config_entries.ConfigEntry."""
+
+    def __init__(self, options: dict | None = None, data: dict | None = None):
+        self.entry_id = "test_entry"
+        self.data = data or {}
+        self.options = options or {}
+
+    def add_update_listener(self, _listener): ...
+
+    def async_on_unload(self, _fn): ...
+
+
+class FakeHass:
+    """Minimalny odpowiednik obiektu `hass` — tyle, ile potrzebują nasze moduły."""
+
+    class _Config:
+        time_zone = "Europe/Warsaw"
+
+    config = _Config()
+
+    def __init__(self) -> None:
+        self.data: dict = {}
+        self.states = _FakeStates()
+        self.services = _FakeServices()
+        self.bus = _FakeBus()
+        self.created_tasks: list[Any] = []
+
+    def async_create_task(self, coro, *_a, **_kw):
+        # Nie planujemy realnie — zapamiętujemy i zamykamy korutynę,
+        # żeby nie sypało ostrzeżeniem "coroutine was never awaited".
+        self.created_tasks.append(coro)
+        try:
+            coro.close()
+        except Exception:  # noqa: BLE001
+            pass
+        return MagicMock()
+
+
+_make_module("homeassistant")
+_make_module("homeassistant.core", {
+    "HomeAssistant": FakeHass,
+    "State": _FakeState,
+    "CALLBACK_TYPE": Any,
+    "Event": MagicMock(),
+    "EventStateChangedData": MagicMock(),
+    "ServiceCall": MagicMock(),
+    "SupportsResponse": MagicMock(),
+    "callback": lambda fn: fn,
+})
+_make_module("homeassistant.const", {"Platform": MagicMock()})
+_make_module("homeassistant.exceptions", {"HomeAssistantError": Exception})
+_make_module("homeassistant.config_entries", {
+    "ConfigEntry": _FakeConfigEntry,
+    "ConfigFlow": object,
+    "ConfigFlowResult": dict,
+    "OptionsFlow": object,
+    "OptionsFlowWithConfigEntry": object,
+})
+_make_module("homeassistant.helpers")
+_make_module("homeassistant.helpers.storage", {"Store": _FakeStore})
+_make_module("homeassistant.helpers.event", {
+    "async_track_time_interval": MagicMock(return_value=MagicMock()),
+    "async_track_state_change_event": MagicMock(return_value=MagicMock()),
+    "async_call_later": MagicMock(return_value=MagicMock()),
+})
+_make_module("homeassistant.helpers.selector", {"selector": MagicMock()})
+
+# ── Czyste moduły bez HA (volter_pure) ──────────────────────────────────────
+# `custom_components/volter/__init__.py` importuje HA, więc zwykłe
+# `from custom_components.volter.guards import ...` przeciągnęłoby cały komponent.
+# Rejestrujemy je pod sztucznym pakietem `volter_pure`, pomijając `__init__.py`.
+# Kolejność ładowania ma znaczenie: `schedule` robi `from .guards import Action`.
 
 PACKAGE = "volter_pure"
 _MODULES = ("guards", "schedule", "mappers")
@@ -35,3 +219,18 @@ if PACKAGE not in sys.modules:
         _mod = importlib.util.module_from_spec(_spec)
         sys.modules[f"{PACKAGE}.{_name}"] = _mod
         _spec.loader.exec_module(_mod)
+
+
+# ── Fikstury ────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def fake_hass() -> FakeHass:
+    """Świeży `hass` na każdy test — stan encji i wywołania serwisów nie przeciekają."""
+    return FakeHass()
+
+
+@pytest.fixture
+def fake_entry() -> _FakeConfigEntry:
+    """Świeży config entry z pustymi `options` — test dopisuje sobie mapowanie encji."""
+    return _FakeConfigEntry()
