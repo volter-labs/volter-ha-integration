@@ -186,6 +186,9 @@ class VolterExecutor:
             return result
 
         executed, errors = await apply_params(self.hass, options, writable)
+        # N-4: raport do chmury musi mówić prawdę — `executed` to to, co naprawdę
+        # poszło do falownika, nie to, co przeszło guardy (`result.params`).
+        result.executed = executed
 
         self._throttle.commit({k: writable[k] for k in executed if k in writable}, now_ts)
         self._direction.record(act, now_ts)

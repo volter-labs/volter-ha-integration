@@ -294,7 +294,7 @@ class VolterCommandHandler:
         await self._report_result(
             request_id,
             result.status.value,
-            executed=list(result.params.keys()),
+            executed=list(result.executed),
             errors=[],
             notes=[{"invariant": n.invariant, "message": n.message} for n in result.notes],
         )

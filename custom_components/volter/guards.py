@@ -160,6 +160,10 @@ class GuardResult:
     params: dict[str, Any]
     status: Status
     notes: list[Note] = field(default_factory=list)
+    #: Parametry FAKTYCZNIE zapisane na encjach. Różni się od `params`: throttle I-6
+    #: mógł część pominąć, a zapis mógł się nie powieść. Raport do chmury musi
+    #: opierać się na tym polu, nie na `params` (N-4).
+    executed: list[str] = field(default_factory=list)
 
     @property
     def rejected(self) -> bool:
@@ -172,6 +176,7 @@ class GuardResult:
         return {
             "status": self.status.value,
             "params": self.params,
+            "executed": list(self.executed),
             "notes": [{"invariant": n.invariant, "message": n.message} for n in self.notes],
         }
 

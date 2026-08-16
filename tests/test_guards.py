@@ -20,6 +20,7 @@ from volter_pure.guards import (
     DeviceState,
     DirectionLimiter,
     GuardContext,
+    GuardResult,
     InvalidCommand,
     InverterLimits,
     RequestDeduplicator,
@@ -327,3 +328,15 @@ def test_zdrowa_komenda_przechodzi_bez_zmian():
 )
 def test_wnioskowanie_kierunku(params, expected):
     assert infer_action(params) is expected
+
+
+def test_n4_executed_jest_niezalezne_od_params():
+    """Raport musi rozróżniać 'przeszło guardy' od 'zapisane w falowniku'."""
+    result = GuardResult(params={"mode": "general", "eco_soc": 30.0}, status=Status.SUCCESS)
+
+    assert result.executed == []
+
+    result.executed = ["mode"]
+    report = result.as_report()
+    assert report["executed"] == ["mode"]
+    assert set(report["params"]) == {"mode", "eco_soc"}
