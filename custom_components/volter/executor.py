@@ -416,6 +416,12 @@ class VolterExecutor:
             "limits": {
                 "allowed_modes": list(limits.allowed_modes) if limits.allowed_modes else None,
                 "soc_max_hw": limits.soc_max_hw,
+                # R-8: bez tego nie da się odróżnić „nastawa przycięta do granicy sprzętu"
+                # od „encja nie podała granicy i zadziałał tylko sanity-check PARAM_SPECS" —
+                # a to pierwsze pytanie przy smoke teście, gdy zapis idzie inny niż plan.
+                "param_bounds": {
+                    key: {"min": b.lo, "max": b.hi} for key, b in limits.param_bounds.items()
+                },
             },
             "config": {"soc_reserve": cfg.soc_reserve, "mode": cfg.mode},
             "slot": slot_info,

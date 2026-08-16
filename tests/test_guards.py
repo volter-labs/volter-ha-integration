@@ -23,6 +23,7 @@ from volter_pure.guards import (
     GuardResult,
     InvalidCommand,
     InverterLimits,
+    ParamBounds,
     RequestDeduplicator,
     Status,
     UserConfig,
@@ -82,14 +83,24 @@ def test_t2_jednoczesne_ladowanie_i_rozladowanie_odrzucone():
     assert "I-2" in invariants(result)
 
 
-# ── T-3: I-3 / I-10 granice ──────────────────────────────────────────────────
+# ── T-3: I-3 przycięcie do granic sprzętowych ────────────────────────────────
 
 
-def test_t3_wartosc_poza_specyfikacja_odrzucona():
-    # charge_limit ma zakres 0..200 (jednostka do potwierdzenia w Etapie 1)
-    with pytest.raises(InvalidCommand) as err:
-        sanitize_params({"charge_limit": 8000.0}, InverterLimits())
-    assert err.value.invariant == "I-10"
+def test_t3_setpoint_powyzej_granicy_falownika_przyciety_a_nie_odrzucony():
+    """T-3 dosłownie: `max_charge_w=5000`, komenda `charge_limit=8000` → zapis 5000,
+    status `success` z adnotacją o przycięciu, powód I-3.
+
+    R-8: ten test asertował wcześniej ODRZUCENIE przez I-10 — czyli opisywał ówczesną
+    implementację (I-3 w części mocowej było martwe), a nie wymaganie ze specyfikacji.
+    Granica bierze się dziś z atrybutu `max` encji `number` (`InverterLimits.param_bounds`).
+    """
+    limits = InverterLimits(param_bounds={"charge_limit": ParamBounds(0.0, 5000.0)})
+
+    result = apply_guards(sanitize_params({"charge_limit": 8000.0}, limits), ctx(limits=limits))
+
+    assert result.params["charge_limit"] == 5000.0
+    assert result.status is Status.SUCCESS
+    assert "I-3" in invariants(result)
 
 
 def test_t3_eco_soc_przyciety_do_limitu_sprzetowego():
@@ -98,7 +109,16 @@ def test_t3_eco_soc_przyciety_do_limitu_sprzetowego():
     )
 
     assert result.params["eco_soc"] == 90.0
+    assert result.status is Status.SUCCESS
     assert "I-3" in invariants(result)
+
+
+def test_i10_wartosc_poza_param_specs_odrzucona_gdy_nie_znamy_granic_encji():
+    """Osobny przypadek I-10, nie T-3: dopóki encja nie poda `min`/`max`, jedyną
+    obroną zostaje zgadywany zakres z `PARAM_SPECS` i wtedy obowiązuje fail-closed."""
+    with pytest.raises(InvalidCommand) as err:
+        sanitize_params({"charge_limit": 8000.0}, InverterLimits())
+    assert err.value.invariant == "I-10"
 
 
 # ── T-4: I-4 cena ujemna ─────────────────────────────────────────────────────

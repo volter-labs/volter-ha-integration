@@ -87,9 +87,25 @@ _DISCHARGE_HINTS = ("discharge_limit",)
 
 
 @dataclass(frozen=True)
+class ParamBounds:
+    """Realna granica nastawy, odczytana z atrybutów `min`/`max` encji (I-3).
+
+    R-8: to jest wiedza o SPRZĘCIE, a nie nasze przypuszczenie — dlatego ma
+    pierwszeństwo nad `PARAM_SPECS`, które do czasu mapy nastaw z Etapu 3 zgadują.
+    """
+
+    lo: float
+    hi: float
+
+
+@dataclass(frozen=True)
 class InverterLimits:
     """Twarde granice sprzętowe (I-3). Docelowo czytane z falownika."""
 
+    #: Granice w WATACH — nikt ich dziś nie ustawia i nikt na nich nie pracuje.
+    #: R-8: świadomie zostają puste do Etapu 3: przeliczenie ich na nastawy falownika
+    #: wymaga napięcia baterii (`charge_limit` jest w A) i mapy nastaw. Część mocową I-3
+    #: realizuje `param_bounds`, czyli granice w jednostkach samych encji.
     max_charge_w: float | None = None
     max_discharge_w: float | None = None
     soc_min_hw: float = 0.0
@@ -98,6 +114,10 @@ class InverterLimits:
     #: Lista dopuszczalnych opcji encji select trybu pracy. Jeśli None — brak walidacji
     #: enuma (nie znamy jeszcze listy). Docelowo czytana z atrybutu `options` encji.
     allowed_modes: tuple[str, ...] | None = None
+    #: R-8: granice per-parametr z encji `number` (nazwa parametru -> `ParamBounds`).
+    #: Pusty słownik znaczy „nie wiem" — wtedy jedyną obroną zostaje sanity-check
+    #: z `PARAM_SPECS`, bo zmyślona granica byłaby groźniejsza niż jej brak.
+    param_bounds: dict[str, ParamBounds] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -249,6 +269,17 @@ def sanitize_params(params: dict[str, Any], limits: InverterLimits) -> dict[str,
 
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise InvalidCommand("I-10", f"{key} musi być liczbą, jest {value!r}")
+
+        # R-8: gdy znamy REALNĄ granicę z encji, zgadywany zakres z `PARAM_SPECS`
+        # (`to_confirm=True`) musi ustąpić — inaczej I-10 odrzuca całą komendę tam,
+        # gdzie specyfikacja (T-3) każe przyciąć do granicy sprzętu. Przycięciem
+        # zajmuje się I-3 w `apply_guards`, tu tylko przepuszczamy wartość dalej.
+        # Zakresów pewnych (`to_confirm=False`, np. procenty 0..100) nie rozmiękczamy:
+        # to fizyczna domena parametru, której żadna encja nie poszerzy (T-11).
+        if spec.to_confirm and key in limits.param_bounds:
+            clean[key] = float(value)
+            continue
+
         if not (spec.lo <= float(value) <= spec.hi):
             raise InvalidCommand(
                 "I-10", f"{key}={value} poza zakresem {spec.lo}..{spec.hi} {spec.unit}"
@@ -358,15 +389,32 @@ def apply_guards(params: dict[str, Any], ctx: GuardContext) -> GuardResult:
             )
 
     # I-3: przycięcie do granic sprzętowych.
-    if limits.max_charge_w is not None and "charge_limit" in out:
-        # charge_limit jest w A (do potwierdzenia w Etapie 1) — porównanie mocy wymaga
-        # napięcia baterii, więc do czasu potwierdzenia stosujemy tylko sanity z PARAM_SPECS.
-        pass
+    #
+    # R-8: granice biorą się z atrybutów `min`/`max` encji `number` — falownik sam mówi,
+    # co przyjmie, więc nie musimy czekać na mapę nastaw z Etapu 3. Wcześniej ta część
+    # I-3 była martwa (literalne `pass` dla `max_charge_w`, a `read_inverter_limits`
+    # i tak nigdy żadnej granicy mocowej nie ustawiało).
+    #
+    # Status pozostaje `success` — litera wektora T-3 („status success z adnotacją
+    # o przycięciu"). `partial` znaczy „części komendy NIE zastosowano" i chmura
+    # traktuje go jako sygnał do ponowienia; przycięta nastawa została zastosowana,
+    # tyle że na granicy sprzętu, i ponawianie jej niczego nie poprawi.
+    for key, bounds in limits.param_bounds.items():
+        raw = out.get(key)
+        if raw is None or isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            continue
+        clipped = min(max(float(raw), bounds.lo), bounds.hi)
+        if clipped != float(raw):
+            result.note(
+                "I-3",
+                f"{key} przycięty {raw}->{clipped} (granica encji {bounds.lo}..{bounds.hi})",
+            )
+            out[key] = clipped
+
     if limits.soc_max_hw < out.get("eco_soc", 0):
         clipped = limits.soc_max_hw
         result.note("I-3", f"eco_soc przycięty {out['eco_soc']}->{clipped} (limit sprzętowy)")
         out["eco_soc"] = clipped
-        result.status = Status.PARTIAL if result.status == Status.SUCCESS else result.status
 
     # I-4: nie eksportuj przy cenie <= 0.
     if ctx.price_pln_kwh is not None and ctx.price_pln_kwh <= 0:
@@ -548,6 +596,7 @@ __all__ = [
     "Note",
     "PARAM_ORDER",
     "PARAM_SPECS",
+    "ParamBounds",
     "RequestDeduplicator",
     "Status",
     "UserConfig",
