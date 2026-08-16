@@ -234,6 +234,118 @@ class VolterExecutor:
 
     # ── diagnostyka ──────────────────────────────────────────────────────────
 
+    async def async_diagnose(self) -> dict[str, Any]:
+        """Suchy przebieg: policz, co executor zrobiłby teraz — i nic nie zapisz.
+
+        To jest odpowiedź na pytanie „dlaczego nic się nie dzieje". Zwraca stan
+        zmapowanych encji, granice odczytane z falownika (w tym realne `allowed_modes`,
+        które weryfikują hipotezę z `mappers.py`), wybrany slot, wynik sanityzacji
+        i guardów oraz listę zapisów, które faktycznie by poszły po throttlingu.
+
+        Twarde reguły tej metody:
+          * ZERO zapisów — żadnego `hass.services.async_call`,
+          * podgląd throttlingu przez `filter`, nigdy `commit` — stan I-6 zostaje nietknięty,
+          * `self._prev_soc` i `self._last` pozostają bez zmian (to suchy przebieg,
+            nie przebieg — nie wolno mu zafałszować kolejnego realnego wykonania).
+        """
+        options = dict(self._entry.options)
+        limits = read_inverter_limits(self.hass, options)
+        state = read_device_state(self.hass, options, self._prev_soc)
+        cfg = UserConfig(
+            soc_reserve=float(options.get(OPT_SOC_RESERVE, DEFAULT_SOC_RESERVE)),
+            mode=str(options.get(OPT_USER_MODE, "autarky")),
+        )
+
+        # Mapowanie encji: `found: false` odpowiada wprost na „zmapowałem, ale nie istnieje".
+        entities: dict[str, Any] = {}
+        for opt_key, entity_id in options.items():
+            if not isinstance(entity_id, str) or "." not in entity_id:
+                continue
+            st = self.hass.states.get(entity_id)
+            entities[opt_key] = {
+                "entity_id": entity_id,
+                "state": None if st is None else st.state,
+                "found": st is not None,
+            }
+
+        now = datetime.now(timezone.utc)
+        slot_info: dict[str, Any] = {"source": "brak harmonogramu"}
+        raw_params: dict[str, Any] = {}
+        if self._schedule is not None:
+            slot, is_fallback = self._schedule.effective_slot(now)
+            rated = float(options.get(OPT_RATED_POWER_W, DEFAULT_RATED_POWER_W))
+            raw_params = slot_to_params(slot, rated_power_w=rated)
+            slot_info = {
+                "source": "fallback" if is_fallback else "schedule",
+                "from": slot.start.isoformat(),
+                "to": slot.end.isoformat(),
+                "action": slot.action.value,
+                "soc_target": slot.soc_target,
+                "price_pln_kwh": slot.price_pln_kwh,
+            }
+
+        report: dict[str, Any] = {
+            "at": now.isoformat(),
+            "entities": entities,
+            "state": {
+                "soc": state.soc,
+                # Brak zmapowanych encji monitoringu daje age_s = inf, a to nie jest
+                # poprawny JSON w odpowiedzi serwisu HA — raportujemy wtedy None.
+                "age_s": state.age_s if state.age_s < float("inf") else None,
+                "pv_power_w": state.pv_power_w,
+                "grid_power_w": state.grid_power_w,
+            },
+            "limits": {
+                "allowed_modes": list(limits.allowed_modes) if limits.allowed_modes else None,
+                "soc_max_hw": limits.soc_max_hw,
+            },
+            "config": {"soc_reserve": cfg.soc_reserve, "mode": cfg.mode},
+            "slot": slot_info,
+            "raw_params": raw_params,
+            "would_write": {},
+            "last": self._last,
+        }
+
+        # Guardy liczymy ZAWSZE, także bez harmonogramu — bo najczęstsze pytanie brzmi
+        # „czy stan instalacji w ogóle pozwoliłby cokolwiek zapisać" (I-9), a na to
+        # odpowiedź nie zależy od tego, czy plan już dotarł z chmury.
+        try:
+            clean = sanitize_params(raw_params, limits)
+        except InvalidCommand as err:
+            report["guards"] = {
+                "status": "error",
+                "notes": [{"invariant": err.invariant, "message": err.message}],
+                "params": {},
+            }
+            return report
+
+        guarded = apply_guards(
+            clean,
+            GuardContext(
+                state=state,
+                limits=limits,
+                config=cfg,
+                price_pln_kwh=slot_info.get("price_pln_kwh"),
+                max_state_age_s=MAX_STATE_AGE_S,
+                max_soc_jump_pp=MAX_SOC_JUMP_PP,
+            ),
+        )
+        report["guards"] = guarded.as_report()
+
+        # `would_write` liczymy tylko wtedy, gdy naprawdę jest co zapisywać. Bez
+        # harmonogramu guardy pracują na pustym zestawie i I-1 potrafi dorzucić
+        # eco_soc = rezerwa — raportowanie tego jako „poszłoby do falownika"
+        # byłoby kłamstwem.
+        if raw_params and not guarded.rejected:
+            # Podgląd throttlingu bez commitu — stan throttle'a zostaje nietknięty.
+            writable, notes = self._throttle.filter(guarded.params, time.monotonic())
+            report["would_write"] = writable
+            report["guards"]["notes"].extend(
+                {"invariant": n.invariant, "message": n.message} for n in notes
+            )
+
+        return report
+
     def _remember(
         self,
         source: str,
