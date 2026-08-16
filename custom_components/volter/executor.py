@@ -166,12 +166,21 @@ class VolterExecutor:
         source: str = "cloud",
         slot: Slot | None = None,
         _remapped: bool = False,
+        _extra_forced_params: frozenset[str] = frozenset(),
     ) -> GuardResult:
         """Jedyna droga do falownika: sanityzacja → guardy → throttle → zapis.
 
         `slot` podaje ścieżka harmonogramu. Jest potrzebny wyłącznie po to, żeby przy
         `GuardResult.forced_action` dało się przemapować slot na tryb bezpieczny (R-1);
         `_remapped` gwarantuje, że dzieje się to najwyżej raz.
+
+        `_extra_forced_params` (RR-3): parametry, które NIE pochodzą z `apply_guards`
+        (bo guardy pracują na wartościach, nie na nazwach encji falownika), ale mimo
+        to są substytutem bezpieczeństwa wymuszonym przez guard — dziś wyłącznie
+        `mode` w przebiegu przemapowanym po `forced_action`. Musi trafić do
+        `result.forced_params` PRZED wywołaniem `apply_params`, inaczej brak
+        zmapowanej encji trybu wyglądałby jak zwykła nota, a nie jak zniknięcie
+        ochrony I-1 (dokładnie ten wzorzec luki, który zamyka RR-3).
         """
         options = dict(self._entry.options)
         # RR-2: realny tor zapisu UCZY cache granic (i z niego korzysta, gdy encja
@@ -231,6 +240,9 @@ class VolterExecutor:
             min_soc_jump_tolerance_pp=MIN_SOC_JUMP_TOLERANCE_PP,
         )
         result = apply_guards(clean, ctx)
+        if _extra_forced_params:
+            # RR-3: dołożone PRZED zapisem — patrz docstring `_extra_forced_params`.
+            result.forced_params |= _extra_forced_params
         # R-5: baseline SoC dla NASTĘPNEGO przebiegu aktualizujemy WYŁĄCZNIE z odczytów,
         # których samo I-9 nie zakwestionowało — inaczej odczyt odrzucony jako fizycznie
         # niemożliwy stawałby się zaufanym punktem odniesienia już w kolejnym ticku
@@ -279,6 +291,11 @@ class VolterExecutor:
                     source=source,
                     slot=forced_slot,
                     _remapped=True,
+                    # RR-3: "mode" w TYM przebiegu to substytut bezpieczny
+                    # wymuszony przez I-1, nie zwykła treść planu — brak
+                    # zmapowanej encji trybu musi być głośnym błędem (tak jak
+                    # I-4 w R-3), nie cichą notą o opcjonalnej encji.
+                    _extra_forced_params=frozenset({"mode"}),
                 )
                 # Powód wymuszenia (nota I-1) powstał w PIERWSZYM przebiegu — bez przeniesienia
                 # go dalej raport do chmury nie tłumaczyłby, czemu plan nie został wykonany.
@@ -335,7 +352,14 @@ class VolterExecutor:
         if not writable:
             result.executed = []
         else:
-            executed, errors = await apply_params(self.hass, options, writable)
+            # RR-3: `forced_params` rozstrzyga w `apply_params`, czy brak zmapowanej
+            # encji dla danego parametru jest błędem (zabezpieczenie guarda) czy tylko
+            # widoczną notą (normalny parametr planu, opcjonalna encja świadomie
+            # niezmapowana) — patrz `GuardResult.forced_params` i docstring
+            # `apply_params`.
+            executed, errors, skip_notes = await apply_params(
+                self.hass, options, writable, forced_params=result.forced_params
+            )
             # N-4: raport do chmury musi mówić prawdę — `executed` to to, co naprawdę
             # poszło do falownika, nie to, co przeszło guardy (`result.params`).
             result.executed = executed
@@ -343,6 +367,12 @@ class VolterExecutor:
             # encja z R-3) ginęły — command_handler raportował do chmury errors=[]
             # na sztywno, niezależnie od tego, co faktycznie zawiodło.
             result.errors = errors
+            # RR-3: parametry z normalnego mapowania planu bez zmapowanej encji nie
+            # są błędem, ale nie mogą też zniknąć bez śladu — trafiają do `notes`,
+            # więc chmura i log HA nadal je widzą (zgodnie z zasadą "nota widoczna,
+            # nie błąd" dla tej kategorii).
+            for skip in skip_notes:
+                result.note("RR-3", f"{skip['entity']}: {skip['note']}")
 
             self._throttle.commit({k: writable[k] for k in executed if k in writable}, now_ts)
             self._direction.record(act, now_ts)

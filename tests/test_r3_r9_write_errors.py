@@ -36,11 +36,15 @@ async def test_r3_niezmapowana_encja_to_cichy_no_op_raportowany_jako_sukces():
     hass = FakeHass()
     options: dict = {}  # entity_eco_mode_soc świadomie NIE zmapowane
 
-    executed, errors = await apply_params(hass, options, {"eco_soc": 40.0})
+    # RR-3: `forced_params=None` (domyślne, brak wiedzy od guardów — stary kontrakt
+    # wywołania spoza executora) zachowuje pierwotną naprawę R-3 co do joty: KAŻDY
+    # brak mapowania jest błędem.
+    executed, errors, notes = await apply_params(hass, options, {"eco_soc": 40.0})
 
     assert executed == []
     assert errors, "niezmapowana encja musi zostawić wpis w errors — inaczej cichy no-op"
     assert errors[0]["entity"] == "eco_soc"
+    assert notes == []
 
 
 @pytest.mark.asyncio
@@ -49,11 +53,12 @@ async def test_r3_niezmapowany_przelacznik_export_limit_to_cichy_no_op():
     hass = FakeHass()
     options: dict = {}  # entity_export_limit_switch świadomie NIE zmapowany
 
-    executed, errors = await apply_params(hass, options, {"export_limit_enabled": True})
+    executed, errors, notes = await apply_params(hass, options, {"export_limit_enabled": True})
 
     assert executed == []
     assert errors, "niezmapowany przełącznik limitu eksportu też musi trafić do errors"
     assert errors[0]["entity"] == "export_limit_enabled"
+    assert notes == []
 
 
 @pytest.mark.asyncio
@@ -64,10 +69,13 @@ async def test_r3_czesciowy_zapis_niezmapowanej_encji_daje_errors_i_wykonane_oso
     hass.states.set("select.tryb", "general", {"options": ["general", "eco_charge"]})
     options = {"entity_ems_mode": "select.tryb"}  # eco_soc świadomie NIE zmapowane
 
-    executed, errors = await apply_params(hass, options, {"mode": "eco_charge", "eco_soc": 40.0})
+    executed, errors, notes = await apply_params(
+        hass, options, {"mode": "eco_charge", "eco_soc": 40.0}
+    )
 
     assert executed == ["mode"]
     assert [e["entity"] for e in errors] == ["eco_soc"]
+    assert notes == []
 
 
 @pytest.mark.asyncio

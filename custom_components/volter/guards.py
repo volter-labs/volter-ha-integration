@@ -222,6 +222,17 @@ class GuardResult:
     #: I-9, bo notę zostawia też przyjęcie NOWEGO baseline'u po długiej przerwie —
     #: i to właśnie mylenie tych dwóch przypadków dawało trwały lockout toru zapisu.
     soc_baseline_ok: bool = True
+    #: RR-3: nazwy parametrów, które guard bezpieczeństwa SAM wstawił/wymusił
+    #: (I-1 podnoszące próg eco_soc, I-4 blokujące eksport) — w odróżnieniu od
+    #: parametrów pochodzących z normalnego mapowania planu (`mappers.slot_to_params`
+    #: emituje część z nich ZAWSZE, niezależnie od tego, czy użytkownik zmapował
+    #: odpowiednią encję). `applier.apply_params` musi traktować te dwie grupy różnie:
+    #: encja bez mapowania dla parametru WYMUSZONEGO to BŁĄD (ochrona, która nie może
+    #: się zastosować, musi być głośna — R-3), encja bez mapowania dla parametru
+    #: z normalnego planu to tylko widoczna NOTA (użytkownik świadomie nie zmapował
+    #: opcjonalnej encji — dosłowne traktowanie obu grup identycznie zamieniało
+    #: legalną konfigurację w trwały ERROR co przebieg pętli, RR-3).
+    forced_params: set[str] = field(default_factory=set)
 
     @property
     def rejected(self) -> bool:
@@ -245,6 +256,10 @@ class GuardResult:
             "notes": [{"invariant": n.invariant, "message": n.message} for n in self.notes],
             # R-9: błędy zapisu per-encja muszą być widoczne w raporcie, nie tylko w logu HA.
             "errors": list(self.errors),
+            # RR-3: chmura musi widzieć, które parametry są zabezpieczeniem wymuszonym
+            # przez guardy — to jest kontekst potrzebny do interpretacji `errors` (patrz
+            # `forced_params` na klasie).
+            "forced_params": sorted(self.forced_params),
         }
 
 
@@ -487,6 +502,11 @@ def apply_guards(params: dict[str, Any], ctx: GuardContext) -> GuardResult:
         eco_soc_raised = out.get("eco_soc", 0) < cfg.soc_reserve
         if eco_soc_raised:
             out["eco_soc"] = cfg.soc_reserve
+            # RR-3: I-1 SAMO wstawia/podnosi tę wartość — jeśli encja eco_soc nie jest
+            # zmapowana, rezerwa backup znika po cichu dokładnie tym samym wzorcem
+            # luki co I-4 w R-3. `applier` musi to traktować jako BŁĄD, nie jako
+            # "użytkownik nie zmapował opcjonalnej encji".
+            result.forced_params.add("eco_soc")
         if removed or wants_discharge or eco_soc_raised:
             result.status = Status.PARTIAL
             result.note(
@@ -555,6 +575,12 @@ def apply_guards(params: dict[str, Any], ctx: GuardContext) -> GuardResult:
         if out.get("export_limit_enabled") is not True:
             out["export_limit_enabled"] = True
             changed = True
+        # RR-3: oznaczamy OBA parametry jako wymuszone niezależnie od `changed` —
+        # brak zmapowanej encji jest równie groźny, gdy plan sam trafił w bezpieczną
+        # wartość (wtedy `changed=False`), bo ochrona nadal wymaga, żeby ta wartość
+        # FAKTYCZNIE dotarła do falownika, a nie tylko żeby guard nie musiał jej zmieniać.
+        result.forced_params.add("export_limit")
+        result.forced_params.add("export_limit_enabled")
         if changed:
             result.note(
                 "I-4",
