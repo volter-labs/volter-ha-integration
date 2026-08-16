@@ -11,6 +11,7 @@ from .command_handler import VolterCommandHandler
 from .const import CONF_API_KEY, CONF_DEVICE_ID, CONF_SUPABASE_ANON_KEY, CONF_SUPABASE_URL, DOMAIN
 from .coordinator import VolterTelemetryCoordinator
 from .executor import VolterExecutor
+from .fetcher import ScheduleFetcher
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -56,6 +57,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: VolterConfigEntry) -> bo
     # Executor — pętla wykonawcza harmonogramu + jedyna brama zapisu do falownika
     executor = VolterExecutor(hass=hass, entry=entry)
 
+    # Task 16: pobieranie planu z chmury (get-schedule, pull co 5 min) —
+    # brakujące ogniwo między planerem a executorem. Musi powstać PO executorze,
+    # bo przekazuje mu pobrany plan (`executor.async_set_schedule`).
+    fetcher = ScheduleFetcher(
+        hass=hass,
+        entry=entry,
+        supabase_url=supabase_url,
+        api_key=api_key,
+        executor=executor,
+    )
+
     # Command handler — subskrybuje kanał Realtime i deleguje do executora
     command_handler = VolterCommandHandler(
         hass=hass,
@@ -71,13 +83,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: VolterConfigEntry) -> bo
         "coordinator": coordinator,
         "command_handler": command_handler,
         "executor": executor,
+        "fetcher": fetcher,
     }
 
     await _async_register_services(hass)
 
-    # Uruchom coordinator, executor i command handler
+    # Uruchom coordinator, executor, fetcher (po executorze — patrz wyżej) i command handler
     await coordinator.async_start()
     await executor.async_start()
+    await fetcher.async_start()
     await command_handler.async_start()
 
     # Reaguj na zmiany w Options Flow (przeładuj encje)
@@ -97,12 +111,19 @@ async def async_unload_entry(hass: HomeAssistant, entry: VolterConfigEntry) -> b
     coordinator: VolterTelemetryCoordinator | None = data.get("coordinator")
     command_handler: VolterCommandHandler | None = data.get("command_handler")
     executor: VolterExecutor | None = data.get("executor")
+    fetcher: ScheduleFetcher | None = data.get("fetcher")
 
     if coordinator:
         await coordinator.async_stop()
 
     if command_handler:
         await command_handler.async_stop()
+
+    # Task 16 / S-5: odsubskrybuj TIMER pobierania PRZED zatrzymaniem executora —
+    # inaczej tick fetchera mógłby jeszcze odpalić się w oknie między odsubskrybowaniem
+    # a `executor.async_stop()` i trafić na executor, który już odmawia zapisu (S-5b).
+    if fetcher:
+        await fetcher.async_stop()
 
     if executor:
         await executor.async_stop()

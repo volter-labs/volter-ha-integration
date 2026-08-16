@@ -382,6 +382,17 @@ class Schedule:
                 "schedule_id", f"schedule_id musi być stringiem, jest {schedule_id!r}"
             )
         generated = raw.get("generated_at")
+        if generated == "":
+            # D-6 (Task 16, znalezione przy naprawie): `get-schedule` (Apka1) wysyła
+            # `generated_at=""` dla LEGALNEGO pustego planu — `emptySchedule()` w
+            # `schedule-assembly.ts` woła `toDeviceSchedule([], ...)`, a bez slotów
+            # nie ma skąd wziąć znacznika czasu, więc kontrakt oddaje pusty string,
+            # nie `null`. Bez tej gałęzi `_znacznik` traktowało pusty string jak
+            # zepsuty znacznik ISO-8601 i S-2 (fail-closed) odrzucało CAŁY
+            # harmonogram — czyli legalna odpowiedź „optymalizator wyłączony, brak
+            # planu" nigdy nie docierała do executora, a urządzenie nie wchodziło
+            # w fallback I-5, tylko zostawało na starym planie z `Store` bez końca.
+            generated = None
         return cls(
             schedule_id=schedule_id,
             generated_at=_znacznik(raw, "generated_at") if generated is not None else None,

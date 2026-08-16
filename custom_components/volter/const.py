@@ -8,6 +8,7 @@ SUPABASE_PROJECT_REF = "japquphqgvvsaoxotnbl"
 DEFAULT_SUPABASE_URL = f"https://{SUPABASE_PROJECT_REF}.supabase.co"
 CLAIM_DEVICE_PATH = "/functions/v1/claim-device"
 DEVICE_TELEMETRY_PATH = "/functions/v1/device-telemetry"
+GET_SCHEDULE_PATH = "/functions/v1/get-schedule"
 
 # ── Config keys ─────────────────────────────────────────────────────────────
 CONF_API_KEY = "api_key"
@@ -165,3 +166,9 @@ OPT_RATED_POWER_W = "rated_power_w"  # moc znamionowa falownika, do przeliczenia
 
 DEFAULT_SOC_RESERVE = 20.0
 DEFAULT_RATED_POWER_W = 10000.0
+
+# ── Task 16 — pobieranie harmonogramu z chmury ──────────────────────────────
+#: Interwał pobierania planu z `get-schedule`. Plan zmienia się rzadko (planer
+#: raz dziennie, reaktor przy odchyleniu), więc 5 min jest z dużym zapasem —
+#: ten sam rząd wielkości co CRON planera po stronie chmury.
+SCHEDULE_FETCH_INTERVAL = 300
