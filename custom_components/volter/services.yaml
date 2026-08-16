@@ -1,0 +1,5 @@
+diagnose:
+  name: Diagnose
+  description: >-
+    Dry run — pokazuje, co Volter zrobilby teraz i ktory inwariant ewentualnie
+    to blokuje. Nie zapisuje niczego do falownika.

@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
 
 from .command_handler import VolterCommandHandler
 from .const import CONF_API_KEY, CONF_DEVICE_ID, CONF_SUPABASE_ANON_KEY, CONF_SUPABASE_URL, DOMAIN
@@ -15,6 +15,26 @@ from .executor import VolterExecutor
 _LOGGER = logging.getLogger(__name__)
 
 type VolterConfigEntry = ConfigEntry
+
+SERVICE_DIAGNOSE = "diagnose"
+
+
+async def _async_register_services(hass: HomeAssistant) -> None:
+    """Zarejestruj serwisy domeny (raz na instancję HA, nie na config entry)."""
+    if hass.services.has_service(DOMAIN, SERVICE_DIAGNOSE):
+        return
+
+    async def _handle_diagnose(_call: ServiceCall) -> dict:
+        entries = hass.data.get(DOMAIN, {})
+        return {
+            entry_id: await bundle["executor"].async_diagnose()
+            for entry_id, bundle in entries.items()
+        }
+
+    hass.services.async_register(
+        DOMAIN, SERVICE_DIAGNOSE, _handle_diagnose,
+        supports_response=SupportsResponse.ONLY,
+    )
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: VolterConfigEntry) -> bool:
@@ -52,6 +72,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: VolterConfigEntry) -> bo
         "command_handler": command_handler,
         "executor": executor,
     }
+
+    await _async_register_services(hass)
 
     # Uruchom coordinator, executor i command handler
     await coordinator.async_start()
