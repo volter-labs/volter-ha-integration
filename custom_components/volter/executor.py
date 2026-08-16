@@ -26,12 +26,14 @@ from homeassistant.helpers.storage import Store
 
 from .applier import apply_params
 from .const import (
+    COMMAND_ENTITY_MAP,
     DEFAULT_RATED_POWER_W,
     DEFAULT_SOC_RESERVE,
     EXECUTOR_INTERVAL,
     MAX_DIRECTION_CHANGES_PER_HOUR,
     MAX_SOC_JUMP_PP,
     MAX_STATE_AGE_S,
+    OPT_ENTITY_EXPORT_LIMIT_SWITCH,
     OPT_RATED_POWER_W,
     OPT_SOC_RESERVE,
     OPT_USER_MODE,
@@ -45,6 +47,7 @@ from .guards import (
     GuardContext,
     GuardResult,
     InvalidCommand,
+    Note,
     Status,
     UserConfig,
     WriteThrottle,
@@ -57,6 +60,22 @@ from .mappers import slot_to_params
 from .schedule import Fallback, Schedule, Slot
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _mapped_entity(param_key: str, options: dict[str, Any]) -> bool:
+    """Czy `param_key` ma zmapowaną encję w opcjach integracji.
+
+    R-7: `async_diagnose` musi wiedzieć dokładnie to samo, co `applier.apply_params`
+    naprawdę zrobi — inaczej `would_write` pokazuje zapis, który w realnym
+    `async_apply` skończy się cichym błędem R-3 (encja niezmapowana), nie zapisem.
+    """
+    if param_key == "export_limit_enabled":
+        return bool(options.get(OPT_ENTITY_EXPORT_LIMIT_SWITCH))
+    mapping = COMMAND_ENTITY_MAP.get(param_key)
+    if not mapping:
+        return False
+    opt_key = mapping[0]
+    return bool(options.get(opt_key))
 
 
 class VolterExecutor:
@@ -157,7 +176,10 @@ class VolterExecutor:
             _LOGGER.error("[%s] Komenda odrzucona (%s): %s", source, err.invariant, err.message)
             result = GuardResult(params={}, status=Status.ERROR)
             result.note(err.invariant, err.message)
-            self._remember(source, result, [], [])
+            # R-12: wczesny return (I-10) musi przejść przez ten sam log decyzji co
+            # ścieżka normalna — inaczej seria odrzuceń nigdy nie zmienia
+            # `_last_decision` i powrót do sukcesu po niej nie generuje INFO.
+            self._remember(source, result, [], [], action or infer_action(raw_params))
             return result
 
         # I-1…I-9
@@ -186,7 +208,11 @@ class VolterExecutor:
 
         if result.rejected:
             _LOGGER.warning("[%s] Zapis wstrzymany, status=%s", source, result.status.value)
-            self._remember(source, result, [], [])
+            # R-12: DEGRADED/ERROR/DUPLICATE to wczesny return — bez aktualizacji
+            # `_last_decision` tutaj ścieżka DEGRADED nie ma żadnej ochrony przed
+            # anty-spamem (loguje WARNING+INFO co przebieg pętli), a powrót do sukcesu
+            # po awarii z identyczną decyzją co przed nią wygląda jak "bez zmian".
+            self._remember(source, result, [], [], action or infer_action(clean))
             return result
 
         # R-1: guard podmienił intencję planu (np. I-1 zdusiło rozładowanie). Zapis
@@ -218,7 +244,13 @@ class VolterExecutor:
                 forced.forced_action = result.forced_action
                 if forced.status is Status.SUCCESS:
                     forced.status = Status.PARTIAL
-                self._remember(source, forced, list(forced.executed), self._last.get("errors", []))
+                # R-12: nadpisujemy `_last` (i `_last_decision`) pełnym raportem
+                # wymuszonej akcji, nie oryginalnie zamierzonej — to ONA faktycznie
+                # zaszła.
+                self._remember(
+                    source, forced, list(forced.executed), self._last.get("errors", []),
+                    result.forced_action,
+                )
                 return forced
 
             if "mode" in result.params:
@@ -244,7 +276,9 @@ class VolterExecutor:
             result.status = Status.THROTTLED
             result.note(note.invariant, note.message)
             _LOGGER.info("[%s] guard %s: %s", source, note.invariant, note.message)
-            self._remember(source, result, [], [])
+            # R-12: THROTTLED to też wczesny return — musi zaktualizować `_last_decision`
+            # tak samo jak ścieżka normalna.
+            self._remember(source, result, [], [], act)
             return result
 
         # I-6 — throttling zapisów (ochrona pamięci nieulotnej falownika)
@@ -276,21 +310,10 @@ class VolterExecutor:
             elif errors:
                 result.status = Status.PARTIAL
 
-        # Log INFO tylko przy zmianie decyzji — pętla chodzi co 60 s i logowanie
-        # każdego przebiegu na INFO uczyniłoby log bezużytecznym. "Brak zmian do
-        # zapisania" to też decyzja i musi przejść przez ten sam mechanizm, inaczej
-        # "nic się nie dzieje" znów staje się niewidoczne.
-        decision = f"{act.value}|{sorted(result.params.items())}|{result.status.value}"
-        if decision != self._last_decision:
-            _LOGGER.info(
-                "[%s] Decyzja: %s, status=%s, zapisano=%s",
-                source, act.value, result.status.value, result.executed or "nic",
-            )
-            self._last_decision = decision
-        else:
-            _LOGGER.debug("[%s] Decyzja bez zmian: %s", source, act.value)
-
-        self._remember(source, result, executed, errors)
+        # R-12: log decyzji (anty-spam + `_last_decision`) przeniesiony do `_remember`,
+        # żeby DZIAŁAŁ TAKŻE na wczesnych returnach (I-10, I-1..I-9, I-8) — patrz
+        # komentarz przy `_remember`.
+        self._remember(source, result, executed, errors, act)
         return result
 
     # ── pętla ────────────────────────────────────────────────────────────────
@@ -464,12 +487,38 @@ class VolterExecutor:
         # eco_soc = rezerwa — raportowanie tego jako „poszłoby do falownika"
         # byłoby kłamstwem.
         if raw_params and not guarded.rejected:
-            # Podgląd throttlingu bez commitu — stan throttle'a zostaje nietknięty.
-            writable, notes = self._throttle.filter(guarded.params, time.monotonic())
-            report["would_write"] = writable
-            report["guards"]["notes"].extend(
-                {"invariant": n.invariant, "message": n.message} for n in notes
-            )
+            # R-7: `async_apply` sprawdza I-8 (anty-oscylacja) PO guardach, a PRZED
+            # throttlingiem — diagnose musi odwzorować dokładnie tę kolejność, inaczej
+            # raportuje `status='success'` i pełne `would_write` tam, gdzie realny
+            # `async_apply` zwróciłby THROTTLED. `allows`, NIGDY `record`: sam odczyt
+            # nie może zmienić stanu `DirectionLimiter` — to suchy przebieg.
+            act = slot_action or infer_action(guarded.params)
+            allowed, direction_note = self._direction.allows(act, time.monotonic())
+            if not allowed and direction_note is not None:
+                report["guards"]["status"] = Status.THROTTLED.value
+                report["guards"]["notes"].append(
+                    {"invariant": direction_note.invariant, "message": direction_note.message}
+                )
+            else:
+                # Podgląd throttlingu bez commitu — stan throttle'a zostaje nietknięty.
+                writable, notes = self._throttle.filter(guarded.params, time.monotonic())
+                # R-7: parametr bez zmapowanej encji w opcjach integracji nigdy nie
+                # zostanie zapisany — `applier.apply_params` zgłosi błąd R-3 i pominie
+                # go. `would_write` musi pokazywać tylko to, co naprawdę by poszło,
+                # inaczej diagnoza kłamie dokładnie w sytuacji, którą ma tłumaczyć.
+                unmapped = [key for key in writable if not _mapped_entity(key, options)]
+                for key in unmapped:
+                    writable.pop(key)
+                    notes.append(
+                        Note(
+                            "R-3",
+                            f"{key}: encja niezmapowana w opcjach integracji — zapis nie poszedłby",
+                        )
+                    )
+                report["would_write"] = writable
+                report["guards"]["notes"].extend(
+                    {"invariant": n.invariant, "message": n.message} for n in notes
+                )
 
         return report
 
@@ -479,6 +528,7 @@ class VolterExecutor:
         result: GuardResult,
         executed: list[str],
         errors: list[dict[str, str]],
+        act: Action,
     ) -> None:
         self._last = {
             "source": source,
@@ -487,6 +537,33 @@ class VolterExecutor:
             "errors": errors,
             **result.as_report(),
         }
+
+        # R-12: `_remember` jest jedynym miejscem wołanym z KAŻDEJ ścieżki wyjścia
+        # `async_apply` — łącznie z wczesnymi returnami (błąd sanityzacji I-10,
+        # odrzucenie I-1..I-9, throttled I-8) — dlatego log decyzji (i anty-spam
+        # `_last_decision`) siedzi tutaj, a nie na końcu `async_apply`. Wcześniej ten
+        # blok stał wyłącznie na "szczęśliwej ścieżce": powrót do normalnej pracy po
+        # DEGRADED nie generował żadnego INFO (bo `_last_decision` zostawało
+        # zamrożone na wartości sprzed awarii — identyczna decyzja po awarii
+        # wyglądała jak "bez zmian"), a sama ścieżka DEGRADED nie miała żadnej
+        # ochrony przed spamem (WARNING + INFO co przebieg pętli, czyli co 60 s).
+        #
+        # Klucz decyzji uwzględnia `executed`, nie tylko `params`/`status` —
+        # przebieg, który policzył te same parametry, ale NIC nie zapisał (np. I-6
+        # odfiltrował wszystko po stronie niezmienionych wartości), musi być
+        # odróżnialny na poziomie INFO od przebiegu, który faktycznie zapisał.
+        decision = (
+            f"{act.value}|{sorted(result.params.items())}|{result.status.value}|"
+            f"executed={sorted(executed)}"
+        )
+        if decision != self._last_decision:
+            _LOGGER.info(
+                "[%s] Decyzja: %s, status=%s, zapisano=%s",
+                source, act.value, result.status.value, executed or "nic",
+            )
+            self._last_decision = decision
+        else:
+            _LOGGER.debug("[%s] Decyzja bez zmian: %s", source, act.value)
 
     @property
     def diagnostics(self) -> dict[str, Any]:

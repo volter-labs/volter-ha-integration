@@ -70,6 +70,16 @@ async def test_n4_blad_zapisu_nie_trafia_do_executed(fake_entry):
 
 @pytest.mark.asyncio
 async def test_zmiana_decyzji_loguje_info_powtorka_debug(fake_entry, caplog):
+    """R-12: klucz decyzji musi uwzględniać `executed`, nie tylko `params`/`status`.
+
+    Ten test PRZED naprawą R-12 asercją `assert not drugi` utrwalał WŁAŚNIE ten błąd:
+    drugi przebieg ma te same `params`/`status` co pierwszy, ale throttle I-6 blokuje
+    powtórzony zapis niezmienionej wartości — `executed` leci z `['eco_soc']` na `[]`.
+    To JEST inna decyzja ("zapisano wszystko" vs "nic nie zapisano") i musi dostać
+    własne INFO, inaczej obie sytuacje są nieodróżnialne w logu. Dopiero TRZECI
+    przebieg (identyczny jak drugi: params/status/executed wszystkie takie same) ma
+    iść na DEBUG — to jest właściwy test anty-spamu.
+    """
     import logging
 
     hass = _hass_ze_swiezym_stanem()
@@ -84,5 +94,13 @@ async def test_zmiana_decyzji_loguje_info_powtorka_debug(fake_entry, caplog):
         await executor.async_apply({"eco_soc": 40.0}, source="schedule")
         drugi = [r for r in caplog.records if r.levelno == logging.INFO]
 
-    assert pierwszy, "pierwsza decyzja musi byc na INFO"
-    assert not drugi, "powtorzona decyzja nie moze smiecic w logu"
+        caplog.clear()
+        await executor.async_apply({"eco_soc": 40.0}, source="schedule")
+        trzeci = [r for r in caplog.records if r.levelno == logging.INFO]
+
+    assert pierwszy, "pierwsza decyzja (pełny zapis) musi byc na INFO"
+    assert drugi, (
+        "druga decyzja ma inny `executed` (throttle I-6 zablokował powtórzony zapis) "
+        "— to inna decyzja niż pierwsza i musi trafić na INFO, nie zniknąć w logu"
+    )
+    assert not trzeci, "trzecia decyzja jest IDENTYCZNA z drugą — dopiero to ma iść na DEBUG"
