@@ -84,7 +84,24 @@ WRITE_MIN_INTERVAL_S = 60
 
 #: I-9 — maksymalny wiek odczytu telemetrii i maksymalny sensowny skok SoC.
 MAX_STATE_AGE_S = 300
+#: RR-1: próg BEZWZGLĘDNY został awaryjny — stosuje się tylko wtedy, gdy odstępu
+#: między próbkami nie znamy. Zwykłą regułą jest tempo (niżej), bo różnica bezwzględna
+#: myli „niemożliwy skok" z „normalną zmianą po przerwie w telemetrii".
 MAX_SOC_JUMP_PP = 20
+
+#: RR-1 — maksymalne realne TEMPO zmiany SoC w punktach procentowych na minutę.
+#: Wyprowadzenie z fizyki: domowy magazyn ładuje/rozładowuje się mocą rzędu 1C
+#: (pojemność [kWh] ≈ moc [kW]), czyli pełne 100 pp w ~60 min = 1,67 pp/min. Nawet
+#: agresywne 2C daje 3,3 pp/min. Bierzemy 4,0 pp/min jako wartość konserwatywną:
+#: ma odsiewać rozjazdy czujnika, a nie karać realną instalację. Wartość jest spójna
+#: z resztą I-9 — przez `MAX_STATE_AGE_S` (5 min) daje dokładnie `MAX_SOC_JUMP_PP`,
+#: więc w oknie świeżości nic nie robi się luźniejsze niż przed naprawą.
+MAX_SOC_RATE_PP_PER_MIN = 4.0
+
+#: RR-1 — podłoga tolerancji niezależna od czasu. Sensory SoC raportują wartości
+#: skwantowane (często co 1%), a przy odstępie kilku sekund limit z tempa zszedłby
+#: poniżej rozdzielczości czujnika i degradował instalację na zaokrągleniu.
+MIN_SOC_JUMP_TOLERANCE_PP = 5.0
 
 #: I-8 — maksymalna liczba zmian kierunku ładowanie<->rozładowanie na godzinę.
 MAX_DIRECTION_CHANGES_PER_HOUR = 4

@@ -33,7 +33,9 @@ from .const import (
     EXECUTOR_INTERVAL,
     MAX_DIRECTION_CHANGES_PER_HOUR,
     MAX_SOC_JUMP_PP,
+    MAX_SOC_RATE_PP_PER_MIN,
     MAX_STATE_AGE_S,
+    MIN_SOC_JUMP_TOLERANCE_PP,
     OPT_ENTITY_EXPORT_LIMIT_SWITCH,
     OPT_RATED_POWER_W,
     OPT_SOC_RESERVE,
@@ -91,6 +93,10 @@ class VolterExecutor:
         self._throttle = WriteThrottle(min_interval_s=WRITE_MIN_INTERVAL_S)
         self._direction = DirectionLimiter(max_changes_per_hour=MAX_DIRECTION_CHANGES_PER_HOUR)
         self._prev_soc: float | None = None
+        # RR-1: znacznik czasu przyjęcia baseline'u SoC. I-9 testuje TEMPO zmiany, więc
+        # sama wartość poprzedniej próbki nie wystarcza — bez czasu 35 pp po 40 minutach
+        # przerwy wygląda tak samo jak 35 pp w 10 sekund.
+        self._prev_soc_ts: float | None = None
         self._last: dict[str, Any] = {}
         self._last_decision: str | None = None
 
@@ -137,6 +143,16 @@ class VolterExecutor:
 
     # ── wspólna brama zapisu ─────────────────────────────────────────────────
 
+    def _soc_sample_gap_s(self) -> float | None:
+        """RR-1: ile czasu upłynęło od przyjęcia baseline'u SoC (albo `None`).
+
+        `None` znaczy „nie mamy jeszcze żadnej zaufanej próbki" — wtedy I-9 nie ma
+        czego porównywać albo wraca do konserwatywnego progu bezwzględnego.
+        """
+        if self._prev_soc_ts is None:
+            return None
+        return max(0.0, time.monotonic() - self._prev_soc_ts)
+
     async def async_apply(
         self,
         raw_params: dict[str, Any],
@@ -155,7 +171,14 @@ class VolterExecutor:
         """
         options = dict(self._entry.options)
         limits = read_inverter_limits(self.hass, options)
-        state = read_device_state(self.hass, options, self._prev_soc)
+        state = read_device_state(
+            self.hass,
+            options,
+            self._prev_soc,
+            # RR-1: odstęp od poprzedniej ZAUFANEJ próbki — jedyna informacja, dzięki
+            # której I-9 odróżni awarię czujnika od zmiany po przerwie w telemetrii.
+            previous_soc_age_s=self._soc_sample_gap_s(),
+        )
         cfg = UserConfig(
             soc_reserve=float(options.get(OPT_SOC_RESERVE, DEFAULT_SOC_RESERVE)),
             mode=str(options.get(OPT_USER_MODE, "autarky")),
@@ -195,14 +218,23 @@ class VolterExecutor:
             action=action,
             max_state_age_s=MAX_STATE_AGE_S,
             max_soc_jump_pp=MAX_SOC_JUMP_PP,
+            max_soc_rate_pp_per_min=MAX_SOC_RATE_PP_PER_MIN,
+            min_soc_jump_tolerance_pp=MIN_SOC_JUMP_TOLERANCE_PP,
         )
         result = apply_guards(clean, ctx)
         # R-5: baseline SoC dla NASTĘPNEGO przebiegu aktualizujemy WYŁĄCZNIE z odczytów,
-        # które same przeszły I-9. Dawniej ta linia biegła bezwarunkowo — odczyt odrzucony
-        # jako fizycznie niemożliwy skok stawał się zaufanym punktem odniesienia już w
-        # kolejnym ticku, więc I-9 chroniło przez dokładnie jeden przebieg.
-        if not any(note.invariant == "I-9" for note in result.notes):
-            self._prev_soc = state.soc if state.soc is not None else self._prev_soc
+        # których samo I-9 nie zakwestionowało — inaczej odczyt odrzucony jako fizycznie
+        # niemożliwy stawałby się zaufanym punktem odniesienia już w kolejnym ticku
+        # i guard chroniłby przez dokładnie jeden przebieg.
+        #
+        # RR-1: warunkiem jest `soc_baseline_ok`, a NIE brak noty I-9. Notę I-9 zostawia
+        # też przyjęcie nowego baseline'u po długiej przerwie — mylenie tych dwóch
+        # przypadków zamrażało punkt odniesienia na stałe i blokowało tor zapisu aż do
+        # restartu HA. Znacznik czasu idzie w parze z wartością, bo tempo liczy się od
+        # momentu przyjęcia baseline'u.
+        if result.soc_baseline_ok and state.soc is not None:
+            self._prev_soc = state.soc
+            self._prev_soc_ts = time.monotonic()
 
         for note in result.notes:
             _LOGGER.info("[%s] guard %s: %s", source, note.invariant, note.message)
@@ -385,12 +417,18 @@ class VolterExecutor:
         Twarde reguły tej metody:
           * ZERO zapisów — żadnego `hass.services.async_call`,
           * podgląd throttlingu przez `filter`, nigdy `commit` — stan I-6 zostaje nietknięty,
-          * `self._prev_soc` i `self._last` pozostają bez zmian (to suchy przebieg,
+          * `self._prev_soc`, `self._prev_soc_ts` i `self._last` pozostają bez zmian
+            (to suchy przebieg,
             nie przebieg — nie wolno mu zafałszować kolejnego realnego wykonania).
         """
         options = dict(self._entry.options)
         limits = read_inverter_limits(self.hass, options)
-        state = read_device_state(self.hass, options, self._prev_soc)
+        # RR-1: suchy przebieg musi widzieć ten sam odstęp próbek co realny — inaczej
+        # diagnoza pokazywałaby I-9 tam, gdzie `async_apply` przyjmuje nowy baseline.
+        # Sam ODCZYT `_prev_soc_ts` niczego nie mutuje, więc kontrakt „zero mutacji" stoi.
+        state = read_device_state(
+            self.hass, options, self._prev_soc, previous_soc_age_s=self._soc_sample_gap_s()
+        )
         cfg = UserConfig(
             soc_reserve=float(options.get(OPT_SOC_RESERVE, DEFAULT_SOC_RESERVE)),
             mode=str(options.get(OPT_USER_MODE, "autarky")),
@@ -485,6 +523,8 @@ class VolterExecutor:
                 action=slot_action,
                 max_state_age_s=MAX_STATE_AGE_S,
                 max_soc_jump_pp=MAX_SOC_JUMP_PP,
+                max_soc_rate_pp_per_min=MAX_SOC_RATE_PP_PER_MIN,
+                min_soc_jump_tolerance_pp=MIN_SOC_JUMP_TOLERANCE_PP,
             ),
         )
         report["guards"] = guarded.as_report()

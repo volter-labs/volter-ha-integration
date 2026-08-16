@@ -143,6 +143,11 @@ class DeviceState:
     grid_power_w: float | None = None
     age_s: float = 0.0
     previous_soc: float | None = None
+    #: RR-1: ile czasu upłynęło między poprzednią ZAUFANĄ próbką SoC a bieżącym
+    #: odczytem. Bez tego I-9 nie odróżnia niemożliwego skoku od normalnej zmiany po
+    #: przerwie w telemetrii i po jednym rozjeździe blokuje tor zapisu na stałe.
+    #: `None` = odstępu nie znamy (stary kontrakt wołającego).
+    previous_soc_age_s: float | None = None
 
 
 @dataclass
@@ -161,7 +166,14 @@ class GuardContext:
     #: Maksymalny dopuszczalny wiek odczytu (I-9).
     max_state_age_s: float = 300.0
     #: Maksymalny sensowny skok SoC między odczytami w punktach procentowych (I-9).
+    #: RR-1: używany już tylko awaryjnie — gdy `previous_soc_age_s is None`, czyli gdy
+    #: odstępu między próbkami nie znamy i nie da się policzyć tempa.
     max_soc_jump_pp: float = 20.0
+    #: RR-1: maksymalne realne tempo zmiany SoC (pp/minutę). To jest właściwy test
+    #: I-9 — próg skoku ma sens WYŁĄCZNIE odniesiony do czasu, jaki upłynął.
+    max_soc_rate_pp_per_min: float = 4.0
+    #: RR-1: podłoga tolerancji dla bardzo krótkich odstępów (kwantyzacja czujnika).
+    min_soc_jump_tolerance_pp: float = 5.0
 
 
 class Status(str, Enum):
@@ -203,6 +215,12 @@ class GuardResult:
     #: niż `[]` — błędy zostawały uwięzione w `executor._last` i nigdy nie docierały
     #: do chmury. To regresja wobec implementacji sprzed Fazy A.
     errors: list[dict[str, str]] = field(default_factory=list)
+    #: RR-1: czy bieżący odczyt SoC wolno przyjąć jako baseline NASTĘPNEGO przebiegu.
+    #: `False` tylko wtedy, gdy to właśnie I-9 zakwestionowało sam odczyt (brak, wiek,
+    #: wartość poza fizyką, tempo). Wołający nie może tego wnioskować z obecności noty
+    #: I-9, bo notę zostawia też przyjęcie NOWEGO baseline'u po długiej przerwie —
+    #: i to właśnie mylenie tych dwóch przypadków dawało trwały lockout toru zapisu.
+    soc_baseline_ok: bool = True
 
     @property
     def rejected(self) -> bool:
@@ -310,30 +328,78 @@ def apply_guards(params: dict[str, Any], ctx: GuardContext) -> GuardResult:
     # stanu nie wolno pisać nic, bo pozostałe guardy nie mają na czym pracować.
     if state.soc is None:
         result.status = Status.DEGRADED
+        # RR-1: nie ma czego przyjąć za baseline — poprzednia próbka i jej znacznik
+        # czasu muszą zostać nietknięte, żeby odstęp liczył się od realnego odczytu.
+        result.soc_baseline_ok = False
         result.note("I-9", "brak odczytu SoC — wstrzymuję zapisy")
         result.params = {}
         return result
     if state.age_s > ctx.max_state_age_s:
         result.status = Status.DEGRADED
+        result.soc_baseline_ok = False
         result.note("I-9", f"odczyt starszy niż {ctx.max_state_age_s:.0f}s (wiek {state.age_s:.0f}s)")
         result.params = {}
         return result
     if not (0.0 <= state.soc <= 100.0):
         result.status = Status.DEGRADED
+        result.soc_baseline_ok = False
         result.note("I-9", f"SoC={state.soc} fizycznie niemożliwy")
         result.params = {}
         return result
-    if (
-        state.previous_soc is not None
-        and abs(state.soc - state.previous_soc) > ctx.max_soc_jump_pp
-    ):
-        result.status = Status.DEGRADED
-        result.note(
-            "I-9",
-            f"skok SoC {state.previous_soc}->{state.soc} przekracza {ctx.max_soc_jump_pp} pp",
-        )
-        result.params = {}
-        return result
+
+    # RR-1: test wiarygodności skoku SoC jest testem TEMPA, nie różnicy bezwzględnej.
+    #
+    # Różnica bezwzględna odpowiada na złe pytanie: 35 pp między dwoma odczytami
+    # oddalonymi o 10 s to awaria czujnika, a te same 35 pp po 40 minutach przerwy
+    # w telemetrii to bateria, która naprawdę się naładowała. Poprzednia wersja
+    # (naprawa R-5) odrzucała oba tak samo i — skoro baseline aktualizował się tylko
+    # z odczytów, które przeszły I-9 — po jednym rozjeździe zamrażała punkt odniesienia
+    # na stałe: każdy kolejny tick też był odrzucany, aż do restartu HA. Falownik
+    # zostawał na nastawie sprzed awarii bezterminowo (scenariusz L-2).
+    if state.previous_soc is not None:
+        delta_pp = abs(state.soc - state.previous_soc)
+        gap_s = state.previous_soc_age_s
+
+        if gap_s is not None and gap_s > ctx.max_state_age_s:
+            # RR-1: ŚCIEŻKA WYJŚCIA. Próbka starsza niż okno świeżości przestaje być
+            # wiarygodnym punktem odniesienia — porównywanie się z nią nie niesie już
+            # informacji. Bieżący odczyt (świeży i mieszczący się w 0..100) przyjmujemy
+            # jako NOWY baseline z jawną notą, zamiast odrzucać go w nieskończoność.
+            result.note(
+                "I-9",
+                f"poprzednia próbka SoC sprzed {gap_s:.0f}s (> {ctx.max_state_age_s:.0f}s) "
+                f"— przyjmuję {state.soc}% jako nowy baseline",
+            )
+        else:
+            if gap_s is None:
+                # Odstępu nie znamy (stary kontrakt wołającego) — nie da się policzyć
+                # tempa, więc zostaje konserwatywny próg bezwzględny. Brak wiedzy
+                # o czasie nie może rozmiękczać I-9.
+                allowed_pp = ctx.max_soc_jump_pp
+            else:
+                # Limit proporcjonalny do upłynionego czasu, z podłogą na kwantyzację
+                # czujnika. Przy `gap_s = max_state_age_s` wychodzi dokładnie
+                # `max_soc_jump_pp`, więc w oknie świeżości nic nie jest luźniejsze
+                # niż przed naprawą.
+                allowed_pp = max(
+                    ctx.min_soc_jump_tolerance_pp,
+                    ctx.max_soc_rate_pp_per_min * (gap_s / 60.0),
+                )
+
+            if delta_pp > allowed_pp:
+                result.status = Status.DEGRADED
+                # R-5: odczyt zakwestionowany przez I-9 NIE MOŻE stać się zaufanym
+                # baseline'em następnego przebiegu — inaczej guard chroniłby przez
+                # dokładnie jeden tick.
+                result.soc_baseline_ok = False
+                result.note(
+                    "I-9",
+                    f"skok SoC {state.previous_soc}->{state.soc} ({delta_pp:.1f} pp) "
+                    f"przekracza {allowed_pp:.1f} pp dopuszczalne przy odstępie "
+                    + (f"{gap_s:.0f}s" if gap_s is not None else "nieznanym"),
+                )
+                result.params = {}
+                return result
 
     # I-3: temperatura / okno pracy sprzętu — najwyższy priorytet.
     if not limits.temperature_ok:

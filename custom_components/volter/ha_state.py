@@ -45,11 +45,18 @@ def read_device_state(
     hass: HomeAssistant,
     options: dict,
     previous_soc: float | None = None,
+    previous_soc_age_s: float | None = None,
 ) -> DeviceState:
     """Zbierz migawkę stanu z zmapowanych encji monitoringu.
 
     `age_s` to wiek NAJSTARSZEGO istotnego odczytu — świadomie pesymistycznie,
     bo guard I-9 ma chronić przed działaniem na nieaktualnym obrazie instalacji.
+
+    RR-1: `previous_soc_age_s` to odstęp między poprzednią zaufaną próbką SoC
+    a bieżącym odczytem. Podaje go wołający (executor), bo tylko on wie, kiedy
+    baseline został przyjęty — HA nie przechowuje historii naszych decyzji.
+    Bez tego I-9 porównuje same wartości i myli awarię czujnika z normalną zmianą
+    po przerwie w telemetrii.
     """
     now = datetime.now(timezone.utc)
 
@@ -71,6 +78,7 @@ def read_device_state(
         grid_power_w=_num(grid_state),
         age_s=max(ages) if ages else float("inf"),
         previous_soc=previous_soc,
+        previous_soc_age_s=previous_soc_age_s,
     )
 
 
