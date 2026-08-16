@@ -22,7 +22,7 @@ from .const import (
     REALTIME_RECONNECT_MAX,
 )
 from .executor import VolterExecutor
-from .guards import GuardResult, RequestDeduplicator, infer_action
+from .guards import GuardResult, RequestDeduplicator, Status, infer_action
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -253,12 +253,13 @@ class VolterCommandHandler:
         params = payload.get("params", {}) or {}
         request_id = payload.get("request_id", "unknown")
 
-        # L-4: idempotencja — ponownie dostarczony broadcast nie wykonuje się dwa razy.
+        # L-4: idempotencja. Zapamiętujemy DOPIERO po wykonaniu i tylko gdy komenda
+        # nie skończyła się błędem — inaczej nieudana próba blokowałaby retry z chmury
+        # na zawsze (N-5).
         if self._dedup.is_duplicate(request_id):
             _LOGGER.info("Komenda %s już wykonana — pomijam [L-4]", request_id)
             await self._report_result(request_id, "duplicate")
             return
-        self._dedup.remember(request_id)
 
         _LOGGER.info(
             "Komenda: %s (request_id=%s, params=%s)", command, request_id, params
@@ -289,8 +290,14 @@ class VolterCommandHandler:
             request_id, "error", errors=[{"entity": "command", "error": f"Unknown command: {command}"}]
         )
 
+    def _remember_unless_error(self, request_id: str, status: str) -> None:
+        """Zapamiętaj request_id, chyba że komenda skończyła się błędem (N-5)."""
+        if status != Status.ERROR.value:
+            self._dedup.remember(request_id)
+
     async def _report_guard_result(self, request_id: str, result: GuardResult) -> None:
         """Zaraportuj wynik razem ze śladem decyzji guardów."""
+        self._remember_unless_error(request_id, result.status.value)
         await self._report_result(
             request_id,
             result.status.value,
