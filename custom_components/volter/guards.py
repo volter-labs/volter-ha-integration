@@ -253,6 +253,15 @@ class Note:
 
     invariant: str
     message: str
+    #: RR-10 (ustalenie 2. kontrolera z rundy 2): tożsamość zdarzenia dla anty-spamu
+    #: w `executor._remember`, NIEZALEŻNA od sformatowanej treści `message`. Dwie
+    #: noty tej samej PRZYCZYNY (np. I-9 „odczyt starszy niż Xs (wiek Ys)") mogą
+    #: różnić się treścią w KAŻDYM ticku, bo `wiek` rośnie z czasem — klucz oparty
+    #: na dosłownej treści wtedy nigdy się nie powtarza i anty-spam nigdy się nie
+    #: stabilizuje. Puste `""` (domyślne) znaczy „brak jawnej tożsamości" —
+    #: `_remember` wraca wtedy do treści `message` jako klucza (zachowanie sprzed
+    #: RR-10, świadomie zachowane tam, gdzie treść realnie niesie inny fakt).
+    key: str = ""
 
 
 @dataclass
@@ -299,8 +308,8 @@ class GuardResult:
     def rejected(self) -> bool:
         return self.status in (Status.ERROR, Status.DEGRADED, Status.DUPLICATE)
 
-    def note(self, invariant: str, message: str) -> None:
-        self.notes.append(Note(invariant, message))
+    def note(self, invariant: str, message: str, *, key: str = "") -> None:
+        self.notes.append(Note(invariant, message, key=key))
 
     def as_report(self) -> dict[str, Any]:
         # R-14: kopia obronna. `params` bez `dict(...)` to żywa referencja do stanu
@@ -436,19 +445,29 @@ def apply_guards(params: dict[str, Any], ctx: GuardContext) -> GuardResult:
         # RR-1: nie ma czego przyjąć za baseline — poprzednia próbka i jej znacznik
         # czasu muszą zostać nietknięte, żeby odstęp liczył się od realnego odczytu.
         result.soc_baseline_ok = False
-        result.note("I-9", "brak odczytu SoC — wstrzymuję zapisy")
+        # RR-10: `key` jawny mimo że TA treść akurat jest stała — konsekwentnie ze
+        # wszystkimi gałęziami DEGRADED I-9, żeby żadna z nich nie zależała
+        # przypadkiem od tego, czy komunikat akurat nie zawiera liczby.
+        result.note("I-9", "brak odczytu SoC — wstrzymuję zapisy", key="missing_reading")
         result.params = {}
         return result
     if state.age_s > ctx.max_state_age_s:
         result.status = Status.DEGRADED
         result.soc_baseline_ok = False
-        result.note("I-9", f"odczyt starszy niż {ctx.max_state_age_s:.0f}s (wiek {state.age_s:.0f}s)")
+        # RR-10: `wiek` rośnie z czasem, więc treść zmienia się na KAŻDYM ticku —
+        # bez jawnego `key` anty-spam w `executor._remember` nigdy się nie stabilizuje
+        # (dosłowny tekst nigdy się nie powtarza), mimo że PRZYCZYNA jest ta sama.
+        result.note(
+            "I-9",
+            f"odczyt starszy niż {ctx.max_state_age_s:.0f}s (wiek {state.age_s:.0f}s)",
+            key="stale_reading",
+        )
         result.params = {}
         return result
     if not (0.0 <= state.soc <= 100.0):
         result.status = Status.DEGRADED
         result.soc_baseline_ok = False
-        result.note("I-9", f"SoC={state.soc} fizycznie niemożliwy")
+        result.note("I-9", f"SoC={state.soc} fizycznie niemożliwy", key="invalid_range")
         result.params = {}
         return result
 
@@ -470,10 +489,14 @@ def apply_guards(params: dict[str, Any], ctx: GuardContext) -> GuardResult:
             # wiarygodnym punktem odniesienia — porównywanie się z nią nie niesie już
             # informacji. Bieżący odczyt (świeży i mieszczący się w 0..100) przyjmujemy
             # jako NOWY baseline z jawną notą, zamiast odrzucać go w nieskończoność.
+            # RR-10: `gap_s` i `state.soc` zmieniają się co tick — jawny `key`
+            # zapewnia, że powtarzające się przyjęcie nowego baseline'u (np. trwała
+            # przerwa w telemetrii) nie zalewa logu INFO co 60s.
             result.note(
                 "I-9",
                 f"poprzednia próbka SoC sprzed {gap_s:.0f}s (> {ctx.max_state_age_s:.0f}s) "
                 f"— przyjmuję {state.soc}% jako nowy baseline",
+                key="baseline_reset",
             )
         else:
             if gap_s is None:
@@ -497,11 +520,14 @@ def apply_guards(params: dict[str, Any], ctx: GuardContext) -> GuardResult:
                 # baseline'em następnego przebiegu — inaczej guard chroniłby przez
                 # dokładnie jeden tick.
                 result.soc_baseline_ok = False
+                # RR-10: `delta_pp`/`gap_s` zmienne co tick — jawny `key`, ta sama
+                # przyczyna (skok SoC odrzucony) nie ma zalewać logu INFO w kółko.
                 result.note(
                     "I-9",
                     f"skok SoC {state.previous_soc}->{state.soc} ({delta_pp:.1f} pp) "
                     f"przekracza {allowed_pp:.1f} pp dopuszczalne przy odstępie "
                     + (f"{gap_s:.0f}s" if gap_s is not None else "nieznanym"),
+                    key="soc_jump",
                 )
                 result.params = {}
                 return result
@@ -572,11 +598,15 @@ def apply_guards(params: dict[str, Any], ctx: GuardContext) -> GuardResult:
         eco_soc_raised = out.get("eco_soc", 0) < cfg.soc_reserve
         if eco_soc_raised:
             out["eco_soc"] = cfg.soc_reserve
-            # RR-3: I-1 SAMO wstawia/podnosi tę wartość — jeśli encja eco_soc nie jest
-            # zmapowana, rezerwa backup znika po cichu dokładnie tym samym wzorcem
-            # luki co I-4 w R-3. `applier` musi to traktować jako BŁĄD, nie jako
-            # "użytkownik nie zmapował opcjonalnej encji".
-            result.forced_params.add("eco_soc")
+        # RR-8 (ustalenie 2. kontrolera z rundy 2): `forced_params` dla `eco_soc`
+        # dodajemy NIEZALEŻNIE od `eco_soc_raised` — dokładnie ten sam wzorzec, który
+        # dla I-4 świadomie zrobiono niezależnie od `changed` (patrz niżej, linia
+        # ok. 665). Plan mógł już sam nieść `eco_soc == soc_reserve` (nic do
+        # "podniesienia"), a mimo to ochrona I-1 nadal WYMAGA, żeby ta wartość
+        # FAKTYCZNIE dotarła do falownika — bez tego rezerwa backup znika po cichu
+        # przy braku zmapowanej encji dokładnie wtedy, gdy plan "przypadkiem" trafił
+        # w bezpieczną wartość, czyli RR-3 chroniło tylko połowę tego samego wektora.
+        result.forced_params.add("eco_soc")
         if removed or wants_discharge or eco_soc_raised:
             result.status = Status.PARTIAL
             # S-4: komunikat musi rozróżniać „SoC pod rezerwą" od „zatrzask jeszcze

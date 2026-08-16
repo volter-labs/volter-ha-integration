@@ -471,11 +471,20 @@ class VolterExecutor:
             if slot is not None:
                 forced_slot = replace(slot, action=result.forced_action)
                 rated = float(options.get(OPT_RATED_POWER_W, DEFAULT_RATED_POWER_W))
-                _LOGGER.warning(
-                    "[%s] Guardy wymusiły akcję %s zamiast %s — przemapowuję slot",
-                    source,
-                    result.forced_action.value,
-                    (action.value if action else "?"),
+                # RR-10 (ustalenie 2. kontrolera z rundy 2): to był `_LOGGER.warning`
+                # BEZWARUNKOWY, poza anty-spamem `_remember` — 60 WARNING/h w stanie
+                # ustabilizowanym (cel RR-5 osiągnięty tylko dla linii "Decyzja").
+                # Jako `Note` trafia do `result.notes`, a te zaraz niżej scalają się
+                # w `forced.notes` i przechodzą przez `_remember` na końcu tej metody
+                # — czyli TĘ SAMĄ regułę anty-spamu (INFO/DEBUG) co pozostałe notatki
+                # guardów. `key` stały (treść i tak jest stabilna dopóki `forced_action`
+                # się nie zmienia — same wartości enuma), ale jawny dla spójności
+                # z resztą mechanizmu identity-key (RR-10).
+                result.note(
+                    "I-1",
+                    f"Guardy wymusiły akcję {result.forced_action.value} zamiast "
+                    f"{(action.value if action else '?')} — przemapowuję slot",
+                    key="forced_remap",
                 )
                 # S-1: rekurencja idzie do części BEZ zamka — ten przebieg już go
                 # trzyma (`asyncio.Lock` nie jest reentrantny, więc `async_apply`
@@ -686,6 +695,23 @@ class VolterExecutor:
         if errors and not executed:
             result.status = Status.ERROR
         elif errors:
+            result.status = Status.PARTIAL
+        elif writable and not executed:
+            # RR-9 (ustalenie 2. kontrolera z rundy 2): żądaliśmy zapisu
+            # (`writable` niepuste — inaczej ta sekwencja w ogóle by się nie
+            # uruchomiła, patrz `if not writable: return` wyżej) i NIC nie poszło
+            # do falownika, a mimo to `errors` jest puste — bo WSZYSTKIE parametry
+            # trafiły w gałąź "encja niezmapowana (opcjonalna)" (RR-3: nota, nie
+            # błąd, bo żaden z nich nie był w `forced_params`). Gdyby choć jeden
+            # był wymuszony przez guard bezpieczeństwa, `apply_params` dałby dla
+            # niego błąd i trafilibyśmy w gałąź wyżej — ta gałąź jest więc
+            # wyłącznie dla "cały zestaw to zwykłe, świadomie niezmapowane
+            # parametry planu". `SUCCESS` tu kłamie: plan zażądał zapisu i ZERO
+            # dotarło do falownika. Nie wracamy do trwałego `ERROR` z pierwotnego
+            # R-3 (to była regresja RR-3 miała naprawić) — `PARTIAL` mówi dosłowną
+            # prawdę "plan nie został w pełni wykonany" i jest spójny z
+            # `command_handler._remember_if_effective` (R-2), które już traktuje
+            # `PARTIAL` z pustym `executed` jako "nic nie poszło, retry legalny".
             result.status = Status.PARTIAL
 
         # RR-5: gałąź WEWNĘTRZNA (przemapowanie po forced_action) nie loguje sama —
@@ -1016,7 +1042,14 @@ class VolterExecutor:
         # sama — i odwrotnie. Wcześniej ta pętla stała PRZED sprawdzeniem
         # `result.rejected` w `async_apply` i logowała bezwarunkowo na KAŻDYM ticku
         # ścieżki DEGRADED (reszta R-12 z rundy 2, RR-7-doc pkt „R-12 (reszta)").
-        notes_key = tuple((n.invariant, n.message) for n in result.notes)
+        # RR-10: klucz per-nota to `key` (tożsamość zdarzenia), a NIE dosłowna
+        # treść `message` — dwie noty tej samej PRZYCZYNY (np. I-9 "wiek rośnie co
+        # tick") różnią się tekstem w każdym przebiegu i klucz oparty na treści
+        # nigdy się nie powtarzał, więc anty-spam nigdy się nie stabilizował.
+        # `n.key or n.message`: notatki bez jawnego `key` (domyślne `""`) wracają
+        # do starego zachowania — dosłowna treść NADAL niesie tożsamość tam, gdzie
+        # faktycznie niesie inny fakt (np. I-6 "eco_soc=X bez zmiany").
+        notes_key = tuple((n.invariant, n.key or n.message) for n in result.notes)
         notes_changed = notes_key != self._last_notes_key
         note_level = logging.INFO if notes_changed else logging.DEBUG
         for note in result.notes:
