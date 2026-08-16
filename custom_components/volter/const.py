@@ -129,6 +129,17 @@ WRITE_RETRIES = 3
 #: zwalniałby na samym zaokrągleniu i zapisy do NVM wracałyby.
 RESERVE_HYSTERESIS_PP = 3.0
 
+#: S-4b — minimalne czasy trwania stanów zatrzasku rezerwy (I-1), w sekundach.
+#: Pełne uzasadnienie doboru przy `guards.RESERVE_LATCH_ENGAGED_MIN_S`. W skrócie:
+#: samo pasmo chroni tylko oscylacje od siebie węższe (5 pp = znowu 1440 zapisów na
+#: dobę), a dla każdego pasma istnieje większa amplituda. Dopiero pasmo + czas trwania
+#: stanu dają budżet zapisów NIEZALEŻNY od amplitudy (~20/dobę).
+#: Krótszy czas dotyczy stanu ZAŁĄCZONEGO, bo to on kosztuje ekonomicznie (bateria stoi
+#: na rezerwie); dłuższy dotyczy stanu ZWOLNIONEGO i obowiązuje wyłącznie dla płytkich,
+#: mieszczących się w paśmie zejść — wyraźne zejście pod rezerwę omija go natychmiast.
+RESERVE_LATCH_ENGAGED_MIN_S = 1800.0
+RESERVE_LATCH_RELEASED_MIN_S = 7200.0
+
 #: S-5 — ile `executor.async_stop()` czeka na TRWAJĄCY zapis, zanim odpuści.
 #:
 #: Dobór: sekwencja PARAM_ORDER to najwyżej 7 nastaw, każda z `WRITE_RETRIES=3` próbami

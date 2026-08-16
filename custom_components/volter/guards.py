@@ -18,6 +18,7 @@ Hierarchia priorytetów (wygrywa wyższy):
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Iterable
@@ -164,9 +165,29 @@ class DeviceState:
 #: typowego poboru domowego, więc plan wraca praktycznie natychmiast po realnym ładowaniu.
 RESERVE_HYSTERESIS_PP: float = 3.0
 
+#: S-4b — minimalny czas trwania stanu ZAŁĄCZONEGO zatrzasku, w sekundach.
+#:
+#: DLACZEGO 30 min: to jest cena ekonomiczna naprawy. W oknie zatrzasku bateria stoi
+#: na rezerwie, więc każda sekunda tego stanu ponad realną potrzebę to zablokowany
+#: slot planu. 30 min = pół slotu godzinowego: wystarczająco długo, żeby stłumić
+#: drgania czujnika (te trwają sekundy), i wystarczająco krótko, żeby po REALNYM
+#: naładowaniu baterii plan wrócił jeszcze w tej samej godzinie rozliczeniowej.
+RESERVE_LATCH_ENGAGED_MIN_S: float = 1800.0
+
+#: S-4b — minimalny czas trwania stanu ZWOLNIONEGO, po którym PŁYTKIE zejście
+#: pod rezerwę (mniej niż `band_pp`) może zatrzask ponownie założyć.
+#:
+#: DLACZEGO 2 h i dlaczego to bezpieczne: ten czas dotyczy WYŁĄCZNIE zejść mieszczących
+#: się w paśmie, czyli w tej samej niepewności ±3 pp, którą pasmo już akceptuje w drugą
+#: stronę. Realne zejście nie zatrzymuje się w paśmie — bateria pod obciążeniem schodzi
+#: 3 pp w kilka minut i wpada w ścieżkę awaryjną (`soc < reserve - band_pp`), która ten
+#: czas OMIJA. Maksymalna ekspozycja to więc `band_pp` poniżej rezerwy, dokładnie tyle,
+#: ile pasmo kosztuje powyżej — a nie „2 h bez ochrony".
+RESERVE_LATCH_RELEASED_MIN_S: float = 7200.0
+
 
 class ReserveHysteresis:
-    """S-4: zatrzask progu rezerwy dla I-1 — chroni pamięć nieulotną falownika.
+    """S-4/S-4b: zatrzask progu rezerwy dla I-1 — chroni pamięć nieulotną falownika.
 
     Sam warunek `state.soc < cfg.soc_reserve` nie ma histerezy, a I-6 go nie ratuje:
     przy baterii stojącej dokładnie na progu `eco_soc` REALNIE zmienia wartość w każdym
@@ -174,24 +195,101 @@ class ReserveHysteresis:
     nie ma czego pominąć. I-8 też nie łapie, bo akcja pozostaje `SELF_CONSUME` — to nie
     jest zmiana kierunku. Efekt: jeden zapis do NVM na tick, ~1440 na dobę, bezterminowo.
 
-    Kontrakt zatrzasku: załóż się przy `soc < reserve`, a zwolnij DOPIERO przy
-    `soc >= reserve + band_pp`. Pierwszy odczyt powyżej progu nie zwalnia niczego —
-    dokładnie dlatego, że to on jest szumem, przed którym się bronimy.
+    **S-4b: samo pasmo tego nie domyka.** Zatrzask oparty wyłącznie na `band_pp` chroni
+    tylko oscylacje WĘŻSZE niż pasmo — zmierzone na 1440 tikach: amplituda 3 pp daje
+    2 zapisy na dobę, ale amplituda 5 pp znowu 1440. Poszerzanie pasma nie pomaga, bo
+    dla każdego pasma istnieje większa amplituda, a szerokie pasmo podnosi efektywną
+    rezerwę. Ograniczenie niezależne od amplitudy daje dopiero DRUGI WYMIAR: minimalny
+    czas trwania stanu. Trzy reguły, każda z innego powodu:
+
+      1. `band_pp` — próg zwolnienia jest wyżej niż próg założenia (tłumi szum czujnika),
+      2. `engaged_min_s` / `released_min_s` — raz przyjęty stan musi potrwać, niezależnie
+         od tego, co robi SoC (tłumi drgania o DOWOLNEJ amplitudzie),
+      3. `cycle_min_s` — minimalny odstęp między kolejnymi ZWOLNIENIAMI. To jest domknięcie
+         ścieżki awaryjnej: wyraźne zejście pod rezerwę omija regułę 2 (bo ochrona nie może
+         czekać), więc bez reguły 3 przebieg 10/40/10/40 rozbujałby zatrzask na nowo.
+         Zwolnienie NIGDY nie jest pilne — utrzymanie rezerwy to strona bezpieczna — więc
+         wolno je ograniczać czasem, w przeciwieństwie do założenia.
+
+    Skutek liczbowy: jeden pełny cykl zatrzasku trwa co najmniej `cycle_min_s`, a każdy
+    cykl to najwyżej dwa zapisy `eco_soc` — czyli twardy budżet ~20 zapisów na dobę
+    dla DOWOLNEGO przebiegu SoC.
+
+    Czego zatrzask NIE robi: nie opóźnia ochrony przed realnym zejściem pod rezerwę.
+    `soc < reserve - deep_pp` załącza go natychmiast, w każdym stanie i o każdej porze.
     """
 
-    def __init__(self, band_pp: float = RESERVE_HYSTERESIS_PP) -> None:
+    def __init__(
+        self,
+        band_pp: float = RESERVE_HYSTERESIS_PP,
+        engaged_min_s: float = RESERVE_LATCH_ENGAGED_MIN_S,
+        released_min_s: float = RESERVE_LATCH_RELEASED_MIN_S,
+        deep_pp: float | None = None,
+    ) -> None:
         self.band_pp = band_pp
+        self.engaged_min_s = engaged_min_s
+        self.released_min_s = released_min_s
+        #: Jak głęboko pod rezerwą kończy się „szum czujnika", a zaczyna realne
+        #: zjadanie rezerwy backup. Domyślnie tyle samo, ile pasmo daje w górę —
+        #: koszt zatrzasku ma być symetryczny wokół rezerwy.
+        self.deep_pp = band_pp if deep_pp is None else deep_pp
         self._engaged = False
+        #: Kiedy bieżący stan został przyjęty. `None` = stan nigdy się nie zmienił,
+        #: czyli nie ma jeszcze czego utrzymywać (świeży executor nie może startować
+        #: z ochroną zamrożoną na dwie godziny).
+        self._since: float | None = None
+        #: Kiedy zatrzask ostatnio ZWOLNIŁ — baza minimalnego cyklu (reguła 3).
+        self._last_release: float | None = None
 
-    def engaged(self, soc: float, reserve: float) -> bool:
-        """Czy I-1 ma zadziałać. Aktualizuje zatrzask — wołać tylko z REALNEGO przebiegu."""
-        self._engaged = self._decide(soc, reserve)
+    @property
+    def cycle_min_s(self) -> float:
+        """Minimalny odstęp między kolejnymi zwolnieniami zatrzasku.
+
+        Suma obu czasów trwania, a nie osobna stała — bo dokładnie tyle trwa cykl
+        w przebiegu bez ścieżki awaryjnej. Reguła 3 ma domykać lukę, a nie tworzyć
+        drugiego, niezgodnego z resztą ograniczenia.
+        """
+        return self.engaged_min_s + self.released_min_s
+
+    def engaged(self, soc: float, reserve: float, now: float | None = None) -> bool:
+        """Czy I-1 ma zadziałać. Aktualizuje zatrzask — wołać tylko z REALNEGO przebiegu.
+
+        `now` to zegar monotoniczny wołającego (jak w `WriteThrottle.filter`
+        i `DirectionLimiter.allows`) — stan zatrzasku jest teraz funkcją czasu, więc
+        musi go dostać z tego samego źródła co reszta guardów czasowych.
+        """
+        teraz = time.monotonic() if now is None else now
+        nowy = self._decide(soc, reserve, teraz)
+        if nowy != self._engaged:
+            self._since = teraz
+            if not nowy:
+                self._last_release = teraz
+        self._engaged = nowy
         return self._engaged
 
-    def _decide(self, soc: float, reserve: float) -> bool:
+    def _decide(self, soc: float, reserve: float, now: float) -> bool:
+        trwanie = None if self._since is None else max(0.0, now - self._since)
+
         if self._engaged:
-            return soc < reserve + self.band_pp
-        return soc < reserve
+            if soc < reserve + self.band_pp:
+                return True  # pasmo: odczyt tuż nad rezerwą to nadal szum
+            if trwanie is not None and trwanie < self.engaged_min_s:
+                return True  # czas trwania stanu: drgania o dowolnej amplitudzie
+            if self._last_release is not None and (now - self._last_release) < self.cycle_min_s:
+                return True  # minimalny cykl: nie wolno zwalniać częściej
+            return False
+
+        # Stan zwolniony. Wyraźne zejście pod rezerwę to nie jest szum — to bateria,
+        # która realnie zjada rezerwę backup. Ochrona wchodzi natychmiast, bez oglądania
+        # się na czas trwania stanu; inaczej tłumienie drgań stałoby się opóźnianiem
+        # reakcji, a I-1 jest ochroną, nie wygładzaniem.
+        if soc < reserve - self.deep_pp:
+            return True
+        if soc < reserve:
+            if trwanie is not None and trwanie < self.released_min_s:
+                return False
+            return True
+        return False
 
     def snapshot(self) -> "ReserveHysteresis":
         """Kopia dla SUCHEGO przebiegu (`executor.async_diagnose`).
@@ -203,8 +301,15 @@ class ReserveHysteresis:
         Kopia zamiast osobnej metody `would_*`, bo to `apply_guards` decyduje o I-1
         i musiałoby wtedy znać tryb wołania.
         """
-        kopia = ReserveHysteresis(self.band_pp)
+        kopia = ReserveHysteresis(
+            self.band_pp, self.engaged_min_s, self.released_min_s, self.deep_pp
+        )
         kopia._engaged = self._engaged
+        # S-4b: kopiujemy też ZNACZNIKI CZASU — bez nich suchy przebieg pracowałby
+        # na zatrzasku bez historii, czyli pokazywałby decyzję, której realny tor
+        # zapisu w tej chwili by nie podjął.
+        kopia._since = self._since
+        kopia._last_release = self._last_release
         return kopia
 
 
@@ -220,6 +325,11 @@ class GuardContext:
     #: przebiegami (testy jednostkowe, stary kontrakt) — wtedy zostaje goły próg,
     #: bo histereza bez pamięci byłaby tylko przesuniętym progiem.
     reserve_hysteresis: "ReserveHysteresis | None" = None
+    #: S-4b: zegar monotoniczny wołającego dla zatrzasku rezerwy. Ten sam wzorzec co
+    #: `now_ts` w `WriteThrottle.filter` — stan zatrzasku jest funkcją czasu, więc musi
+    #: iść z tego samego źródła co I-6/I-8, inaczej dwa guardy mierzyłyby dwa czasy.
+    #: `None` = wołający zegara nie podał, zatrzask weźmie własny.
+    now_s: float | None = None
     #: Jawna intencja planu (R-1). Gdy podana, I-1 i I-2 pracują na niej, bo tylko ona
     #: przetrwa mapowanie na nastawy falownika — nazwa trybu jest dla guardów
     #: nieprzezroczysta. `None` oznacza stary kontrakt SET_WORK_MODE z surowymi
@@ -576,8 +686,12 @@ def apply_guards(params: dict[str, Any], ctx: GuardContext) -> GuardResult:
     # S-4: goły próg zużywał pamięć nieulotną falownika, bo przy baterii stojącej na
     # progu każdy tick przerzucał `eco_soc` między planem a rezerwą (~1440 zapisów/dobę).
     # Zatrzask utrzymuje raz uruchomioną ochronę aż do WYRAŹNEGO powrotu ponad próg.
+    # S-4b: „wyraźny powrót" to nie tylko pasmo, ale i czas — samo pasmo przepuszczało
+    # w całości każdą oscylację od niego szerszą (5 pp = znowu 1440 zapisów na dobę).
     if ctx.reserve_hysteresis is not None:
-        ponizej_rezerwy = ctx.reserve_hysteresis.engaged(state.soc, cfg.soc_reserve)
+        ponizej_rezerwy = ctx.reserve_hysteresis.engaged(
+            state.soc, cfg.soc_reserve, ctx.now_s
+        )
     else:
         ponizej_rezerwy = state.soc < cfg.soc_reserve
 
@@ -612,19 +726,35 @@ def apply_guards(params: dict[str, Any], ctx: GuardContext) -> GuardResult:
             # S-4: komunikat musi rozróżniać „SoC pod rezerwą" od „zatrzask jeszcze
             # trzyma" — inaczej log twierdzi `SoC=21% < rezerwa 20%`, czyli kłamie
             # dokładnie tam, gdzie ma tłumaczyć decyzję.
-            powod = (
-                f"SoC={state.soc}% < rezerwa {cfg.soc_reserve}%"
-                if state.soc < cfg.soc_reserve
-                else (
+            # S-4b: trzeci powód — SoC jest już PONAD pasmem, a zatrzask trzyma
+            # wyłącznie dlatego, że nie upłynął minimalny czas trwania stanu. Bez tego
+            # rozróżnienia log przy SoC=40% twierdziłby „w paśmie histerezy 20%".
+            pasmo = ctx.reserve_hysteresis.band_pp if ctx.reserve_hysteresis else 0.0
+            if state.soc < cfg.soc_reserve:
+                powod = f"SoC={state.soc}% < rezerwa {cfg.soc_reserve}%"
+                powod_key = "ponizej_rezerwy"
+            elif state.soc < cfg.soc_reserve + pasmo:
+                powod = (
                     f"SoC={state.soc}% w paśmie histerezy rezerwy {cfg.soc_reserve}% "
                     f"(zatrzask trzyma do powrotu wyraźnie ponad próg) [S-4]"
                 )
-            )
+                powod_key = "pasmo_histerezy"
+            else:
+                powod = (
+                    f"SoC={state.soc}% ponad pasmem, ale zatrzask rezerwy nie przetrwał "
+                    f"jeszcze minimalnego czasu trwania stanu [S-4b]"
+                )
+                powod_key = "czas_trwania"
             result.note(
                 "I-1",
                 f"{powod}: "
                 f"rozładowanie zablokowane={wants_discharge}, usunięto {removed or 'brak'}, "
                 f"eco_soc podniesiony do {cfg.soc_reserve}%",
+                # RR-10: tożsamość zdarzenia NIE MOŻE zawierać `state.soc` — przy
+                # zatrzasku trzymającym pół godziny SoC zmienia się w każdym tiku,
+                # więc klucz oparty na treści dawałby INFO co 60 s. Powód (a nie
+                # wartość) jest tym, co realnie się zmienia i zasługuje na wpis.
+                key=f"rezerwa_{powod_key}",
             )
 
     # I-3: przycięcie do granic sprzętowych.
@@ -898,6 +1028,8 @@ __all__ = [
     "PARAM_SPECS",
     "ParamBounds",
     "RESERVE_HYSTERESIS_PP",
+    "RESERVE_LATCH_ENGAGED_MIN_S",
+    "RESERVE_LATCH_RELEASED_MIN_S",
     "RequestDeduplicator",
     "ReserveHysteresis",
     "Status",

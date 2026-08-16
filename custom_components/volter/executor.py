@@ -43,6 +43,8 @@ from .const import (
     OPT_SOC_RESERVE,
     OPT_USER_MODE,
     RESERVE_HYSTERESIS_PP,
+    RESERVE_LATCH_ENGAGED_MIN_S,
+    RESERVE_LATCH_RELEASED_MIN_S,
     STOP_WRITE_TIMEOUT_S,
     STORAGE_KEY,
     STORAGE_VERSION,
@@ -133,7 +135,13 @@ class VolterExecutor:
         self._direction = DirectionLimiter(max_changes_per_hour=MAX_DIRECTION_CHANGES_PER_HOUR)
         # S-4: zatrzask progu rezerwy (I-1). Stan MIĘDZY przebiegami, dokładnie jak
         # `_direction` i `_throttle` — bez pamięci histereza jest tylko przesuniętym progiem.
-        self._reserve = ReserveHysteresis(band_pp=RESERVE_HYSTERESIS_PP)
+        # S-4b: pasmo to za mało — zatrzask ma też minimalny CZAS TRWANIA stanu, bo samo
+        # pasmo przepuszczało w całości każdą oscylację od niego szerszą.
+        self._reserve = ReserveHysteresis(
+            band_pp=RESERVE_HYSTERESIS_PP,
+            engaged_min_s=RESERVE_LATCH_ENGAGED_MIN_S,
+            released_min_s=RESERVE_LATCH_RELEASED_MIN_S,
+        )
         self._prev_soc: float | None = None
         # RR-1: znacznik czasu przyjęcia baseline'u SoC. I-9 testuje TEMPO zmiany, więc
         # sama wartość poprzedniej próbki nie wystarcza — bez czasu 35 pp po 40 minutach
@@ -423,6 +431,9 @@ class VolterExecutor:
             # S-4: REALNY przebieg dostaje żywy zatrzask — tylko on ma prawo go
             # zakładać i zwalniać (suchy przebieg dostaje kopię, patrz `async_diagnose`).
             reserve_hysteresis=self._reserve,
+            # S-4b: zatrzask mierzy czas trwania własnego stanu, więc musi dostać
+            # DOKŁADNIE ten sam zegar co I-6 i I-8 — jedno źródło czasu na przebieg.
+            now_s=time.monotonic(),
             max_state_age_s=MAX_STATE_AGE_S,
             max_soc_jump_pp=MAX_SOC_JUMP_PP,
             max_soc_rate_pp_per_min=MAX_SOC_RATE_PP_PER_MIN,
@@ -965,6 +976,9 @@ class VolterExecutor:
                 # (ten sam kontrakt „zero mutacji" co RR-2 dla cache granic i RR-7
                 # dla DirectionLimiter).
                 reserve_hysteresis=self._reserve.snapshot(),
+                # S-4b: ten sam zegar co realny przebieg — diagnoza ma odpowiadać na
+                # pytanie „co byś zrobił TERAZ", a stan zatrzasku zależy od czasu.
+                now_s=time.monotonic(),
                 max_state_age_s=MAX_STATE_AGE_S,
                 max_soc_jump_pp=MAX_SOC_JUMP_PP,
                 max_soc_rate_pp_per_min=MAX_SOC_RATE_PP_PER_MIN,

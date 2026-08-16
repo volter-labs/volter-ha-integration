@@ -184,6 +184,25 @@ class FakeHass:
         return MagicMock()
 
 
+class ZegarSterowany:
+    """Sterowany zegar monotoniczny — podmieniany za moduł `time` widziany przez kod.
+
+    S-4b: część guardów (I-6 odstęp zapisów, I-8 okno kierunków, I-9 tempo SoC,
+    zatrzask rezerwy) to funkcje CZASU. Test bez sterowanego zegara przepuszcza dobę
+    przez pętlę w mikrosekundach, czyli nie mierzy żadnej z tych reguł — mierzy
+    wyłącznie kolejność wywołań.
+    """
+
+    def __init__(self, start: float = 10_000.0) -> None:
+        self._t = start
+
+    def monotonic(self) -> float:
+        return self._t
+
+    def przesun(self, sekundy: float = 60.0) -> None:
+        self._t += sekundy
+
+
 _make_module("homeassistant")
 _make_module("homeassistant.core", {
     "HomeAssistant": FakeHass,

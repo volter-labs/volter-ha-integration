@@ -36,8 +36,9 @@ import pytest
 from custom_components.volter import executor as executor_module
 from custom_components.volter.command_handler import VolterCommandHandler
 from custom_components.volter.executor import VolterExecutor
+from custom_components.volter.const import RESERVE_LATCH_ENGAGED_MIN_S
 from custom_components.volter.guards import ReserveHysteresis
-from tests.conftest import FakeHass
+from tests.conftest import FakeHass, ZegarSterowany
 
 OPTIONS = {
     "entity_soc": "sensor.soc",
@@ -141,10 +142,16 @@ async def test_s4_zatrzask_puszcza_dopiero_wyraznie_ponad_progiem(fake_entry, mo
     """Guard raz uruchomiony NIE odpuszcza przy pierwszym odczycie powyżej progu.
 
     Rezerwa 20%, szerokość histerezy 3 pp: przy 21% i 22% zatrzask trzyma
-    (to nadal jest szum czujnika o rozdzielczości 1%), przy 23% puszcza, bo taka
-    zmiana wymagała realnego naładowania baterii, a nie zaokrąglenia.
+    (to nadal jest szum czujnika o rozdzielczości 1%).
+
+    S-4b: samo przekroczenie pasma też nie zwalnia — do zwolnienia potrzebne są OBIE
+    rzeczy naraz, pasmo i minimalny czas trwania stanu. Samo pasmo przepuszczało
+    w całości każdą oscylację od siebie szerszą (19/24 = znowu 1440 zapisów na dobę),
+    bo dla każdego pasma istnieje większa amplituda.
     """
     monkeypatch.setattr(executor_module, "WRITE_MIN_INTERVAL_S", 0.0)
+    zegar = ZegarSterowany()
+    monkeypatch.setattr(executor_module, "time", zegar)
     hass = _hass(soc="19")
     fake_entry.options = dict(OPTIONS)
     executor = VolterExecutor(hass, fake_entry)
@@ -153,16 +160,33 @@ async def test_s4_zatrzask_puszcza_dopiero_wyraznie_ponad_progiem(fake_entry, mo
     assert _zapisy_eco_soc(hass) == [20.0]
 
     for soc in ("21", "22"):
+        zegar.przesun(60.0)
         hass.states.set("sensor.soc", soc)
         await executor._async_tick()
     assert _zapisy_eco_soc(hass) == [20.0], (
         "odczyt tuż nad progiem mieści się w szumie czujnika — zatrzask musi trzymać"
     )
 
+    zegar.przesun(60.0)
+    hass.states.set("sensor.soc", "23")
+    await executor._async_tick()
+    assert _zapisy_eco_soc(hass) == [20.0], (
+        "S-4b: pasmo bez czasu trwania stanu nie ogranicza niczego — zatrzask musi "
+        "przetrwać minimalny czas, bo inaczej wystarczy szersza oscylacja"
+    )
+
+    # Nawet po upływie minimalnego czasu pasmo nadal rozstrzyga: 22% to szum.
+    zegar.przesun(RESERVE_LATCH_ENGAGED_MIN_S)
+    hass.states.set("sensor.soc", "22")
+    await executor._async_tick()
+    assert _zapisy_eco_soc(hass) == [20.0], "pasmo obowiązuje bezterminowo"
+
+    zegar.przesun(60.0)
     hass.states.set("sensor.soc", "23")
     await executor._async_tick()
     assert _zapisy_eco_soc(hass) == [20.0, 10.0], (
-        "po realnym naładowaniu ponad próg + histereza plan musi znowu dojść do falownika"
+        "po realnym naładowaniu ponad próg + histereza i po minimalnym czasie trwania "
+        "stanu plan musi znowu dojść do falownika"
     )
 
 
@@ -190,15 +214,34 @@ def test_s4_histereza_jest_szersza_niz_rozdzielczosc_sensora():
     Rozdzielczość sensora SoC to zwykle 1 pp. Pasmo równe rozdzielczości nie
     rozwiązałoby sondy B (oscylacja 19/21 nadal przekraczałaby próg zwolnienia),
     więc musi być od niej wyraźnie szersze.
+
+    S-4b dokłada drugi wymiar: pasmo rozstrzyga BEZTERMINOWO (22.9% nie zwalnia nigdy),
+    ale przekroczenie pasma zwalnia zatrzask dopiero po minimalnym czasie trwania stanu.
     """
     h = ReserveHysteresis()
     assert h.band_pp >= 3.0
+    t = 0.0
 
-    assert h.engaged(soc=19.0, reserve=20.0) is True
-    assert h.engaged(soc=21.0, reserve=20.0) is True, "1 pp ponad progiem to szum"
-    assert h.engaged(soc=22.9, reserve=20.0) is True
-    assert h.engaged(soc=23.0, reserve=20.0) is False, "reserve + pasmo zwalnia zatrzask"
-    assert h.engaged(soc=19.9, reserve=20.0) is True, "zatrzask zakłada się ponownie"
+    assert h.engaged(soc=19.0, reserve=20.0, now=t) is True
+    assert h.engaged(soc=21.0, reserve=20.0, now=t + 60) is True, "1 pp ponad progiem to szum"
+
+    # Po dowolnie długim czasie pasmo nadal trzyma — czas nie rozmiękcza pasma.
+    t += h.engaged_min_s + 120
+    assert h.engaged(soc=22.9, reserve=20.0, now=t) is True
+    assert h.engaged(soc=23.0, reserve=20.0, now=t + 60) is False, (
+        "reserve + pasmo + minimalny czas trwania stanu zwalniają zatrzask"
+    )
+
+    # Zatrzask zakłada się ponownie: wyraźne zejście pod rezerwę omija czas trwania
+    # stanu zwolnionego, bo I-1 jest ochroną, a nie wygładzaniem.
+    assert h.engaged(soc=16.9, reserve=20.0, now=t + 120) is True
+
+    # Zejście PŁYTKIE (w paśmie) czeka na swój czas — to ono jest szumem czujnika.
+    assert h.engaged(soc=40.0, reserve=20.0, now=t + h.cycle_min_s + 180) is False
+    assert h.engaged(soc=19.9, reserve=20.0, now=t + h.cycle_min_s + 240) is False
+    assert h.engaged(
+        soc=19.9, reserve=20.0, now=t + h.cycle_min_s + 240 + h.released_min_s
+    ) is True, "zatrzask zakłada się ponownie"
 
 
 def test_s4_kopia_dla_suchego_przebiegu_nie_mutuje_oryginalu():
