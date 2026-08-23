@@ -11,7 +11,16 @@ from homeassistant.const import UnitOfPower
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN
+from .const import (
+    DEFAULT_BATTERY_CAPACITY_KWH,
+    DOMAIN,
+    OPT_BATTERY_CAPACITY_KWH,
+    OPT_ENTITY_BATTERY_POWER,
+    OPT_ENTITY_GRID_POWER,
+    OPT_ENTITY_LOAD_POWER,
+    OPT_ENTITY_PV_POWER,
+    OPT_ENTITY_SOC,
+)
 from .entity import VolterEntity, plan_do_json
 
 
@@ -59,11 +68,26 @@ class VolterPlanSensor(VolterEntity, SensorEntity):
         plan = self._executor.plan
         diag = self._executor.diagnostics
         teraz = datetime.now(timezone.utc)
+        opcje = dict(self._entry.options)
         atrybuty: dict[str, Any] = {
             "sloty": plan_do_json(plan, teraz),
             "schedule_id": diag.get("schedule_id"),
             "wazny_do": diag.get("schedule_valid_until"),
             "sterowanie_wlaczone": self._executor.sterowanie_wlaczone,
+            # Karta czyta wartości bieżące WPROST z encji falownika — lokalnie,
+            # bez chmury. Podajemy jej tylko adresy, żeby nie duplikować odczytów
+            # ani nie opóźniać ich o cykl aktualizacji tego sensora.
+            "encje": {
+                "soc": opcje.get(OPT_ENTITY_SOC),
+                "pv": opcje.get(OPT_ENTITY_PV_POWER),
+                "siec": opcje.get(OPT_ENTITY_GRID_POWER),
+                "bateria": opcje.get(OPT_ENTITY_BATTERY_POWER),
+                "dom": opcje.get(OPT_ENTITY_LOAD_POWER),
+            },
+            # Do lokalnej prognozy SoC: delta = moc * 1 h / pojemność.
+            "pojemnosc_kwh": float(
+                opcje.get(OPT_BATTERY_CAPACITY_KWH, DEFAULT_BATTERY_CAPACITY_KWH)
+            ),
         }
         if plan is not None:
             biezacy, fallback = plan.effective_slot(teraz)

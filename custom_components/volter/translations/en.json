@@ -66,10 +66,12 @@
           "soc_reserve": "Battery reserve (SoC %)",
           "user_mode": "User mode",
           "rated_power_w": "Inverter rated power (W)",
-          "control_enabled": "Enable inverter control"
+          "control_enabled": "Enable inverter control",
+          "battery_capacity_kwh": "Battery capacity (kWh)"
         },
         "data_description": {
-          "control_enabled": "When off, Volter computes the plan and logs every decision but writes NOTHING to the inverter. Leave it off until you have verified the mode mapping with the volter.diagnose action."
+          "control_enabled": "When off, Volter computes the plan and logs every decision but writes NOTHING to the inverter. Leave it off until you have verified the mode mapping with the volter.diagnose action.",
+          "battery_capacity_kwh": "Used only for the SoC forecast on the Volter card."
         }
       }
     },

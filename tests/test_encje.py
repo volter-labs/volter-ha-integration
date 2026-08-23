@@ -185,3 +185,32 @@ def test_executor_czyta_wylacznik_z_runtimeu(fake_entry):
     assert ex.sterowanie_wlaczone is True
     runtime.control_enabled = False
     assert ex.sterowanie_wlaczone is False
+
+
+def test_sensor_planu_podaje_karcie_adresy_encji_i_pojemnosc(fake_entry):
+    """Karta czyta wartości bieżące WPROST z encji falownika — lokalnie, bez chmury.
+
+    Sensor podaje jej tylko adresy: duplikowanie odczytów tutaj opóźniałoby kokpit
+    o cykl aktualizacji tego sensora, a wartości i tak są w `hass.states`.
+    """
+    ex = _executor(fake_entry)
+    fake_entry.options = dict(OPTIONS) | {
+        "entity_battery_power": "sensor.bat",
+        "entity_load_power": "sensor.dom",
+        "battery_capacity_kwh": 10.64,
+    }
+    atrybuty = VolterPlanSensor(fake_entry, ex).extra_state_attributes
+
+    assert atrybuty["encje"]["soc"] == "sensor.soc"
+    assert atrybuty["encje"]["bateria"] == "sensor.bat"
+    assert atrybuty["encje"]["dom"] == "sensor.dom"
+    # Pojemność jest potrzebna WYŁĄCZNIE do lokalnej prognozy SoC
+    # (delta = moc * 1 h / pojemność), więc musi dojechać do karty.
+    assert atrybuty["pojemnosc_kwh"] == 10.64
+
+
+def test_sensor_planu_ma_domyslna_pojemnosc(fake_entry):
+    """Brak opcji nie może wysadzić karty — prognoza ma po prostu użyć domyślnej."""
+    atrybuty = VolterPlanSensor(fake_entry, _executor(fake_entry)).extra_state_attributes
+
+    assert atrybuty["pojemnosc_kwh"] > 0

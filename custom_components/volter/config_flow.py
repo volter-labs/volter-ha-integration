@@ -23,6 +23,7 @@ from .const import (
     CONF_SUPABASE_ANON_KEY,
     CONF_SUPABASE_URL,
     DEFAULT_RATED_POWER_W,
+    DEFAULT_BATTERY_CAPACITY_KWH,
     DEFAULT_CONTROL_ENABLED,
     DEFAULT_SOC_RESERVE,
     DEFAULT_SUPABASE_URL,
@@ -41,6 +42,7 @@ from .const import (
     OPT_ENTITY_LOAD_POWER,
     OPT_ENTITY_PV_ENERGY_TOTAL,
     OPT_ENTITY_PV_POWER,
+    OPT_BATTERY_CAPACITY_KWH,
     OPT_CONTROL_ENABLED,
     OPT_ENTITY_SOC,
     OPT_ENTITY_SOC_UPPER,
@@ -348,6 +350,18 @@ class VolterOptionsFlow(OptionsFlowWithConfigEntry):
                             OPT_CONTROL_ENABLED, DEFAULT_CONTROL_ENABLED
                         ),
                     ): selector.BooleanSelector(),
+                    vol.Required(
+                        OPT_BATTERY_CAPACITY_KWH,
+                        default=self._options.get(
+                            OPT_BATTERY_CAPACITY_KWH, DEFAULT_BATTERY_CAPACITY_KWH
+                        ),
+                    ): selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=1, max=200, step=0.1,
+                            mode=selector.NumberSelectorMode.BOX,
+                            unit_of_measurement="kWh",
+                        )
+                    ),
                     vol.Required(
                         OPT_RATED_POWER_W,
                         default=self._options.get(OPT_RATED_POWER_W, DEFAULT_RATED_POWER_W),

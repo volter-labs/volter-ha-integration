@@ -204,6 +204,12 @@ OPT_RATED_POWER_W = "rated_power_w"  # moc znamionowa falownika, do przeliczenia
 OPT_CONTROL_ENABLED = "control_enabled"
 DEFAULT_CONTROL_ENABLED = False
 
+#: Pojemnosc magazynu (kWh). Potrzebna WYLACZNIE do prognozy SoC na karcie:
+#: delta SoC = moc_bateryjna * 1h / pojemnosc. Trajektoria liczona lokalnie
+#: startuje z REALNEGO odczytu z falownika, a nie z projekcji sprzed doby.
+OPT_BATTERY_CAPACITY_KWH = "battery_capacity_kwh"
+DEFAULT_BATTERY_CAPACITY_KWH = 10.0
+
 DEFAULT_SOC_RESERVE = 20.0
 DEFAULT_RATED_POWER_W = 10000.0
 
