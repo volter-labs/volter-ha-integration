@@ -44,6 +44,11 @@ const AKCJE = {
   idle: { kolor: AURA.textMuted, etykieta: 'Postój', znak: 0 },
 };
 
+/** Wersja karty. Widoczna w stopce, zeby dalo sie jednym spojrzeniem odroznic
+ *  „kod jest zly" od „przegladarka trzyma stary plik". Test w `test_karta_frontend.py`
+ *  pilnuje, zeby nie rozjechala sie z `manifest.json`. */
+const WERSJA = '2.6.1';
+
 const KOL_W = 22;   // szerokość kolumny godzinowej w jednostkach viewBox
 const WYS_SLUP = 96;
 const WYS_SOC = 58;
@@ -301,7 +306,7 @@ class VolterPlanCard extends HTMLElement {
     const cena = a.cena != null ? Number(a.cena).toFixed(2) + ' zł/kWh' : '—';
     return '<div class="stopka">'
       + '<span>Cena tej godziny <b>' + cena + '</b></span>'
-      + '<span>Plan do <b>' + doKiedy + '</b></span>'
+      + '<span>Plan do <b>' + doKiedy + '</b> <i class="wer">v' + WERSJA + '</i></span>'
       + '</div>';
   }
 
@@ -355,6 +360,8 @@ class VolterPlanCard extends HTMLElement {
       + 'color:' + AURA.textSecondary + '}'
       + '.stopka b{color:' + AURA.textPrimary + ';font-weight:600;'
       + 'font-variant-numeric:tabular-nums}'
+      + '.stopka .wer{font-style:normal;color:' + AURA.textMuted + ';font-size:10px;'
+      + 'margin-left:6px}'
       + '.pusto{padding:26px 0;text-align:center;color:' + AURA.textMuted + ';font-size:14px}'
       + '.karta code{font-family:ui-monospace,monospace;font-size:12px}'
       + '@media(max-width:520px){.teraz{grid-template-columns:repeat(3,1fr)}}'

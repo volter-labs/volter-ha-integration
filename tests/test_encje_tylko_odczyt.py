@@ -1,13 +1,20 @@
-"""Krok „Sterowanie" nie może przyjąć encji, do której zapis nigdy się nie uda.
+"""Krok „Sterowanie" nie może przyjąć encji, która w danym układzie nic nie zrobi.
 
-Realna sytuacja z żywej instalacji: `number.goodwe_eco_mode_soc` wygląda jak
-zwykły suwak — jest w domenie `number`, ma zakres 0–100 i jednostkę procentową —
-ale w integracji mletenay ma `setter=None`. Zapis do niej nie robi NIC.
+`number.goodwe_eco_mode_soc` i `number.goodwe_eco_mode_power` mają w integracji
+mletenay `setter=None`, ale to NIE znaczy, że są martwe. `async_set_native_value`
+mimo braku settera zapisuje stan encji, a `select.py` nasłuchuje tej zmiany
+(`update_eco_mode_power` / `update_eco_mode_soc`) i przekłada ją na
+`set_operation_mode(tryb, moc, soc)`.
 
-Wskazanie jej jako encji dolnego progu SoC było więc ciche wyłączenie rezerwy
+Jest jednak warunek: listener działa TYLKO wtedy, gdy bieżąca opcja selecta trybu
+pracy to `eco_charge` albo `eco_discharge`. To jest `select.goodwe_operation_mode`,
+a nie `select.goodwe_ems_mode` — inna encja, inny zestaw trybów.
+
+Stąd reguła: encje eco są prawidłowym adresatem, gdy tryb prowadzimy przez select
+trybu pracy, i są martwym adresatem, gdy prowadzimy go przez select EMS. Wtedy
+wskazanie `eco_mode_soc` jako dolnego progu SoC to ciche wyłączenie rezerwy
 backupu (I-1): plan liczy rezerwę, guardy ją przepuszczają, komenda wychodzi,
-a falownik nigdy jej nie zobaczy. Formularz musi to odrzucić, bo użytkownik nie
-ma jak tego zauważyć — po zapisie wszystko wygląda poprawnie.
+a falownik nigdy jej nie zobaczy.
 """
 
 from __future__ import annotations
@@ -43,9 +50,26 @@ async def _dalej():
 
 
 def test_walidator_wskazuje_pole_i_powod():
-    bledy = waliduj_encje_sterujace({OPT_ENTITY_ECO_MODE_SOC: "number.goodwe_eco_mode_soc"})
+    bledy = waliduj_encje_sterujace({
+        OPT_ENTITY_EMS_MODE: "select.goodwe_ems_mode",
+        OPT_ENTITY_ECO_MODE_SOC: "number.goodwe_eco_mode_soc",
+    })
 
     assert bledy == {OPT_ENTITY_ECO_MODE_SOC: "encja_tylko_do_odczytu"}
+
+
+def test_encje_eco_sa_prawidlowe_przy_selekcie_trybu_pracy():
+    """Regresja z v2.6.0: blokada byla bezwarunkowa i wycinala dzialajacy kanal.
+
+    Przy `select.goodwe_operation_mode` zapis do `eco_mode_power`/`eco_mode_soc`
+    DOCIERA do falownika — przez listener w `goodwe/select.py`, nie przez setter
+    encji. Odrzucanie tego mapowania odbieralo uzytkownikowi sterowanie moca
+    w trybach eco.
+    """
+    assert waliduj_encje_sterujace({
+        OPT_ENTITY_EMS_MODE: "select.goodwe_operation_mode",
+        OPT_ENTITY_ECO_MODE_SOC: "number.goodwe_eco_mode_soc",
+    }) == {}
 
 
 def test_walidator_przepuszcza_encje_zapisywalne():
@@ -68,7 +92,7 @@ def test_walidator_nie_myli_sie_o_podobna_nazwe():
 
 
 @pytest.mark.asyncio
-async def test_odrzuca_encje_tylko_do_odczytu_jako_prog_soc(fake_entry):
+async def test_odrzuca_encje_eco_gdy_tryb_idzie_przez_select_ems(fake_entry):
     flow = _flow(fake_entry)
 
     wynik = await flow.async_step_control(
@@ -89,7 +113,10 @@ async def test_odrzuca_eco_mode_power_jako_nastawe_mocy(fake_entry):
     flow = _flow(fake_entry)
 
     wynik = await flow.async_step_control(
-        {OPT_ENTITY_CHARGE_LIMIT: "number.goodwe_eco_mode_power"}
+        {
+            OPT_ENTITY_EMS_MODE: "select.goodwe_ems_mode",
+            OPT_ENTITY_CHARGE_LIMIT: "number.goodwe_eco_mode_power",
+        }
     )
 
     assert wynik["errors"][OPT_ENTITY_CHARGE_LIMIT] == "encja_tylko_do_odczytu"
@@ -140,7 +167,11 @@ def test_executor_traktuje_encje_tylko_do_odczytu_jak_niezmapowana():
     """
     from custom_components.volter.executor import _mapped_entity
 
-    assert _mapped_entity("eco_soc", {OPT_ENTITY_ECO_MODE_SOC: "number.goodwe_eco_mode_soc"}) is False
+    ems = {OPT_ENTITY_EMS_MODE: "select.goodwe_ems_mode"}
+    eco = {OPT_ENTITY_EMS_MODE: "select.goodwe_operation_mode"}
+
+    assert _mapped_entity("eco_soc", ems | {OPT_ENTITY_ECO_MODE_SOC: "number.goodwe_eco_mode_soc"}) is False
+    assert _mapped_entity("eco_soc", eco | {OPT_ENTITY_ECO_MODE_SOC: "number.goodwe_eco_mode_soc"}) is True
     assert _mapped_entity(
-        "eco_soc", {OPT_ENTITY_ECO_MODE_SOC: "number.goodwe_depth_of_discharge_on_grid"}
+        "eco_soc", ems | {OPT_ENTITY_ECO_MODE_SOC: "number.goodwe_depth_of_discharge_on_grid"}
     ) is True

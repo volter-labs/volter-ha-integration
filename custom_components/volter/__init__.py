@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 
@@ -33,16 +34,43 @@ PLATFORMS: list[Platform] = [Platform.SENSOR, Platform.BINARY_SENSOR, Platform.S
 CARD_URL = "/volter_static/volter-plan-card.js"
 
 
+def _wersja_integracji() -> str | None:
+    """Wersja z `manifest.json`. `None`, gdy manifestu nie da się odczytać."""
+    try:
+        with open(Path(__file__).parent / "manifest.json", encoding="utf-8") as plik:
+            return str(json.load(plik).get("version") or "") or None
+    except (OSError, ValueError):
+        return None
+
+
+def url_karty() -> str:
+    """Adres karty dla frontendu — z wersją integracji jako parametrem.
+
+    Frontend HA cache'uje moduły takze wtedy, gdy serwer odpowiada `no-cache`
+    (miedzy innymi przez service workera). Po podmianie pliku pod tym samym
+    adresem przegladarka potrafi trzymac STARY modul, a wtedy dashboard pokazuje
+    blad, ktorego nie widac po zadnej stronie serwera: plik na dysku jest nowy,
+    HTTP zwraca 200, testy przechodza, a uzytkownik ma kod sprzed dwoch wydan.
+
+    Wersja w adresie rozstrzyga to deterministycznie — nowe wydanie to nowy adres.
+    Brak wersji nie jest powodem do niewystawienia karty.
+    """
+    wersja = _wersja_integracji()
+    return f"{CARD_URL}?v={wersja}" if wersja else CARD_URL
+
+
 async def _async_register_frontend(hass: HomeAssistant) -> None:
     """Wystaw kartę Lovelace i dopisz ją do zasobów frontendu (raz na HA)."""
     if hass.data.get(f"{DOMAIN}_frontend"):
         return
     hass.data[f"{DOMAIN}_frontend"] = True
     katalog = str(Path(__file__).parent / "www")
+    # Sciezka statyczna zostaje GOLA — parametr zapytania jest dla przegladarki,
+    # nie dla routera; zarejestrowany razem z `?v=...` nie trafilby w handler.
     await hass.http.async_register_static_paths([
         StaticPathConfig(CARD_URL, f"{katalog}/volter-plan-card.js", cache_headers=False)
     ])
-    add_extra_js_url(hass, CARD_URL)
+    add_extra_js_url(hass, url_karty())
 
 
 async def _async_register_services(hass: HomeAssistant) -> None:

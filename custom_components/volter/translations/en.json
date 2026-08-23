@@ -84,7 +84,7 @@
       }
     },
     "error": {
-      "encja_tylko_do_odczytu": "This entity is read-only in the GoodWe integration (setter=None), so writes to it silently do nothing. Use number.goodwe_depth_of_discharge_on_grid for the lower SoC threshold and number.goodwe_ems_power_limit for the battery power setpoint."
+      "encja_tylko_do_odczytu": "Eco-mode entities (eco_mode_soc, eco_mode_power) only reach the inverter while the operation-mode select sits in eco_charge/eco_discharge — the GoodWe integration forwards them from select.py, not from the number entity itself. With the EMS mode select they have no addressee and writes are silently lost. Either map the mode to select.goodwe_operation_mode, or use number.goodwe_depth_of_discharge_on_grid for the lower SoC threshold and number.goodwe_ems_power_limit for the battery power setpoint."
     }
   },
   "entity": {

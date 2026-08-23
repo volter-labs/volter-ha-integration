@@ -30,7 +30,9 @@ from homeassistant.helpers.storage import Store
 from .applier import apply_params
 from .const import (
     COMMAND_ENTITY_MAP,
-    ENCJE_TYLKO_ODCZYT,
+    ENCJE_ECO,
+    OPT_ENTITY_EMS_MODE,
+    SELECT_TRYBU_ECO,
     DEFAULT_CONTROL_ENABLED,
     DEFAULT_RATED_POWER_W,
     DEFAULT_SOC_RESERVE,
@@ -102,18 +104,22 @@ def _mapped_entity(param_key: str, options: dict[str, Any]) -> bool:
     # `would_write` w `volter.diagnose` klamie w jedynym narzedziu, ktorym uzytkownik
     # sprawdza tor zapisu przed wlaczeniem sterowania.
     nazwa_obiektu = str(encja).split(".", 1)[-1]
-    if nazwa_obiektu in ENCJE_TYLKO_ODCZYT:
+    # Encje eco sa zywe TYLKO przy selekcie trybu pracy — patrz `ENCJE_ECO`.
+    tryb = options.get(OPT_ENTITY_EMS_MODE)
+    przez_eco = bool(tryb) and str(tryb).split(".", 1)[-1] == SELECT_TRYBU_ECO
+    if nazwa_obiektu in ENCJE_ECO and not przez_eco:
         # Raz na parę (parametr, encja): ta funkcja jest wolana w kazdym cyklu
         # wykonawczym, a blad konfiguracji nie zmienia sie miedzy cyklami.
         klucz_logu = (param_key, str(encja))
         if klucz_logu not in _ZGLOSZONE_TYLKO_ODCZYT:
             _ZGLOSZONE_TYLKO_ODCZYT.add(klucz_logu)
             _LOGGER.error(
-                "Parametr '%s' wskazuje encje '%s', ktora jest TYLKO DO ODCZYTU — zapis nie "
-                "zrobilby nic. Zmien mapowanie na '%s' w opcjach integracji.",
+                "Parametr '%s' wskazuje encje '%s', ktora przy selekcie EMS nie ma "
+                "adresata — zapis nie dotrze do falownika. Zmien mapowanie na '%s' albo "
+                "prowadz tryb przez select trybu pracy.",
                 param_key,
                 encja,
-                ENCJE_TYLKO_ODCZYT[nazwa_obiektu],
+                ENCJE_ECO[nazwa_obiektu],
             )
         return False
     return True

@@ -81,40 +81,60 @@ PARAM_VALUE_TRANSFORM = {
     "eco_soc": lambda prog: round(100.0 - float(prog), 1),
 }
 
-#: Encje falownika, ktore WYGLADAJA na sterujace, a zapis do nich nie robi nic.
+#: Encje trybow ECO — dzialaja albo nie, zaleznie od tego, ktorym selectem
+#: prowadzimy tryb pracy.
 #:
-#: `number.goodwe_eco_mode_soc` i `number.goodwe_eco_mode_power` sa w domenie `number`,
-#: maja zakres 0..100 i jednostke procentowa — w formularzu nie da sie ich odroznic od
-#: encji, ktora przyjmuje nastawe. W integracji mletenay obie maja `setter=None`.
+#: `number.goodwe_eco_mode_soc` i `number.goodwe_eco_mode_power` maja w integracji
+#: mletenay `setter=None`, ale to NIE znaczy, ze sa martwe. `async_set_native_value`
+#: mimo braku settera zapisuje stan encji (`goodwe/number.py:247-252`), a `select.py`
+#: nasluchuje tej zmiany (`update_eco_mode_power` / `update_eco_mode_soc`) i przeklada
+#: ja na `set_operation_mode(tryb, moc, soc)`.
 #:
-#: Wskazanie takiej encji jako dolnego progu SoC bylo CICHE wylaczenie rezerwy backupu
-#: (I-1): plan liczy rezerwe, guardy ja przepuszczaja, komenda wychodzi, a falownik
-#: nigdy jej nie widzi. Uzytkownik nie ma jak tego zauwazyc — po zapisie wszystko
-#: wyglada poprawnie. Dlatego blokujemy to w formularzu, a nie w dokumentacji.
+#: Warunek jest jeden i twardy: listener reaguje TYLKO wtedy, gdy biezaca opcja
+#: selecta trybu pracy to `eco_charge` albo `eco_discharge`. To jest
+#: `select.goodwe_operation_mode` — inna encja niz `select.goodwe_ems_mode`
+#: i inny zestaw trybow.
 #:
-#: Klucz to NAZWA OBIEKTU (czesc po kropce), porownywana w calosci. Porownanie po
+#: Stad regula: encje eco sa prawidlowym adresatem, gdy tryb prowadzimy przez select
+#: TRYBU PRACY, i martwym adresatem, gdy prowadzimy go przez select EMS. W tym drugim
+#: ukladzie wskazanie `eco_mode_soc` jako dolnego progu SoC to ciche wylaczenie rezerwy
+#: backupu (I-1): plan liczy rezerwe, guardy ja przepuszczaja, komenda wychodzi,
+#: a falownik nigdy jej nie widzi.
+#:
+#: Klucz to NAZWA OBIEKTU (czesc po kropce), porownywana w calosci — porownanie po
 #: fragmencie odrzucaloby encje innych integracji o podobnej nazwie.
-ENCJE_TYLKO_ODCZYT: dict[str, str] = {
+ENCJE_ECO: dict[str, str] = {
     "goodwe_eco_mode_soc": "number.goodwe_depth_of_discharge_on_grid",
     "goodwe_eco_mode_power": "number.goodwe_ems_power_limit",
 }
 
-#: Kod bledu formularza — tresc w `translations/pl.json`.
+#: Select, przy ktorym encje eco sa zywe.
+SELECT_TRYBU_ECO = "goodwe_operation_mode"
+
+#: Kod bledu formularza — tresc w `translations/en.json`.
 BLAD_ENCJA_TYLKO_ODCZYT = "encja_tylko_do_odczytu"
 
 
+def _tryb_prowadzony_przez_eco(mapowanie: dict[str, str | None]) -> bool:
+    """Czy tryb pracy idzie przez select, ktory ozywia encje eco."""
+    tryb = mapowanie.get(OPT_ENTITY_EMS_MODE)
+    return bool(tryb) and str(tryb).split(".", 1)[-1] == SELECT_TRYBU_ECO
+
+
 def waliduj_encje_sterujace(mapowanie: dict[str, str | None]) -> dict[str, str]:
-    """Zwroc bledy formularza dla encji, do ktorych zapis nigdy sie nie uda.
+    """Zwroc bledy formularza dla encji, ktore w tym ukladzie nic nie zrobia.
 
     Klucz wyniku to nazwa pola, wartosc to kod bledu — dokladnie taki ksztalt,
     jakiego oczekuje `async_show_form(errors=...)`.
     """
+    if _tryb_prowadzony_przez_eco(mapowanie):
+        return {}
+
     bledy: dict[str, str] = {}
     for pole, encja in mapowanie.items():
         if not encja or "." not in str(encja):
             continue
-        nazwa_obiektu = str(encja).split(".", 1)[1]
-        if nazwa_obiektu in ENCJE_TYLKO_ODCZYT:
+        if str(encja).split(".", 1)[1] in ENCJE_ECO:
             bledy[pole] = BLAD_ENCJA_TYLKO_ODCZYT
     return bledy
 
