@@ -221,23 +221,33 @@ class VolterOptionsFlow(OptionsFlowWithConfigEntry):
                 {
                     vol.Optional(
                         OPT_ENTITY_BATTERY_POWER,
-                        default=self._options.get(OPT_ENTITY_BATTERY_POWER, ""),
+                        description={
+                            "suggested_value": self._options.get(OPT_ENTITY_BATTERY_POWER)
+                        },
                     ): sensor_selector,
                     vol.Optional(
                         OPT_ENTITY_LOAD_POWER,
-                        default=self._options.get(OPT_ENTITY_LOAD_POWER, ""),
+                        description={
+                            "suggested_value": self._options.get(OPT_ENTITY_LOAD_POWER)
+                        },
                     ): sensor_selector,
                     vol.Optional(
                         OPT_ENTITY_PV_ENERGY_TOTAL,
-                        default=self._options.get(OPT_ENTITY_PV_ENERGY_TOTAL, ""),
+                        description={
+                            "suggested_value": self._options.get(OPT_ENTITY_PV_ENERGY_TOTAL)
+                        },
                     ): sensor_selector,
                     vol.Optional(
                         OPT_ENTITY_GRID_IMPORT_TOTAL,
-                        default=self._options.get(OPT_ENTITY_GRID_IMPORT_TOTAL, ""),
+                        description={
+                            "suggested_value": self._options.get(OPT_ENTITY_GRID_IMPORT_TOTAL)
+                        },
                     ): sensor_selector,
                     vol.Optional(
                         OPT_ENTITY_GRID_EXPORT_TOTAL,
-                        default=self._options.get(OPT_ENTITY_GRID_EXPORT_TOTAL, ""),
+                        description={
+                            "suggested_value": self._options.get(OPT_ENTITY_GRID_EXPORT_TOTAL)
+                        },
                     ): sensor_selector,
                 }
             ),
@@ -259,49 +269,65 @@ class VolterOptionsFlow(OptionsFlowWithConfigEntry):
                 {
                     vol.Optional(
                         OPT_ENTITY_EMS_MODE,
-                        default=self._options.get(OPT_ENTITY_EMS_MODE, ""),
+                        description={
+                            "suggested_value": self._options.get(OPT_ENTITY_EMS_MODE)
+                        },
                     ): selector.EntitySelector(
                         selector.EntitySelectorConfig(domain="select")
                     ),
                     vol.Optional(
                         OPT_ENTITY_CHARGE_LIMIT,
-                        default=self._options.get(OPT_ENTITY_CHARGE_LIMIT, ""),
+                        description={
+                            "suggested_value": self._options.get(OPT_ENTITY_CHARGE_LIMIT)
+                        },
                     ): selector.EntitySelector(
                         selector.EntitySelectorConfig(domain="number")
                     ),
                     vol.Optional(
                         OPT_ENTITY_DISCHARGE_LIMIT,
-                        default=self._options.get(OPT_ENTITY_DISCHARGE_LIMIT, ""),
+                        description={
+                            "suggested_value": self._options.get(OPT_ENTITY_DISCHARGE_LIMIT)
+                        },
                     ): selector.EntitySelector(
                         selector.EntitySelectorConfig(domain="number")
                     ),
                     vol.Optional(
                         OPT_ENTITY_EXPORT_LIMIT,
-                        default=self._options.get(OPT_ENTITY_EXPORT_LIMIT, ""),
+                        description={
+                            "suggested_value": self._options.get(OPT_ENTITY_EXPORT_LIMIT)
+                        },
                     ): selector.EntitySelector(
                         selector.EntitySelectorConfig(domain="number")
                     ),
                     vol.Optional(
                         OPT_ENTITY_EXPORT_LIMIT_SWITCH,
-                        default=self._options.get(OPT_ENTITY_EXPORT_LIMIT_SWITCH, ""),
+                        description={
+                            "suggested_value": self._options.get(OPT_ENTITY_EXPORT_LIMIT_SWITCH)
+                        },
                     ): selector.EntitySelector(
                         selector.EntitySelectorConfig(domain="switch")
                     ),
                     vol.Optional(
                         OPT_ENTITY_ECO_MODE_POWER,
-                        default=self._options.get(OPT_ENTITY_ECO_MODE_POWER, ""),
+                        description={
+                            "suggested_value": self._options.get(OPT_ENTITY_ECO_MODE_POWER)
+                        },
                     ): selector.EntitySelector(
                         selector.EntitySelectorConfig(domain="number")
                     ),
                     vol.Optional(
                         OPT_ENTITY_SOC_UPPER,
-                        default=self._options.get(OPT_ENTITY_SOC_UPPER, ""),
+                        description={
+                            "suggested_value": self._options.get(OPT_ENTITY_SOC_UPPER)
+                        },
                     ): selector.EntitySelector(
                         selector.EntitySelectorConfig(domain="number")
                     ),
                     vol.Optional(
                         OPT_ENTITY_ECO_MODE_SOC,
-                        default=self._options.get(OPT_ENTITY_ECO_MODE_SOC, ""),
+                        description={
+                            "suggested_value": self._options.get(OPT_ENTITY_ECO_MODE_SOC)
+                        },
                     ): selector.EntitySelector(
                         selector.EntitySelectorConfig(domain="number")
                     ),

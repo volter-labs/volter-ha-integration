@@ -64,11 +64,13 @@ class VolterPlanCard extends HTMLElement {
   }
 
   setConfig(config) {
-    if (!config || !config.entity) {
-      throw new Error('Podaj pole entity — sensor planu Voltera.');
-    }
-    this._config = config;
+    // NIE rzucamy przy braku `entity`. `preview: true` w customCards każe HA zbudować
+    // podgląd karty bez hass i bez konfiguracji — wyjątek w tym miejscu HA pokazuje
+    // jako "configuration error" NA DASHBOARDZIE, nie tylko w podglądzie.
+    // Brak encji to stan do pokazania użytkownikowi, a nie powód do wysadzenia karty.
+    this._config = Object.assign({ entity: 'sensor.volter_energy_plan' }, config || {});
     if (!this.shadowRoot) this.attachShadow({ mode: 'open' });
+    this._render();
   }
 
   getCardSize() { return 8; }
@@ -88,6 +90,7 @@ class VolterPlanCard extends HTMLElement {
   }
 
   _render() {
+    if (!this.shadowRoot || !this._config) return;
     const st = this._hass && this._hass.states
       ? this._hass.states[this._config.entity]
       : null;
