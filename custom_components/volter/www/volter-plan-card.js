@@ -47,7 +47,7 @@ const AKCJE = {
 /** Wersja karty. Widoczna w stopce, zeby dalo sie jednym spojrzeniem odroznic
  *  „kod jest zly" od „przegladarka trzyma stary plik". Test w `test_karta_frontend.py`
  *  pilnuje, zeby nie rozjechala sie z `manifest.json`. */
-const WERSJA = '2.6.3';
+const WERSJA = '2.7.0';
 
 const KOL_W = 22;   // szerokość kolumny godzinowej w jednostkach viewBox
 const WYS_SLUP = 96;

@@ -59,6 +59,10 @@ class ScheduleFetcher:
         #: dublujemy tego wewnątrz executora — zderzyłoby się to z RR-4, który
         #: wymaga, żeby KAŻDE wywołanie `async_set_schedule` naprawdę zapisało.
         self._last_schedule_id: str | None = None
+        #: Odcisk treści OSTATNIO PRZYJĘTEGO planu. Dedup po samym id zakłada, że id
+        #: jest funkcją treści — dla `schedule_id` sklejanego z identyfikatorów wierszy
+        #: to nieprawda (patrz `async_refresh`).
+        self._last_plan_signature: str | None = None
         #: U-8: `schedule_id` pusty (legalny pusty plan, patrz `PUSTY_PLAN_Z_CHMURY`
         #: w `test_fetcher.py` / D-6) jest ZAWSZE falsy, więc porównanie po samym id
         #: nigdy nie wykryje "bez zmian" — zmierzone 288 zapisów do Store na dobę,
@@ -111,10 +115,28 @@ class ScheduleFetcher:
             return
 
         schedule_id = str(plan.get("schedule_id", ""))
+        sygnatura_planu = json.dumps(plan, sort_keys=True)
         if schedule_id:
-            if schedule_id == self._last_schedule_id:
+            # Dedup po id ORAZ po treści. Samo id nie wystarcza, bo `schedule_id`
+            # jest sklejony z identyfikatorów WIERSZY `optimizer_schedules` — a treść
+            # zmienia też wersja kodu tłumaczącego plan na kontrakt urządzenia.
+            #
+            # Znalezione na żywej instalacji: po naprawie po stronie chmury (moc slotu
+            # odtwarzana z progów SoC) `get-schedule` zwracał już plan z mocą, ale HA
+            # go odrzucał — planer nie przeliczał planu, więc id wskazywało te same
+            # wiersze co przed naprawą. Objaw był mylący: chmura zwracała 200 z dobrą
+            # treścią, po stronie serwera wszystko się zgadzało, a falownik dalej
+            # dostawał tryb neutralny.
+            if (
+                schedule_id == self._last_schedule_id
+                and sygnatura_planu == self._last_plan_signature
+            ):
                 _LOGGER.debug("Plan %s bez zmian — pomijam zapis do Store", schedule_id)
                 return
+            if schedule_id == self._last_schedule_id:
+                _LOGGER.info(
+                    "Plan %s ma to samo id, ale INNĄ treść — przyjmuję", schedule_id
+                )
         else:
             # U-8: id pusty (legalny pusty plan, D-6) — "bez zmian" rozstrzyga TREŚĆ,
             # nie id. Warunek `self._last_schedule_id == ""` celowo wymaga, żeby
@@ -122,8 +144,10 @@ class ScheduleFetcher:
             # niepusty (albo to pierwszy fetch), sygnatury nie ma z czym porównać
             # i zapis MUSI przejść — inaczej przejście "plan realny → optymalizator
             # wyłączony" nigdy by nie dotarło do executora (I-5 zostałoby ślepe).
-            sygnatura = json.dumps(plan, sort_keys=True)
-            if self._last_schedule_id == "" and sygnatura == self._last_empty_plan_signature:
+            if (
+                self._last_schedule_id == ""
+                and sygnatura_planu == self._last_empty_plan_signature
+            ):
                 _LOGGER.debug("Pusty plan bez zmian — pomijam zapis do Store")
                 return
 
@@ -144,7 +168,8 @@ class ScheduleFetcher:
         # U-8: sygnatura ma sens WYŁĄCZNIE, gdy ten plan miał pusty id — dla
         # niepustego id zeruj ją, żeby stary odcisk z poprzedniego pustego planu
         # nie przeciekł w drugą stronę (pusty → niepusty → znowu ten sam pusty).
-        self._last_empty_plan_signature = json.dumps(plan, sort_keys=True) if not schedule_id else None
+        self._last_plan_signature = sygnatura_planu
+        self._last_empty_plan_signature = sygnatura_planu if not schedule_id else None
         _LOGGER.info(
             "Przyjęto plan %s (%s slotów)", schedule_id or "(bez id)",
             len(plan.get("slots", [])) if isinstance(plan.get("slots"), list) else "?",
