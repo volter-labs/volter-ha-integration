@@ -233,7 +233,23 @@ _make_module("homeassistant.helpers.event", {
     "async_track_state_change_event": MagicMock(return_value=MagicMock()),
     "async_call_later": MagicMock(return_value=MagicMock()),
 })
-_make_module("homeassistant.helpers.selector", {"selector": MagicMock()})
+# Selektory formularza. Renderowanie nas nie interesuje, ale krok Options Flow,
+# ktory WRACA z bledem, musi zbudowac schemat — inaczej nie da sie przetestowac
+# ani jednej walidacji pola.
+_make_module("homeassistant.helpers.selector", {
+    "selector": MagicMock(),
+    "EntitySelector": MagicMock(),
+    "EntitySelectorConfig": MagicMock(),
+    "NumberSelector": MagicMock(),
+    "NumberSelectorConfig": MagicMock(),
+    "NumberSelectorMode": MagicMock(),
+    "SelectSelector": MagicMock(),
+    "SelectSelectorConfig": MagicMock(),
+    "SelectSelectorMode": MagicMock(),
+    "TextSelector": MagicMock(),
+    "TextSelectorConfig": MagicMock(),
+    "BooleanSelector": MagicMock(),
+})
 
 # --- platformy i frontend (encje Voltera + karta Lovelace) ---
 class _FakeEntity:

@@ -30,6 +30,7 @@ from homeassistant.helpers.storage import Store
 from .applier import apply_params
 from .const import (
     COMMAND_ENTITY_MAP,
+    ENCJE_TYLKO_ODCZYT,
     DEFAULT_CONTROL_ENABLED,
     DEFAULT_RATED_POWER_W,
     DEFAULT_SOC_RESERVE,
@@ -75,6 +76,10 @@ from .schedule import Fallback, Schedule, Slot, akcja_efektywna
 _LOGGER = logging.getLogger(__name__)
 
 
+#: Zgloszone juz bledne mapowania — patrz `_mapped_entity`.
+_ZGLOSZONE_TYLKO_ODCZYT: set[tuple[str, str]] = set()
+
+
 def _mapped_entity(param_key: str, options: dict[str, Any]) -> bool:
     """Czy `param_key` ma zmapowaną encję w opcjach integracji.
 
@@ -88,7 +93,30 @@ def _mapped_entity(param_key: str, options: dict[str, Any]) -> bool:
     if not mapping:
         return False
     opt_key = mapping[0]
-    return bool(options.get(opt_key))
+    encja = options.get(opt_key)
+    if not encja:
+        return False
+    # Encja z `setter=None` nie przyjmie zapisu, wiec parametr NIE ma adresata.
+    # Walidacja formularza lapie to przy nastepnym zapisie opcji — instalacja, ktora
+    # ma juz zle mapowanie w `.storage`, musi byc widoczna teraz. Inaczej
+    # `would_write` w `volter.diagnose` klamie w jedynym narzedziu, ktorym uzytkownik
+    # sprawdza tor zapisu przed wlaczeniem sterowania.
+    nazwa_obiektu = str(encja).split(".", 1)[-1]
+    if nazwa_obiektu in ENCJE_TYLKO_ODCZYT:
+        # Raz na parę (parametr, encja): ta funkcja jest wolana w kazdym cyklu
+        # wykonawczym, a blad konfiguracji nie zmienia sie miedzy cyklami.
+        klucz_logu = (param_key, str(encja))
+        if klucz_logu not in _ZGLOSZONE_TYLKO_ODCZYT:
+            _ZGLOSZONE_TYLKO_ODCZYT.add(klucz_logu)
+            _LOGGER.error(
+                "Parametr '%s' wskazuje encje '%s', ktora jest TYLKO DO ODCZYTU — zapis nie "
+                "zrobilby nic. Zmien mapowanie na '%s' w opcjach integracji.",
+                param_key,
+                encja,
+                ENCJE_TYLKO_ODCZYT[nazwa_obiektu],
+            )
+        return False
+    return True
 
 
 def _cena_zaufana(value: Any) -> float | None:

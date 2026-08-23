@@ -49,7 +49,6 @@
           "entity_discharge_limit": "Battery Discharge Depth (DOD)",
           "entity_export_limit": "Grid Export Limit (W)",
           "entity_export_limit_switch": "Export Limit Switch (on/off)",
-          "entity_eco_mode_power": "Eco Mode Power (%)",
           "entity_eco_mode_soc": "Lower SoC threshold — map the Depth of Discharge entity",
           "entity_soc_upper": "Upper SoC limit (charge target)"
         },
@@ -83,6 +82,9 @@
           "backup": "Backup — protect reserve"
         }
       }
+    },
+    "error": {
+      "encja_tylko_do_odczytu": "This entity is read-only in the GoodWe integration (setter=None), so writes to it silently do nothing. Use number.goodwe_depth_of_discharge_on_grid for the lower SoC threshold and number.goodwe_ems_power_limit for the battery power setpoint."
     }
   },
   "entity": {

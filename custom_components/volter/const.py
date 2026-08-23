@@ -81,6 +81,44 @@ PARAM_VALUE_TRANSFORM = {
     "eco_soc": lambda prog: round(100.0 - float(prog), 1),
 }
 
+#: Encje falownika, ktore WYGLADAJA na sterujace, a zapis do nich nie robi nic.
+#:
+#: `number.goodwe_eco_mode_soc` i `number.goodwe_eco_mode_power` sa w domenie `number`,
+#: maja zakres 0..100 i jednostke procentowa — w formularzu nie da sie ich odroznic od
+#: encji, ktora przyjmuje nastawe. W integracji mletenay obie maja `setter=None`.
+#:
+#: Wskazanie takiej encji jako dolnego progu SoC bylo CICHE wylaczenie rezerwy backupu
+#: (I-1): plan liczy rezerwe, guardy ja przepuszczaja, komenda wychodzi, a falownik
+#: nigdy jej nie widzi. Uzytkownik nie ma jak tego zauwazyc — po zapisie wszystko
+#: wyglada poprawnie. Dlatego blokujemy to w formularzu, a nie w dokumentacji.
+#:
+#: Klucz to NAZWA OBIEKTU (czesc po kropce), porownywana w calosci. Porownanie po
+#: fragmencie odrzucaloby encje innych integracji o podobnej nazwie.
+ENCJE_TYLKO_ODCZYT: dict[str, str] = {
+    "goodwe_eco_mode_soc": "number.goodwe_depth_of_discharge_on_grid",
+    "goodwe_eco_mode_power": "number.goodwe_ems_power_limit",
+}
+
+#: Kod bledu formularza — tresc w `translations/pl.json`.
+BLAD_ENCJA_TYLKO_ODCZYT = "encja_tylko_do_odczytu"
+
+
+def waliduj_encje_sterujace(mapowanie: dict[str, str | None]) -> dict[str, str]:
+    """Zwroc bledy formularza dla encji, do ktorych zapis nigdy sie nie uda.
+
+    Klucz wyniku to nazwa pola, wartosc to kod bledu — dokladnie taki ksztalt,
+    jakiego oczekuje `async_show_form(errors=...)`.
+    """
+    bledy: dict[str, str] = {}
+    for pole, encja in mapowanie.items():
+        if not encja or "." not in str(encja):
+            continue
+        nazwa_obiektu = str(encja).split(".", 1)[1]
+        if nazwa_obiektu in ENCJE_TYLKO_ODCZYT:
+            bledy[pole] = BLAD_ENCJA_TYLKO_ODCZYT
+    return bledy
+
+
 #: Parametry, ktorych encje w integracji mletenay sa TYLKO DO ODCZYTU (`setter=None`).
 #: Zapis by sie nie powiodl, wiec nie emitujemy ich w ogole — patrz mappers.py.
 PARAMETRY_TYLKO_ODCZYT = frozenset({"eco_power"})

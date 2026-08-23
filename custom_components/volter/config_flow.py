@@ -31,8 +31,8 @@ from .const import (
     OPT_ENTITY_BATTERY_POWER,
     OPT_ENTITY_CHARGE_LIMIT,
     OPT_ENTITY_DISCHARGE_LIMIT,
-    OPT_ENTITY_ECO_MODE_POWER,
     OPT_ENTITY_ECO_MODE_SOC,
+    waliduj_encje_sterujace,
     OPT_ENTITY_EMS_MODE,
     OPT_ENTITY_EXPORT_LIMIT,
     OPT_ENTITY_EXPORT_LIMIT_SWITCH,
@@ -257,14 +257,24 @@ class VolterOptionsFlow(OptionsFlowWithConfigEntry):
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Krok 3: Sterowanie — opcjonalne encje do komend."""
+        bledy: dict[str, str] = {}
         if user_input is not None:
-            self._options.update(
-                {k: v for k, v in user_input.items() if v}
-            )
-            return await self.async_step_strategy()
+            bledy = waliduj_encje_sterujace(user_input)
+            if not bledy:
+                # Puste pole KASUJE mapowanie. Wczesniejszy filtr `if v` je ignorowal,
+                # wiec raz wskazanej encji sterujacej nie dalo sie odpiac inaczej niz
+                # reczna edycja `.storage` — a odciecie kanalu zapisu to wlasnie ta
+                # rzecz, ktora uzytkownik musi moc zrobic z interfejsu.
+                for klucz, wartosc in user_input.items():
+                    if wartosc:
+                        self._options[klucz] = wartosc
+                    else:
+                        self._options.pop(klucz, None)
+                return await self.async_step_strategy()
 
         return self.async_show_form(
             step_id="control",
+            errors=bledy,
             data_schema=vol.Schema(
                 {
                     vol.Optional(
@@ -306,14 +316,6 @@ class VolterOptionsFlow(OptionsFlowWithConfigEntry):
                         },
                     ): selector.EntitySelector(
                         selector.EntitySelectorConfig(domain="switch")
-                    ),
-                    vol.Optional(
-                        OPT_ENTITY_ECO_MODE_POWER,
-                        description={
-                            "suggested_value": self._options.get(OPT_ENTITY_ECO_MODE_POWER)
-                        },
-                    ): selector.EntitySelector(
-                        selector.EntitySelectorConfig(domain="number")
                     ),
                     vol.Optional(
                         OPT_ENTITY_SOC_UPPER,
