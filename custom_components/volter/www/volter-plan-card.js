@@ -47,12 +47,12 @@ const AKCJE = {
 /** Wersja karty. Widoczna w stopce, zeby dalo sie jednym spojrzeniem odroznic
  *  „kod jest zly" od „przegladarka trzyma stary plik". Test w `test_karta_frontend.py`
  *  pilnuje, zeby nie rozjechala sie z `manifest.json`. */
-const WERSJA = '2.7.0';
+const WERSJA = '2.7.2';
 
 const KOL_W = 22;   // szerokość kolumny godzinowej w jednostkach viewBox
 const WYS_SLUP = 96;
 const WYS_SOC = 58;
-const MARGINES = 26;
+const MARGINES = 6;   // dolny oddech pod slupkami; podpisy godzin sa juz w HTML
 
 const esc = (s) => String(s).replace(/[&<>"]/g, (z) =>
   ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[z]));
@@ -63,13 +63,26 @@ const liczba = (v, jedn, dokl) => (v == null || Number.isNaN(v))
   ? '—'
   : (dokl ? Number(v).toFixed(dokl) : Math.round(v)) + (jedn ? ' ' + jedn : '');
 
-/** Moc czytelnie: waty do 1 kW, wyżej kilowaty. 4-cyfrowe liczby nie mieszczą
- *  się w kafelku, a „3,2 kW” niesie tę samą informację co „3226 W”. */
-const moc = (w) => {
-  if (w == null || Number.isNaN(w)) return '—';
+/** Moc rozbita na liczbę i jednostkę.
+ *
+ *  Waty do 1 kW, wyżej kilowaty — „3,2 kW" niesie tę samą informację co „3226 W",
+ *  a mieści się w kafelku. Jednostka wraca OSOBNO, bo składana w jeden ciąg
+ *  („-3,24 kW" w stopniu pisma liczby) wychodziła poza kafelek przy pięciu
+ *  kolumnach: sam znak minus i spacja przed jednostką kosztują tyle, co cyfra. */
+const mocRozbita = (w) => {
+  if (w == null || Number.isNaN(w)) return { liczba: '—', jedn: '' };
   const abs = Math.abs(w);
-  if (abs < 1000) return Math.round(w) + ' W';
-  return (w / 1000).toFixed(abs < 10000 ? 2 : 1).replace('.', ',') + ' kW';
+  if (abs < 1000) return { liczba: String(Math.round(w)), jedn: 'W' };
+  return {
+    liczba: (w / 1000).toFixed(abs < 10000 ? 2 : 1).replace('.', ','),
+    jedn: 'kW',
+  };
+};
+
+/** Moc jednym ciągiem — do podpowiedzi, gdzie miejsca nie brakuje. */
+const moc = (w) => {
+  const { liczba: l, jedn } = mocRozbita(w);
+  return jedn ? l + ' ' + jedn : l;
 };
 
 class VolterPlanCard extends HTMLElement {
@@ -150,21 +163,24 @@ class VolterPlanCard extends HTMLElement {
     const dom = this._val(enc.dom);
     const bat = this._val(enc.bateria);
     const siec = this._val(enc.siec);
-    const kafel = (etykieta, wartosc, kolor, dopisek) => ''
+    const kafel = (etykieta, wartosc, jedn, kolor, dopisek) => ''
       + '<div class="kafel">'
       + '<span class="et">' + etykieta + '</span>'
-      + '<b style="color:' + kolor + '">' + wartosc + '</b>'
+      + '<b style="color:' + kolor + '">' + wartosc
+      + (jedn ? '<i>' + jedn + '</i>' : '') + '</b>'
       + (dopisek ? '<span class="dop">' + dopisek + '</span>' : '')
       + '</div>';
+    const kafelMocy = (etykieta, wartosc, kolor, dopisek) => {
+      const m = mocRozbita(wartosc);
+      return kafel(etykieta, m.liczba, m.jedn, kolor, dopisek);
+    };
     return '<div class="teraz">'
-      + kafel('SoC', liczba(soc, '%'), AURA.primaryBright,
-        soc != null ? this._pasekSoc(soc) : '')
-      + kafel('PV', moc(pv), AURA.amber)
-      + kafel('Dom', moc(dom), AURA.violet)
-      + kafel('Bateria', moc(bat),
-        bat != null && bat < 0 ? AURA.primary : AURA.orange)
-      + kafel('Sieć', moc(siec),
-        siec != null && siec > 0 ? AURA.danger : AURA.sky,
+      + kafel('SoC', soc == null ? '—' : String(Math.round(soc)), soc == null ? '' : '%',
+        AURA.primaryBright, soc != null ? this._pasekSoc(soc) : '')
+      + kafelMocy('PV', pv, AURA.amber)
+      + kafelMocy('Dom', dom, AURA.violet)
+      + kafelMocy('Bateria', bat, bat != null && bat < 0 ? AURA.primary : AURA.orange)
+      + kafelMocy('Sieć', siec, siec != null && siec > 0 ? AURA.danger : AURA.sky,
         siec == null ? '' : (siec > 0 ? 'import' : 'eksport'))
       + '</div>';
   }
@@ -201,7 +217,6 @@ class VolterPlanCard extends HTMLElement {
       Math.round(Math.sqrt(Math.abs(p || 0) / maks) * (WYS_SLUP - 8)));
 
     let kolumny = '';
-    let etykiety = '';
     let siatka = '';
     let obszary = '';
 
@@ -239,14 +254,25 @@ class VolterPlanCard extends HTMLElement {
         + '<rect x="' + x + '" y="0" width="' + KOL_W + '" height="' + dolSlupka
         + '" fill="transparent"/></g>';
 
-      const g = godzina(s.od);
-      if (g % 3 === 0) {
-        etykiety += '<text x="' + (x + KOL_W / 2) + '" y="' + (H - 8)
-          + '" class="oc">' + String(g).padStart(2, '0') + '</text>';
+      if (godzina(s.od) % 3 === 0) {
         siatka += '<line x1="' + x + '" y1="0" x2="' + x + '" y2="' + dolSlupka
-          + '" stroke="rgba(255,255,255,.07)" stroke-width="1"/>';
+          + '" stroke="rgba(255,255,255,.07)" stroke-width="1"'
+          + ' vector-effect="non-scaling-stroke"/>';
       }
     });
+
+    // Podpisy godzin w HTML, NIE w SVG. Wykres skaluje sie nierownomiernie
+    // (`preserveAspectRatio="none"`), zeby slupki wypelnialy cala szerokosc karty
+    // niezaleznie od liczby slotow — a to rozciaga tekst w pionie tym mocniej, im
+    // wezsza karta. Siatka HTML o tej samej liczbie kolumn trzyma podpisy dokladnie
+    // pod slupkami i nie deformuje pisma.
+    const podpisy = '<div class="godziny" style="grid-template-columns:repeat('
+      + n + ',1fr)">'
+      + sloty.map((s) => {
+        const g = godzina(s.od);
+        return '<span>' + (g % 3 === 0 ? String(g).padStart(2, '0') : '') + '</span>';
+      }).join('')
+      + '</div>';
 
     // Obszar prognozy: od bieżącej godziny w prawo, w ukośne kreski — jak w aplikacji.
     // Bez tego nie widać, gdzie kończy się fakt, a zaczyna założenie.
@@ -269,9 +295,11 @@ class VolterPlanCard extends HTMLElement {
         soc = Math.max(0, Math.min(100, soc + (kwh / pojemnosc) * 100));
         punkty.push((i * KOL_W + KOL_W).toFixed(1) + ',' + yDlaSoc(soc).toFixed(1));
       }
+      // `non-scaling-stroke`: bez tego niejednorodne skalowanie robi z linii
+      // wstege — grubsza w pionie, cienka w poziomie.
       krzywa = '<polyline points="' + punkty.join(' ') + '" fill="none" stroke="'
         + AURA.primaryBright + '" stroke-width="2" stroke-linejoin="round"'
-        + ' stroke-linecap="round"/>';
+        + ' stroke-linecap="round" vector-effect="non-scaling-stroke"/>';
       punktStart = '<circle cx="' + (xProg + 1) + '" cy="' + yDlaSoc(socTeraz)
         + '" r="2.6" fill="' + AURA.primaryBright + '"/>';
     }
@@ -283,9 +311,9 @@ class VolterPlanCard extends HTMLElement {
 
     return '<div class="wykres">'
       + '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none" '
-      + 'style="width:100%;height:' + Math.round(H * 1.4) + 'px">'
-      + defs + prognoza + siatka + krzywa + punktStart + kolumny + etykiety + obszary
-      + '</svg></div>';
+      + 'style="width:100%;height:' + Math.round(H * 1.35) + 'px">'
+      + defs + prognoza + siatka + krzywa + punktStart + kolumny + obszary
+      + '</svg>' + podpisy + '</div>';
   }
 
   _legenda(sloty) {
@@ -319,52 +347,77 @@ class VolterPlanCard extends HTMLElement {
       + 'color:' + AURA.textPrimary + ';'
       + 'font-family:Outfit,"DM Sans",Roboto,system-ui,-apple-system,sans-serif;'
       + 'box-shadow:0 10px 30px rgba(0,0,0,.35)}'
-      + '.head{display:flex;justify-content:space-between;align-items:center;gap:12px}'
+      // `flex-wrap`: przy bardzo waskiej karcie pigulka schodzi pod tytul, zamiast
+      // sciskac go do „Lad...". Nazwa biezacego trybu jest wazniejsza od tego, zeby
+      // naglowek zmiescil sie w jednej linii.
+      + '.head{display:flex;flex-wrap:wrap;justify-content:space-between;'
+      + 'align-items:center;gap:8px 12px}'
       + '.teraz-tryb{display:flex;align-items:center;gap:10px;min-width:0}'
       + '.kropka{width:11px;height:11px;border-radius:9999px;background:var(--k);'
       + 'box-shadow:0 0 0 4px color-mix(in srgb,var(--k) 18%,transparent);flex:0 0 auto}'
-      + '.tytul{font-size:19px;font-weight:700;letter-spacing:-.2px}'
+      // Tytul ustepuje pierwszy. Bez `min-width:0` i wielokropka pigulka wchodzila
+      // na napis „Ladowanie" przy karcie ponizej ~300 px — flex nie zwezi elementu
+      // ponizej jego tresci, dopoki mu sie tego nie pozwoli.
+      + '.tytul{font-size:19px;font-weight:700;letter-spacing:-.2px;min-width:0;'
+      + 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap}'
       + '.pigulka{padding:5px 11px;border-radius:9999px;font-size:11px;white-space:nowrap;'
-      + 'border:1px solid ' + AURA.borderMid + '}'
+      + 'flex:0 0 auto;border:1px solid ' + AURA.borderMid + '}'
       + '.pigulka.on{color:' + AURA.primaryBright + ';background:rgba(52,211,153,.10);'
       + 'border-color:rgba(52,211,153,.35)}'
       + '.pigulka.off{color:' + AURA.textSecondary + ';background:rgba(255,255,255,.03)}'
-      + '.teraz{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin:16px 0 4px}'
+      // `auto-fit` zamiast sztywnych piatki i media query. Prog `@media` mierzy OKNO,
+      // a karta ma wlasna szerokosc — na szerokim pulpicie z waska kolumna dashboardu
+      // kafelki dalej probowaly zmiescic sie w pieciu, a w waskim oknie lamaly sie
+      // nawet wtedy, gdy karta byla szeroka. `minmax` rozstrzyga to szerokoscia KARTY.
+      // Prog 70 px, nie 74: przy karcie 440 px zostaje 400 px na tresc, cztery odstepy
+      // po 6 px zjadaja 24, wiec na kolumne przypada 75 px. Prog 74 mijal sie o wlos
+      // i lamal piatke na cztery.
+      + '.teraz{display:grid;grid-template-columns:repeat(auto-fit,minmax(70px,1fr));'
+      + 'gap:6px;margin:16px 0 4px}'
       + '.kafel{background:rgba(255,255,255,.03);border:1px solid ' + AURA.border + ';'
-      + 'border-radius:14px;padding:9px 10px;min-width:0}'
-      + '.kafel .et{display:block;font-size:10px;letter-spacing:.7px;text-transform:uppercase;'
+      + 'border-radius:14px;padding:9px 8px;min-width:0}'
+      + '.kafel .et{display:block;font-size:9px;letter-spacing:.5px;text-transform:uppercase;'
       + 'color:' + AURA.textMuted + '}'
-      + '.kafel b{display:block;font-size:17px;font-weight:600;margin-top:2px;'
-      + 'font-variant-numeric:tabular-nums;white-space:nowrap}'
+      // 15px zamiast 17px i jednostka o polowe mniejsza: przy pieciu kolumnach
+      // kafelek ma okolo 78 px, a „-3,24 kW" w stopniu pisma liczby zajmowal wiecej.
+      // `min-width:0` na kafelku pozwala siatce go sciesnic zamiast rozpychac karte.
+      + '.kafel b{display:flex;align-items:baseline;gap:2px;font-size:14px;'
+      + 'font-weight:600;margin-top:2px;font-variant-numeric:tabular-nums;'
+      + 'white-space:nowrap;overflow:hidden}'
+      + '.kafel b i{font-style:normal;font-size:9px;font-weight:500;letter-spacing:.3px;'
+      + 'color:' + AURA.textMuted + ';flex:0 0 auto}'
       + '.kafel .dop{font-size:10px;color:' + AURA.textMuted + '}'
       + '.soc-bar{display:block;height:3px;border-radius:9999px;margin-top:6px;'
       + 'background:rgba(255,255,255,.08);overflow:hidden}'
       + '.soc-bar i{display:block;height:100%;background:' + AURA.primary + '}'
       + '.wykres{margin:10px -2px 0}'
+      + '.godziny{display:grid;margin-top:3px}'
+      // `overflow:visible`: komorka siatki ma szerokosc JEDNEJ kolumny wykresu, przy
+      // waskiej karcie okolo 9 px, a „21" zajmuje wiecej. Przycinanie robilo z podpisow
+      // „1ε 0( 0ς". Sasiednie komorki sa puste (podpisujemy co trzecia godzine), wiec
+      // napis ma gdzie wystawac i nic nie zasloni.
+      + '.godziny span{font-size:9px;text-align:center;color:' + AURA.textMuted + ';'
+      + 'font-variant-numeric:tabular-nums;overflow:visible;white-space:nowrap}'
       + 'svg g.hit rect{fill:transparent}'
       + 'svg g.hit:hover rect{fill:rgba(255,255,255,.09)}'
       + '.poz i.kreski{width:14px;height:9px;border-radius:3px;'
       + 'background:repeating-linear-gradient(45deg,rgba(255,255,255,.22) 0 2px,'
       + 'transparent 2px 5px);border:1px solid ' + AURA.border + '}'
-      + 'svg text.oc{fill:' + AURA.textMuted + ';font-size:9px;text-anchor:middle;'
-      + 'font-family:inherit}'
-      + 'svg text.os-soc{fill:' + AURA.textMuted + ';font-size:8px;font-family:inherit}'
-      + '.legenda{display:flex;flex-wrap:wrap;gap:14px;margin-top:10px}'
-      + '.poz{display:flex;align-items:center;gap:6px;font-size:12px;'
-      + 'color:' + AURA.textSecondary + '}'
+      + '.legenda{display:flex;flex-wrap:wrap;gap:6px 12px;margin-top:12px}'
+      + '.poz{display:flex;align-items:center;gap:5px;font-size:11px;'
+      + 'white-space:nowrap;color:' + AURA.textSecondary + '}'
       + '.poz i{width:9px;height:9px;border-radius:3px;background:var(--k)}'
       + '.poz i.linia{width:14px;height:2px;border-radius:2px;background:'
       + AURA.primaryBright + '}'
       + '.stopka{margin-top:14px;padding-top:12px;border-top:1px solid ' + AURA.border + ';'
-      + 'display:flex;justify-content:space-between;font-size:12px;'
-      + 'color:' + AURA.textSecondary + '}'
+      + 'display:flex;flex-wrap:wrap;gap:2px 14px;justify-content:space-between;'
+      + 'font-size:12px;color:' + AURA.textSecondary + '}'
       + '.stopka b{color:' + AURA.textPrimary + ';font-weight:600;'
       + 'font-variant-numeric:tabular-nums}'
       + '.stopka .wer{font-style:normal;color:' + AURA.textMuted + ';font-size:10px;'
       + 'margin-left:6px}'
       + '.pusto{padding:26px 0;text-align:center;color:' + AURA.textMuted + ';font-size:14px}'
       + '.karta code{font-family:ui-monospace,monospace;font-size:12px}'
-      + '@media(max-width:520px){.teraz{grid-template-columns:repeat(3,1fr)}}'
       + '</style>'
       + '<div class="karta">' + tresc + '</div>';
   }
