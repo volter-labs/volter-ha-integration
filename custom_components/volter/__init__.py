@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 
@@ -11,6 +10,7 @@ from homeassistant.components.frontend import add_extra_js_url
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
+from homeassistant.loader import async_get_integration
 
 from .command_handler import VolterCommandHandler
 from .const import CONF_API_KEY, CONF_DEVICE_ID, CONF_SUPABASE_ANON_KEY, CONF_SUPABASE_URL, DOMAIN
@@ -34,29 +34,77 @@ PLATFORMS: list[Platform] = [Platform.SENSOR, Platform.BINARY_SENSOR, Platform.S
 CARD_URL = "/volter_static/volter-plan-card.js"
 
 
-def _wersja_integracji() -> str | None:
-    """Wersja z `manifest.json`. `None`, gdy manifestu nie da się odczytać."""
-    try:
-        with open(Path(__file__).parent / "manifest.json", encoding="utf-8") as plik:
-            return str(json.load(plik).get("version") or "") or None
-    except (OSError, ValueError):
-        return None
+def url_karty(wersja: str | None) -> str:
+    """Adres karty dla frontendu — z wersja integracji jako parametrem.
 
+    Frontend HA cache'uje moduly takze wtedy, gdy serwer odpowiada `no-cache`.
+    Po podmianie pliku pod tym samym adresem przegladarka potrafi trzymac STARY
+    modul, a to jest blad niewidoczny z zadnej strony serwera: plik na dysku nowy,
+    HTTP 200, testy zielone, a uzytkownik ma kod sprzed dwoch wydan. Wersja
+    w adresie rozstrzyga to deterministycznie — nowe wydanie to nowy adres.
 
-def url_karty() -> str:
-    """Adres karty dla frontendu — z wersją integracji jako parametrem.
-
-    Frontend HA cache'uje moduły takze wtedy, gdy serwer odpowiada `no-cache`
-    (miedzy innymi przez service workera). Po podmianie pliku pod tym samym
-    adresem przegladarka potrafi trzymac STARY modul, a wtedy dashboard pokazuje
-    blad, ktorego nie widac po zadnej stronie serwera: plik na dysku jest nowy,
-    HTTP zwraca 200, testy przechodza, a uzytkownik ma kod sprzed dwoch wydan.
-
-    Wersja w adresie rozstrzyga to deterministycznie — nowe wydanie to nowy adres.
+    Wersje podaje loader HA (`async_get_integration`), a nie odczyt `manifest.json`
+    z dysku: ten drugi jest blokujacym wejsciem-wyjsciem w petli zdarzen.
     Brak wersji nie jest powodem do niewystawienia karty.
     """
-    wersja = _wersja_integracji()
     return f"{CARD_URL}?v={wersja}" if wersja else CARD_URL
+
+
+def decyzja_o_zasobie(
+    istniejace: list[dict], adres: str
+) -> tuple[str, str | None]:
+    """Co zrobic z wpisem karty w zasobach Lovelace: utworz / zaktualizuj / nic.
+
+    Wydzielone jako czysta funkcja, bo cala reszta to I/O po kolekcji HA, ktorej
+    w testach nie ma — a decyzja jest tym, co moze byc zle.
+
+    Dopasowanie po SCIEZCE, nie po pelnym adresie: adres niesie wersje, wiec po
+    kazdym wydaniu pelne porownanie nie znalazloby wpisu i dokladalo kolejny.
+    """
+    for wpis in istniejace:
+        url = str(wpis.get("url") or "")
+        if url.split("?", 1)[0] != CARD_URL:
+            continue
+        return ("nic" if url == adres else "zaktualizuj"), wpis.get("id")
+    return "utworz", None
+
+
+async def _async_zarejestruj_zasob(hass: HomeAssistant, adres: str) -> None:
+    """Dopisz karte do zasobow Lovelace.
+
+    `add_extra_js_url` wstrzykuje modul do powloki HTML i to jest droga zalecana,
+    ale okazala sie niewystarczajaca: na instalacji, na ktorej to debugowalismy,
+    osiem dzialajacych kart wlasnych (apexcharts, mushroom, power-flow-card-plus...)
+    bylo zarejestrowanych jako ZASOBY, a nasza — jedyna szyta przez `extra_module_url`
+    — pokazywala "configuration error". Zasob jest ladowany przez frontend razem
+    z konfiguracja dashboardu, a nie z powloki, ktora potrafi przyjechac z cache'a.
+
+    Robimy OBIE rzeczy. Zaden blad tutaj nie moze przewrocic integracji: karta jest
+    dodatkiem do sterowania, a nie warunkiem jego dzialania.
+    """
+    try:
+        lovelace = hass.data.get("lovelace")
+        zasoby = getattr(lovelace, "resources", None)
+        if zasoby is None:
+            _LOGGER.debug("Lovelace w trybie YAML albo bez kolekcji zasobow — pomijam")
+            return
+        # Kolekcja jest leniwa; bez tego `async_items` zwroci pusta liste i przy
+        # kazdym starcie dokladalibysmy duplikat.
+        if hasattr(zasoby, "async_get_info"):
+            await zasoby.async_get_info()
+
+        akcja, ident = decyzja_o_zasobie(list(zasoby.async_items()), adres)
+        if akcja == "utworz":
+            await zasoby.async_create_item({"res_type": "module", "url": adres})
+            _LOGGER.info("Karta Voltera dodana do zasobow Lovelace: %s", adres)
+        elif akcja == "zaktualizuj" and ident:
+            await zasoby.async_update_item(ident, {"res_type": "module", "url": adres})
+            _LOGGER.info("Zasob karty Voltera zaktualizowany na %s", adres)
+    except Exception:  # noqa: BLE001 — patrz docstring: karta nie moze wywrocic setupu
+        _LOGGER.warning(
+            "Nie udalo sie zarejestrowac karty w zasobach Lovelace. Karta moze wymagac "
+            "recznego dodania (Ustawienia > Dashboardy > Zasoby): %s", adres, exc_info=True
+        )
 
 
 async def _async_register_frontend(hass: HomeAssistant) -> None:
@@ -70,7 +118,10 @@ async def _async_register_frontend(hass: HomeAssistant) -> None:
     await hass.http.async_register_static_paths([
         StaticPathConfig(CARD_URL, f"{katalog}/volter-plan-card.js", cache_headers=False)
     ])
-    add_extra_js_url(hass, url_karty())
+    integracja = await async_get_integration(hass, DOMAIN)
+    adres = url_karty(str(integracja.version) if integracja.version else None)
+    add_extra_js_url(hass, adres)
+    await _async_zarejestruj_zasob(hass, adres)
 
 
 async def _async_register_services(hass: HomeAssistant) -> None:
