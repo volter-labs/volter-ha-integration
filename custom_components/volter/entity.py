@@ -26,6 +26,9 @@ def plan_do_json(plan: Schedule | None, teraz: datetime | None = None) -> list[d
     JSON i renderowane w przeglądarce, więc nie ma tu miejsca na obiekty domenowe.
     `akcja` to kierunek EFEKTYWNY (ten sam, który widzą guardy), a nie dosłowne
     pole `mode` — inaczej karta pokazywałaby co innego niż robi urządzenie.
+    Obok niego idzie `tryb_planu`: kierunek mówi, CO ROBI falownik, a tryb planu —
+    czym ta godzina jest w planie. Te dwie rzeczy nie zawsze się pokrywają i karta
+    potrzebuje obu, żeby nazwać godzinę tak samo jak aplikacja.
     """
     if plan is None:
         return []
@@ -43,6 +46,13 @@ def plan_do_json(plan: Schedule | None, teraz: datetime | None = None) -> list[d
             "cena": s.price_pln_kwh,
             "eksport": s.export_allowed,
             "limit_eksportu_w": s.export_limit_w,
+            # Pola OPISOWE — karta nazywa nimi godzinę tak samo jak aplikacja.
+            # `akcja` zostaje kierunkiem efektywnym, bo na nim stoi wykonanie (U-6);
+            # `tryb_planu` mówi, czym ta godzina JEST w planie. Bez tego karta
+            # zgadywała kategorię z kierunku i myliła autokonsumpcję ze sprzedażą.
+            "tryb_planu": s.plan_mode,
+            "import_kwh": s.grid_import_kwh,
+            "eksport_kwh": s.grid_export_kwh,
             "teraz": s.covers(teraz),
         })
     return out

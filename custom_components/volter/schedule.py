@@ -213,6 +213,22 @@ def _waliduj_spojnosc_kierunku(
         )
 
 
+def _tekst_miekko(raw: dict[str, Any], klucz: str) -> str | None:
+    """Tekst pola OPISOWEGO albo `None`. Zły typ jest pomijany, nie zgłaszany."""
+    wartosc = raw.get(klucz)
+    return wartosc if isinstance(wartosc, str) and wartosc else None
+
+
+def _liczba_miekko(raw: dict[str, Any], klucz: str) -> float | None:
+    """Liczba pola OPISOWEGO albo `None`. Patrz `_tekst_miekko`."""
+    wartosc = raw.get(klucz)
+    if isinstance(wartosc, bool) or not isinstance(wartosc, (int, float)):
+        return None
+    liczba = float(wartosc)
+    return liczba if math.isfinite(liczba) else None
+
+
+
 @dataclass(frozen=True)
 class Slot:
     """Pojedynczy przedział harmonogramu."""
@@ -236,6 +252,19 @@ class Slot:
     #: N-8/D-5: realny pułap eksportu w watach. Bez niego mapper znał tylko „wolno /
     #: nie wolno" i przy zgodzie ZDEJMOWAŁ ogranicznik, czyli kasował limit OSD.
     export_limit_w: float | None = None
+    #: Tryb planera bez tłumaczenia (`OptimizerMode`) — WYŁĄCZNIE do prezentacji.
+    #: Kontrakt ma cztery kierunki, bo tyle wystarcza guardom. Aplikacja Volter
+    #: pokazuje osiem kategorii wizualnych; bez tego pola karta musiała je zgadywać
+    #: z kierunku i myliła się w sposób zmieniający wymowę planu — `self_consume`
+    #: z `discharge_purpose='self'` (bateria pokrywa dom) pokazywała jako
+    #: „Rozładowanie" w kolorze sprzedaży.
+    #: Guardy, mapper i executor tego NIE czytają.
+    plan_mode: str | None = None
+    #: Annotacje przepływów sieciowych z planera (kWh), do prezentacji.
+    #: `None` znaczy „nie wiem", `0.0` znaczy „zaplanowane zero" — aplikacja
+    #: przemalowuje tryb pasywny na import dopiero powyżej progu.
+    grid_import_kwh: float | None = None
+    grid_export_kwh: float | None = None
 
     def covers(self, moment: datetime) -> bool:
         return self.start <= moment < self.end
@@ -278,6 +307,12 @@ class Slot:
             charge_source=charge_source,
             discharge_purpose=discharge_purpose,
             export_limit_w=_moc_nieujemna(raw, "export_limit_w"),
+            # Pola opisowe czytamy MIĘKKO. Nie sterują niczym, więc ich zły typ nie
+            # może być powodem odrzucenia całego planu — inaczej regresja
+            # w prezentacji wyłączałaby sterowanie falownikiem.
+            plan_mode=_tekst_miekko(raw, "plan_mode"),
+            grid_import_kwh=_liczba_miekko(raw, "grid_import_kwh"),
+            grid_export_kwh=_liczba_miekko(raw, "grid_export_kwh"),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -294,6 +329,9 @@ class Slot:
             "charge_source": self.charge_source,
             "discharge_purpose": self.discharge_purpose,
             "export_limit_w": self.export_limit_w,
+            "plan_mode": self.plan_mode,
+            "grid_import_kwh": self.grid_import_kwh,
+            "grid_export_kwh": self.grid_export_kwh,
         }
 
 

@@ -37,17 +37,80 @@ const AURA = {
   textMuted: '#6B7280',
 };
 
+/** Kierunek slotu — do PROGNOZY SoC, nie do nazywania godziny.
+ *  `znak` mówi, w którą stronę idzie energia baterii w tej godzinie. */
 const AKCJE = {
-  charge: { kolor: AURA.primary, etykieta: 'Ładowanie', znak: 1 },
-  discharge: { kolor: AURA.orange, etykieta: 'Rozładowanie', znak: -1 },
-  self_consume: { kolor: AURA.sky, etykieta: 'Autokonsumpcja', znak: 0 },
-  idle: { kolor: AURA.textMuted, etykieta: 'Postój', znak: 0 },
+  charge: { znak: 1 },
+  discharge: { znak: -1 },
+  self_consume: { znak: 0 },
+  idle: { znak: 0 },
 };
+
+/** Kategorie wizualne — te same, których używa aplikacja Volter.
+ *
+ *  Kontrakt urządzenia ma cztery kierunki, bo tyle wystarcza guardom i falownikowi.
+ *  Aplikacja pokazuje OSIEM kategorii: osobno ładowanie z PV i z sieci, osobno
+ *  rozładowanie na dom i na sprzedaż, osobno eksport PV i import z sieci.
+ *
+ *  Karta miała wcześniej tylko kierunek i te kategorie ZGADYWAŁA — myliła się
+ *  w sposób, który zmieniał wymowę planu: godzina, w której bateria pokrywa dom
+ *  (`self_consume` z `discharge_purpose='self'`), wyglądała jak sprzedaż. Plan był
+ *  ten sam co w aplikacji — rozjeżdżała się wyłącznie prezentacja.
+ *
+ *  Kolory i etykiety skopiowane 1:1 z `services/optimizerService.ts` (MODE_COLORS,
+ *  DISPLAY_COLORS) i `i18n/locales/pl/dashboard.json` (optimizer.modes), żeby ta
+ *  sama godzina nazywała się w obu miejscach tak samo. */
+const KATEGORIE = {
+  SELF_CONSUME: { kolor: '#00FF9D', etykieta: 'Autokonsumpcja' },
+  EXPORT_PV: { kolor: '#F59E0B', etykieta: 'PV → sieć' },
+  CHARGE_FROM_PV: { kolor: '#34D399', etykieta: 'Ładuj z PV' },
+  CHARGE_FROM_GRID: { kolor: '#818CF8', etykieta: 'Ładuj z sieci' },
+  BATTERY_DISCHARGE_SELF: { kolor: '#FB923C', etykieta: 'Bateria → dom' },
+  BATTERY_DISCHARGE_SELL: { kolor: '#EF4444', etykieta: 'Bateria → sieć' },
+  IDLE: { kolor: '#475569', etykieta: 'Bezczynność' },
+  GRID_IMPORT: { kolor: '#60A5FA', etykieta: 'Import z sieci' },
+};
+
+/** Próg netto importu (kWh), powyżej którego tryb pasywny pokazujemy jako import.
+ *  Ta sama wartość co `NET_IMPORT_DISPLAY_THRESHOLD_KWH` w aplikacji. */
+const PROG_IMPORTU_KWH = 0.1;
+
+/** Kategoria wizualna slotu — z trybu planu, a gdy go brak, z kierunku.
+ *
+ *  Plany utrwalone przed rozszerzeniem kontraktu nie mają `tryb_planu`; wtedy
+ *  odtwarzamy kategorię z kierunku i pól opisowych. Jest to przybliżenie —
+ *  `EXPORT_PV` nie da się w ten sposób odróżnić od autokonsumpcji — ale plan
+ *  odświeża się co pięć minut, więc dotyczy wyłącznie pierwszych chwil po
+ *  aktualizacji integracji. */
+const kategoria = (s) => {
+  let k = s.tryb_planu;
+  if (!k || !KATEGORIE[k]) k = kategoriaZKierunku(s);
+  // Ta sama reguła co w aplikacji: tryb PASYWNY, który netto importuje, kłamie
+  // kolorem „autokonsumpcja" — bateria jest pusta i prąd realnie kupujemy.
+  if ((k === 'SELF_CONSUME' || k === 'IDLE') && s.import_kwh != null) {
+    const netto = s.import_kwh - (s.eksport_kwh || 0);
+    if (netto > PROG_IMPORTU_KWH) return 'GRID_IMPORT';
+  }
+  return k;
+};
+
+const kategoriaZKierunku = (s) => {
+  if (s.akcja === 'charge') {
+    return s.zrodlo_ladowania === 'pv' ? 'CHARGE_FROM_PV' : 'CHARGE_FROM_GRID';
+  }
+  if (s.akcja === 'discharge') {
+    return s.cel_rozladowania === 'sell'
+      ? 'BATTERY_DISCHARGE_SELL' : 'BATTERY_DISCHARGE_SELF';
+  }
+  return s.akcja === 'idle' ? 'IDLE' : 'SELF_CONSUME';
+};
+
+const opisKategorii = (s) => KATEGORIE[kategoria(s)] || KATEGORIE.SELF_CONSUME;
 
 /** Wersja karty. Widoczna w stopce, zeby dalo sie jednym spojrzeniem odroznic
  *  „kod jest zly" od „przegladarka trzyma stary plik". Test w `test_karta_frontend.py`
  *  pilnuje, zeby nie rozjechala sie z `manifest.json`. */
-const WERSJA = '2.7.2';
+const WERSJA = '2.8.0';
 
 const KOL_W = 22;   // szerokość kolumny godzinowej w jednostkach viewBox
 const WYS_SLUP = 96;
@@ -142,8 +205,16 @@ class VolterPlanCard extends HTMLElement {
   }
 
   _naglowek(st, a) {
-    const akcja = String(st.state || '').replace(' (fallback)', '');
-    const cfg = AKCJE[akcja] || AKCJE.idle;
+    const sloty = Array.isArray(a.sloty) ? a.sloty : [];
+    const biezacy = sloty.find((s) => s.teraz);
+    // Nazwa bierze sie z KATEGORII biezacej godziny, nie z samego kierunku —
+    // inaczej naglowek mowilby „Rozladowanie" w godzinie, w ktorej plan przewiduje
+    // zwykle pokrycie domu z baterii.
+    const cfg = biezacy
+      ? opisKategorii(biezacy)
+      : (KATEGORIE[kategoriaZKierunku(
+          { akcja: String(st.state || '').replace(' (fallback)', '') })]
+         || KATEGORIE.SELF_CONSUME);
     const sterowanie = a.sterowanie_wlaczone === true;
     return ''
       + '<div class="head">'
@@ -221,7 +292,7 @@ class VolterPlanCard extends HTMLElement {
     let obszary = '';
 
     sloty.forEach((s, i) => {
-      const cfg = AKCJE[s.akcja] || AKCJE.idle;
+      const cfg = opisKategorii(s);
       const h = wysokosc(s.moc_w);
       const x = i * KOL_W;
       const y = dolSlupka - h;
@@ -290,8 +361,10 @@ class VolterPlanCard extends HTMLElement {
       const yDlaSoc = (v) => WYS_SOC - (v / 100) * (WYS_SOC - 8) - 4;
       const punkty = [(xProg + 1).toFixed(1) + ',' + yDlaSoc(soc).toFixed(1)];
       for (let i = iTeraz; i < n; i += 1) {
-        const cfg = AKCJE[sloty[i].akcja] || AKCJE.idle;
-        const kwh = ((sloty[i].moc_w || 0) / 1000) * cfg.znak;
+        // Znak z KIERUNKU, nie z kategorii: prognoza SoC to fizyka baterii,
+        // a kategoria jest nazwa dla czlowieka.
+        const kier = AKCJE[sloty[i].akcja] || AKCJE.idle;
+        const kwh = ((sloty[i].moc_w || 0) / 1000) * kier.znak;
         soc = Math.max(0, Math.min(100, soc + (kwh / pojemnosc) * 100));
         punkty.push((i * KOL_W + KOL_W).toFixed(1) + ',' + yDlaSoc(soc).toFixed(1));
       }
@@ -317,9 +390,9 @@ class VolterPlanCard extends HTMLElement {
   }
 
   _legenda(sloty) {
-    const obecne = sloty.map((s) => s.akcja).filter((v, i, t) => t.indexOf(v) === i);
+    const obecne = sloty.map(kategoria).filter((v, i, t) => t.indexOf(v) === i);
     return '<div class="legenda">' + obecne.map((k) => {
-      const cfg = AKCJE[k] || AKCJE.idle;
+      const cfg = KATEGORIE[k] || KATEGORIE.SELF_CONSUME;
       return '<span class="poz"><i style="--k:' + cfg.kolor + '"></i>' + cfg.etykieta + '</span>';
     }).join('')
       + '<span class="poz"><i class="linia"></i>Prognoza SoC</span>'
