@@ -58,6 +58,15 @@ const liczba = (v, jedn, dokl) => (v == null || Number.isNaN(v))
   ? '—'
   : (dokl ? Number(v).toFixed(dokl) : Math.round(v)) + (jedn ? ' ' + jedn : '');
 
+/** Moc czytelnie: waty do 1 kW, wyżej kilowaty. 4-cyfrowe liczby nie mieszczą
+ *  się w kafelku, a „3,2 kW” niesie tę samą informację co „3226 W”. */
+const moc = (w) => {
+  if (w == null || Number.isNaN(w)) return '—';
+  const abs = Math.abs(w);
+  if (abs < 1000) return Math.round(w) + ' W';
+  return (w / 1000).toFixed(abs < 10000 ? 2 : 1).replace('.', ',') + ' kW';
+};
+
 class VolterPlanCard extends HTMLElement {
   static getStubConfig() {
     return { entity: 'sensor.volter_energy_plan' };
@@ -145,11 +154,11 @@ class VolterPlanCard extends HTMLElement {
     return '<div class="teraz">'
       + kafel('SoC', liczba(soc, '%'), AURA.primaryBright,
         soc != null ? this._pasekSoc(soc) : '')
-      + kafel('PV', liczba(pv, 'W'), AURA.amber)
-      + kafel('Dom', liczba(dom, 'W'), AURA.violet)
-      + kafel('Bateria', liczba(bat, 'W'),
+      + kafel('PV', moc(pv), AURA.amber)
+      + kafel('Dom', moc(dom), AURA.violet)
+      + kafel('Bateria', moc(bat),
         bat != null && bat < 0 ? AURA.primary : AURA.orange)
-      + kafel('Sieć', liczba(siec, 'W'),
+      + kafel('Sieć', moc(siec),
         siec != null && siec > 0 ? AURA.danger : AURA.sky,
         siec == null ? '' : (siec > 0 ? 'import' : 'eksport'))
       + '</div>';
@@ -171,69 +180,106 @@ class VolterPlanCard extends HTMLElement {
     const n = sloty.length;
     const W = n * KOL_W;
     const H = WYS_SLUP + WYS_SOC + MARGINES;
+    const dolSlupka = WYS_SOC + WYS_SLUP;
     const maks = Math.max.apply(null,
       sloty.map((s) => Math.abs(s.moc_w || 0)).concat([1]));
 
-    // — kolumny godzinowe (moc) —
+    // Indeks bieżącej godziny. Wszystko przed nim JUŻ SIĘ WYDARZYŁO — plan na te
+    // godziny jest historią, a nie zapowiedzią, więc nie może wyglądać tak samo.
+    let iTeraz = sloty.findIndex((s) => s.teraz);
+    if (iTeraz < 0) iTeraz = 0;
+
+    // Skala pierwiastkowa. Liniowa gubiła wszystko poniżej ~1 kW przy jednej
+    // godzinie sprzedaży 4–5 kW: słupki 200 W miały kilka pikseli i nie dało się
+    // w nie trafić kursorem. Pierwiastek zachowuje kolejność, a spłaszcza górę.
+    const wysokosc = (p) => Math.max(4,
+      Math.round(Math.sqrt(Math.abs(p || 0) / maks) * (WYS_SLUP - 8)));
+
     let kolumny = '';
     let etykiety = '';
     let siatka = '';
+    let obszary = '';
+
     sloty.forEach((s, i) => {
       const cfg = AKCJE[s.akcja] || AKCJE.idle;
-      const h = Math.max(3, Math.round((Math.abs(s.moc_w || 0) / maks) * (WYS_SLUP - 8)));
+      const h = wysokosc(s.moc_w);
       const x = i * KOL_W;
-      const y = WYS_SOC + (WYS_SLUP - h);
+      const y = dolSlupka - h;
+      const przeszlosc = i < iTeraz;
       const tytul = [
-        String(godzina(s.od)).padStart(2, '0') + ':00',
+        String(godzina(s.od)).padStart(2, '0') + ':00–'
+          + String(godzina(s.do)).padStart(2, '0') + ':00',
         cfg.etykieta,
-        s.moc_w != null ? Math.round(s.moc_w) + ' W' : 'moc niezadana',
-        s.cena != null ? Number(s.cena).toFixed(2) + ' zł/kWh' : null,
+        s.moc_w != null ? moc(s.moc_w) : 'moc niezadana',
+        s.cena != null ? Number(s.cena).toFixed(2).replace('.', ',') + ' zł/kWh' : null,
+        s.soc_docelowy != null ? 'SoC ' + Math.round(s.soc_docelowy) + '%' : null,
         s.zrodlo_ladowania ? 'źródło: ' + s.zrodlo_ladowania : null,
         s.cel_rozladowania ? 'cel: ' + s.cel_rozladowania : null,
+        s.eksport === false ? 'eksport zablokowany' : null,
+        przeszlosc ? 'godzina miniona' : null,
       ].filter(Boolean).join(' · ');
 
       if (s.teraz) {
         siatka += '<rect x="' + x + '" y="0" width="' + KOL_W + '" height="'
-          + (WYS_SOC + WYS_SLUP) + '" fill="rgba(255,255,255,.06)" rx="3"/>';
+          + dolSlupka + '" fill="rgba(255,255,255,.07)" rx="3"/>';
       }
-      kolumny += '<g><title>' + esc(tytul) + '</title>'
-        + '<rect x="' + (x + 2) + '" y="' + y + '" width="' + (KOL_W - 4)
-        + '" height="' + h + '" rx="3" fill="' + cfg.kolor + '"'
-        + (s.moc_w == null ? ' opacity=".35"' : '') + '/></g>';
+
+      kolumny += '<rect x="' + (x + 2) + '" y="' + y + '" width="' + (KOL_W - 4)
+        + '" height="' + h + '" rx="3" fill="' + cfg.kolor + '" opacity="'
+        + (s.moc_w == null ? '.28' : (przeszlosc ? '.4' : '1')) + '"/>';
+
+      // CAŁA kolumna jest obszarem najechania, nie sam słupek. Przy niskich mocach
+      // słupek ma kilka pikseli i trafienie w niego było loterią.
+      obszary += '<g class="hit"><title>' + esc(tytul) + '</title>'
+        + '<rect x="' + x + '" y="0" width="' + KOL_W + '" height="' + dolSlupka
+        + '" fill="transparent"/></g>';
 
       const g = godzina(s.od);
       if (g % 3 === 0) {
         etykiety += '<text x="' + (x + KOL_W / 2) + '" y="' + (H - 8)
           + '" class="oc">' + String(g).padStart(2, '0') + '</text>';
-        siatka += '<line x1="' + x + '" y1="0" x2="' + x + '" y2="'
-          + (WYS_SOC + WYS_SLUP) + '" stroke="rgba(255,255,255,.07)" stroke-width="1"/>';
+        siatka += '<line x1="' + x + '" y1="0" x2="' + x + '" y2="' + dolSlupka
+          + '" stroke="rgba(255,255,255,.07)" stroke-width="1"/>';
       }
     });
 
-    // — krzywa prognozy SoC —
+    // Obszar prognozy: od bieżącej godziny w prawo, w ukośne kreski — jak w aplikacji.
+    // Bez tego nie widać, gdzie kończy się fakt, a zaczyna założenie.
+    const xProg = iTeraz * KOL_W;
+    const prognoza = '<rect x="' + xProg + '" y="0" width="' + (W - xProg)
+      + '" height="' + dolSlupka + '" fill="url(#volter-kreski)"/>';
+
+    // Krzywa SoC WYŁĄCZNIE nad prognozą. Historycznego SoC nie mamy — siedzi
+    // w recorderze HA, nie w planie — więc linia nad przeszłością byłaby
+    // zmyślaniem danych, a nie informacją.
     let krzywa = '';
-    let etykietaSoc = '';
+    let punktStart = '';
     if (socTeraz != null && pojemnosc > 0) {
-      let s = socTeraz;
-      const punkty = [];
-      sloty.forEach((slot, i) => {
-        const cfg = AKCJE[slot.akcja] || AKCJE.idle;
-        const kwh = ((slot.moc_w || 0) / 1000) * cfg.znak;
-        s = Math.max(0, Math.min(100, s + (kwh / pojemnosc) * 100));
-        const x = i * KOL_W + KOL_W / 2;
-        const y = WYS_SOC - (s / 100) * (WYS_SOC - 6) - 3;
-        punkty.push(x.toFixed(1) + ',' + y.toFixed(1));
-      });
+      let soc = socTeraz;
+      const yDlaSoc = (v) => WYS_SOC - (v / 100) * (WYS_SOC - 8) - 4;
+      const punkty = [(xProg + 1).toFixed(1) + ',' + yDlaSoc(soc).toFixed(1)];
+      for (let i = iTeraz; i < n; i += 1) {
+        const cfg = AKCJE[sloty[i].akcja] || AKCJE.idle;
+        const kwh = ((sloty[i].moc_w || 0) / 1000) * cfg.znak;
+        soc = Math.max(0, Math.min(100, soc + (kwh / pojemnosc) * 100));
+        punkty.push((i * KOL_W + KOL_W).toFixed(1) + ',' + yDlaSoc(soc).toFixed(1));
+      }
       krzywa = '<polyline points="' + punkty.join(' ') + '" fill="none" stroke="'
         + AURA.primaryBright + '" stroke-width="2" stroke-linejoin="round"'
-        + ' stroke-linecap="round" opacity=".9"/>';
-      etykietaSoc = '<text x="2" y="10" class="os-soc">SoC — prognoza</text>';
+        + ' stroke-linecap="round"/>';
+      punktStart = '<circle cx="' + (xProg + 1) + '" cy="' + yDlaSoc(socTeraz)
+        + '" r="2.6" fill="' + AURA.primaryBright + '"/>';
     }
+
+    const defs = '<defs><pattern id="volter-kreski" width="6" height="6" '
+      + 'patternUnits="userSpaceOnUse" patternTransform="rotate(45)">'
+      + '<line x1="0" y1="0" x2="0" y2="6" stroke="rgba(255,255,255,.06)" '
+      + 'stroke-width="2"/></pattern></defs>';
 
     return '<div class="wykres">'
       + '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none" '
-      + 'style="width:100%;height:' + (H * 1.35) + 'px">'
-      + siatka + krzywa + etykietaSoc + kolumny + etykiety
+      + 'style="width:100%;height:' + Math.round(H * 1.4) + 'px">'
+      + defs + prognoza + siatka + krzywa + punktStart + kolumny + etykiety + obszary
       + '</svg></div>';
   }
 
@@ -243,7 +289,8 @@ class VolterPlanCard extends HTMLElement {
       const cfg = AKCJE[k] || AKCJE.idle;
       return '<span class="poz"><i style="--k:' + cfg.kolor + '"></i>' + cfg.etykieta + '</span>';
     }).join('')
-      + '<span class="poz"><i class="linia"></i>Prognoza SoC</span></div>';
+      + '<span class="poz"><i class="linia"></i>Prognoza SoC</span>'
+      + '<span class="poz"><i class="kreski"></i>Prognoza (przed: godziny minione)</span></div>';
   }
 
   _stopka(a) {
@@ -289,6 +336,11 @@ class VolterPlanCard extends HTMLElement {
       + 'background:rgba(255,255,255,.08);overflow:hidden}'
       + '.soc-bar i{display:block;height:100%;background:' + AURA.primary + '}'
       + '.wykres{margin:10px -2px 0}'
+      + 'svg g.hit rect{fill:transparent}'
+      + 'svg g.hit:hover rect{fill:rgba(255,255,255,.09)}'
+      + '.poz i.kreski{width:14px;height:9px;border-radius:3px;'
+      + 'background:repeating-linear-gradient(45deg,rgba(255,255,255,.22) 0 2px,'
+      + 'transparent 2px 5px);border:1px solid ' + AURA.border + '}'
       + 'svg text.oc{fill:' + AURA.textMuted + ';font-size:9px;text-anchor:middle;'
       + 'font-family:inherit}'
       + 'svg text.os-soc{fill:' + AURA.textMuted + ';font-size:8px;font-family:inherit}'
