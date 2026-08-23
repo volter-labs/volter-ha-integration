@@ -214,7 +214,10 @@ _make_module("homeassistant.core", {
     "SupportsResponse": MagicMock(),
     "callback": lambda fn: fn,
 })
-_make_module("homeassistant.const", {"Platform": MagicMock()})
+_make_module("homeassistant.const", {
+    "Platform": MagicMock(),
+    "UnitOfPower": MagicMock(),
+})
 _make_module("homeassistant.exceptions", {"HomeAssistantError": Exception})
 _make_module("homeassistant.config_entries", {
     "ConfigEntry": _FakeConfigEntry,
@@ -231,6 +234,38 @@ _make_module("homeassistant.helpers.event", {
     "async_call_later": MagicMock(return_value=MagicMock()),
 })
 _make_module("homeassistant.helpers.selector", {"selector": MagicMock()})
+
+# --- platformy i frontend (encje Voltera + karta Lovelace) ---
+class _FakeEntity:
+    _attr_has_entity_name = False
+    _attr_unique_id = None
+    _attr_device_info = None
+    _attr_translation_key = None
+
+    def async_write_ha_state(self):  # encje wołają to po zmianie stanu
+        pass
+
+
+class _FakeSwitchEntity(_FakeEntity):
+    pass
+
+
+_make_module("homeassistant.components")
+_make_module("homeassistant.components.sensor", {
+    "SensorEntity": _FakeEntity,
+    "SensorDeviceClass": MagicMock(),
+    "SensorStateClass": MagicMock(),
+})
+_make_module("homeassistant.components.binary_sensor", {
+    "BinarySensorEntity": _FakeEntity,
+    "BinarySensorDeviceClass": MagicMock(),
+})
+_make_module("homeassistant.components.switch", {"SwitchEntity": _FakeSwitchEntity})
+_make_module("homeassistant.components.http", {"StaticPathConfig": MagicMock()})
+_make_module("homeassistant.components.frontend", {"add_extra_js_url": MagicMock()})
+_make_module("homeassistant.helpers.entity", {"Entity": _FakeEntity})
+_make_module("homeassistant.helpers.device_registry", {"DeviceInfo": dict})
+_make_module("homeassistant.helpers.entity_platform", {"AddEntitiesCallback": Any})
 
 # ── Czyste moduły bez HA (volter_pure) ──────────────────────────────────────
 # `custom_components/volter/__init__.py` importuje HA, więc zwykłe

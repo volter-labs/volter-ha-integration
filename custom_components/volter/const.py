@@ -103,6 +103,9 @@ MONITORING_ENTITY_MAP = {
 
 STORAGE_VERSION = 1
 STORAGE_KEY = f"{DOMAIN}.schedule"
+#: Stan przelaczalny z UI (wylacznik sterowania) — osobny plik, zeby
+#: przelaczenie nie wymagalo przeladowania integracji (patrz runtime.py).
+RUNTIME_STORAGE_KEY = f"{DOMAIN}.runtime"
 
 #: Interwał pętli wykonawczej. Wymóg ze specyfikacji: <= 60 s.
 EXECUTOR_INTERVAL = 60

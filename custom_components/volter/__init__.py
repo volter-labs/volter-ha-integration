@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
+from homeassistant.components.http import StaticPathConfig
+from homeassistant.components.frontend import add_extra_js_url
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
 
 from .command_handler import VolterCommandHandler
@@ -12,12 +16,33 @@ from .const import CONF_API_KEY, CONF_DEVICE_ID, CONF_SUPABASE_ANON_KEY, CONF_SU
 from .coordinator import VolterTelemetryCoordinator
 from .executor import VolterExecutor
 from .fetcher import ScheduleFetcher
+from .runtime import VolterRuntime
 
 _LOGGER = logging.getLogger(__name__)
 
 type VolterConfigEntry = ConfigEntry
 
 SERVICE_DIAGNOSE = "diagnose"
+
+#: Encje Voltera w HA. Bez nich integracja nie pokazywała NICZEGO — jedynym
+#: wglądem był log, a jedynym hamulcem usunięcie mapowania encji.
+PLATFORMS: list[Platform] = [Platform.SENSOR, Platform.BINARY_SENSOR, Platform.SWITCH]
+
+#: Karta Lovelace dostarczana razem z integracją. Rejestrujemy ją sami, żeby
+#: użytkownik nie musiał nic wgrywać ręcznie ani dodawać zasobu w Lovelace.
+CARD_URL = "/volter_static/volter-plan-card.js"
+
+
+async def _async_register_frontend(hass: HomeAssistant) -> None:
+    """Wystaw kartę Lovelace i dopisz ją do zasobów frontendu (raz na HA)."""
+    if hass.data.get(f"{DOMAIN}_frontend"):
+        return
+    hass.data[f"{DOMAIN}_frontend"] = True
+    katalog = str(Path(__file__).parent / "www")
+    await hass.http.async_register_static_paths([
+        StaticPathConfig(CARD_URL, f"{katalog}/volter-plan-card.js", cache_headers=False)
+    ])
+    add_extra_js_url(hass, CARD_URL)
 
 
 async def _async_register_services(hass: HomeAssistant) -> None:
@@ -54,8 +79,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: VolterConfigEntry) -> bo
         supabase_url=supabase_url,
     )
 
+    # Wyłącznik sterowania trzymany poza opcjami, żeby przełączenie encją nie
+    # wymuszało `async_reload` (czyli resetu ochrony NVM — ustalenie S-7).
+    runtime = VolterRuntime(hass, entry.entry_id, dict(entry.options))
+    await runtime.async_load()
+
     # Executor — pętla wykonawcza harmonogramu + jedyna brama zapisu do falownika
-    executor = VolterExecutor(hass=hass, entry=entry)
+    executor = VolterExecutor(hass=hass, entry=entry, runtime=runtime)
 
     # Task 16: pobieranie planu z chmury (get-schedule, pull co 5 min) —
     # brakujące ogniwo między planerem a executorem. Musi powstać PO executorze,
@@ -84,6 +114,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: VolterConfigEntry) -> bo
         "command_handler": command_handler,
         "executor": executor,
         "fetcher": fetcher,
+        "runtime": runtime,
     }
 
     await _async_register_services(hass)
@@ -91,6 +122,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: VolterConfigEntry) -> bo
     # Uruchom coordinator, executor, fetcher (po executorze — patrz wyżej) i command handler
     await coordinator.async_start()
     await executor.async_start()
+    await _async_register_frontend(hass)
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     await fetcher.async_start()
     await command_handler.async_start()
 
@@ -106,6 +139,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: VolterConfigEntry) -> bo
 
 async def async_unload_entry(hass: HomeAssistant, entry: VolterConfigEntry) -> bool:
     """Wyładuj integrację Volter."""
+    await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     data = hass.data[DOMAIN].pop(entry.entry_id, {})
 
     coordinator: VolterTelemetryCoordinator | None = data.get("coordinator")

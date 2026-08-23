@@ -82,5 +82,31 @@
         }
       }
     }
+  },
+  "entity": {
+    "sensor": {
+      "planned_mode": {
+        "name": "Plan pracy"
+      },
+      "current_power": {
+        "name": "Moc zadana"
+      },
+      "schedule_valid_until": {
+        "name": "Plan ważny do"
+      },
+      "last_write": {
+        "name": "Ostatni zapis"
+      }
+    },
+    "binary_sensor": {
+      "degraded": {
+        "name": "Zapisy wstrzymane"
+      }
+    },
+    "switch": {
+      "control_enabled": {
+        "name": "Sterowanie falownikiem"
+      }
+    }
   }
 }

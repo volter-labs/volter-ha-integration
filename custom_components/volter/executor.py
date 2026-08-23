@@ -118,9 +118,14 @@ def _cena_zaufana(value: Any) -> float | None:
 class VolterExecutor:
     """Pętla wykonawcza + wspólna brama zapisu dla harmonogramu i komend."""
 
-    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
+    def __init__(
+        self, hass: HomeAssistant, entry: ConfigEntry, runtime: Any | None = None
+    ) -> None:
         self.hass = hass
         self._entry = entry
+        # Wyłącznik sterowania. `runtime` jest źródłem prawdy w czasie pracy;
+        # brak (testy, stary kod) -> czytamy opcje, czyli zachowanie jak dotąd.
+        self._runtime = runtime
         self._store: Store = Store(hass, STORAGE_VERSION, f"{STORAGE_KEY}.{entry.entry_id}")
         self._schedule: Schedule | None = None
         self._unsub: CALLBACK_TYPE | None = None
@@ -682,7 +687,12 @@ class VolterExecutor:
         # Domyślnie WYŁĄCZONY, bo do czasu potwierdzenia mapowania trybów na żywym
         # falowniku (Etap 3) jedyną barierą przed pierwszym zapisem był przypadek:
         # niezgodność nazw trybów łapana przez I-10.
-        if not bool(options.get(OPT_CONTROL_ENABLED, DEFAULT_CONTROL_ENABLED)):
+        sterowanie = (
+            self._runtime.control_enabled
+            if self._runtime is not None
+            else bool(options.get(OPT_CONTROL_ENABLED, DEFAULT_CONTROL_ENABLED))
+        )
+        if not sterowanie:
             result.executed = []
             # THROTTLED, nie ERROR: nic nie poszło, ale nic też nie zawiodło —
             # a dedup (R-2) nie zapamiętuje tego statusu, więc komenda z chmury
@@ -1269,6 +1279,20 @@ class VolterExecutor:
             self._last_decision = decision
         else:
             _LOGGER.debug("[%s] Decyzja bez zmian: %s", source, act.value)
+
+    @property
+    def sterowanie_wlaczone(self) -> bool:
+        """Czy tor zapisu ma dziś prawo dotknąć falownika (dla encji `switch`)."""
+        if self._runtime is not None:
+            return self._runtime.control_enabled
+        return bool(
+            dict(self._entry.options).get(OPT_CONTROL_ENABLED, DEFAULT_CONTROL_ENABLED)
+        )
+
+    @property
+    def plan(self) -> Schedule | None:
+        """Aktualny harmonogram — dla encji prezentujących plan w HA."""
+        return self._schedule
 
     @property
     def diagnostics(self) -> dict[str, Any]:

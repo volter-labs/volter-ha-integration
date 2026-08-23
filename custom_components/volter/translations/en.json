@@ -82,5 +82,31 @@
         }
       }
     }
+  },
+  "entity": {
+    "sensor": {
+      "planned_mode": {
+        "name": "Plan"
+      },
+      "current_power": {
+        "name": "Setpoint power"
+      },
+      "schedule_valid_until": {
+        "name": "Plan valid until"
+      },
+      "last_write": {
+        "name": "Last write"
+      }
+    },
+    "binary_sensor": {
+      "degraded": {
+        "name": "Writes suspended"
+      }
+    },
+    "switch": {
+      "control_enabled": {
+        "name": "Inverter control"
+      }
+    }
   }
 }
