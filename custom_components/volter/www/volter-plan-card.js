@@ -114,7 +114,7 @@ const opisKategorii = (s) => KATEGORIE[kategoria(s)] || KATEGORIE.SELF_CONSUME;
 /** Wersja karty. Widoczna w stopce, zeby dalo sie jednym spojrzeniem odroznic
  *  „kod jest zly" od „przegladarka trzyma stary plik". Test w `test_karta_frontend.py`
  *  pilnuje, zeby nie rozjechala sie z `manifest.json`. */
-const WERSJA = '2.11.0';
+const WERSJA = '2.11.1';
 
 const KOL_W = 22;   // szerokość kolumny godzinowej w jednostkach viewBox
 const WYS_SLUP = 96;

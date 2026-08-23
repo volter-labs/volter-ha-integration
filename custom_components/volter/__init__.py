@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 from homeassistant.components.http import StaticPathConfig
@@ -151,12 +152,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: VolterConfigEntry) -> bo
     supabase_url = entry.data[CONF_SUPABASE_URL]
     anon_key = entry.data[CONF_SUPABASE_ANON_KEY]
 
-    # N-6: jedna tożsamość urządzenia (JWT z device-token) dla obu kanałów
-    # Realtime — telemetrii (nadawanie) i komend (nasłuch). Sesja aiohttp
-    # współdzielona z HA, żeby nie mnożyć połączeń.
-    token_provider = DeviceTokenProvider(
-        make_fetch(lambda: async_get_clientsession(hass), supabase_url, api_key)
-    )
+    # N-6: prywatne kanały Realtime (JWT z device-token dla telemetrii i komend).
+    # DOMYŚLNIE WYŁĄCZONE — bez tokenu HA nadaje/dołącza publicznie, tak jak przed N-6,
+    # więc build aplikacji sprzed prywatnego kanału dalej widzi telemetrię. Włączenie:
+    # ustaw `VOLTER_PRIVATE_REALTIME=1` w środowisku HA I zbuduj aplikację z
+    # `private: true` (hooks/useHaTelemetry.ts) + zastosuj migrację 060. Kolejność:
+    # nagłówek supabase/migrations/060_realtime_private_channels.sql (repo Apka1).
+    token_provider = None
+    if os.getenv("VOLTER_PRIVATE_REALTIME") == "1":
+        token_provider = DeviceTokenProvider(
+            make_fetch(lambda: async_get_clientsession(hass), supabase_url, api_key)
+        )
+        _LOGGER.info("N-6: prywatne kanały Realtime WŁĄCZONE (VOLTER_PRIVATE_REALTIME=1)")
 
     # Telemetry coordinator — zbiera stany encji i wysyła batche co 60s
     coordinator = VolterTelemetryCoordinator(

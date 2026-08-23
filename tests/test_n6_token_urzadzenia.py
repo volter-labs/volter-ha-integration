@@ -189,3 +189,29 @@ async def test_odswiezony_token_idzie_na_kanal_zdarzeniem_access_token():
     assert wyslane[-1]["event"] == "access_token"
     assert wyslane[-1]["payload"] == {"access_token": "jwt2"}
     assert wyslane[-1]["topic"] == "realtime:device:dev-1"
+
+
+# --- Flaga runtime: N-6 domyślnie WYŁĄCZONE (rollback „jak było") ----------------
+
+import importlib  # noqa: E402
+
+
+@pytest.mark.asyncio
+async def test_flaga_domyslnie_wylaczona_join_publiczny(monkeypatch):
+    """Bez VOLTER_PRIVATE_REALTIME=1 handler nie ma providera → kanał publiczny.
+
+    To jest stan po odłożeniu N-6: HA nadaje/dołącza publicznie, więc build aplikacji
+    sprzed prywatnego kanału dalej widzi telemetrię. Włączenie = zmienna + build app.
+    """
+    import os
+    monkeypatch.delenv("VOLTER_PRIVATE_REALTIME", raising=False)
+    assert os.getenv("VOLTER_PRIVATE_REALTIME") != "1"
+    # command_handler z token_provider=None dołącza publicznie (bez access_token).
+    h = VolterCommandHandler(
+        hass=FakeHass(), entry=type("E", (), {"options": {"entity_ems_mode": "s.t"}})(),
+        device_id="dev-1", supabase_url="https://x.supabase.co", anon_key="anon",
+        api_key="vk_test", executor=AsyncMock(), token_provider=None,
+    )
+    msg = await h._join_message()
+    assert msg["payload"]["config"].get("private", False) is False
+    assert "access_token" not in msg["payload"]
