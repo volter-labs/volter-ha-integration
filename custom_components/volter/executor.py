@@ -30,6 +30,7 @@ from homeassistant.helpers.storage import Store
 from .applier import apply_params
 from .const import (
     COMMAND_ENTITY_MAP,
+    DEFAULT_CONTROL_ENABLED,
     DEFAULT_RATED_POWER_W,
     DEFAULT_SOC_RESERVE,
     EXECUTOR_INTERVAL,
@@ -39,6 +40,7 @@ from .const import (
     MAX_STATE_AGE_S,
     MIN_SOC_JUMP_TOLERANCE_PP,
     OPT_ENTITY_EXPORT_LIMIT_SWITCH,
+    OPT_CONTROL_ENABLED,
     OPT_RATED_POWER_W,
     OPT_SOC_RESERVE,
     OPT_USER_MODE,
@@ -668,6 +670,29 @@ class VolterExecutor:
             # R-12: log decyzji (anty-spam + `_last_decision`) siedzi w `_remember`,
             # żeby DZIAŁAŁ TAKŻE na wczesnych returnach (I-10, I-1..I-9, I-8).
             # RR-5: gałąź WEWNĘTRZNA (przemapowanie po forced_action) nie loguje sama.
+            if _report:
+                self._remember(source, result, [], [], act)
+            return result
+
+        # WYŁĄCZNIK STEROWANIA — ostatnia brama przed dotknięciem falownika.
+        # Stoi TU, a nie na wejściu `async_apply`, celowo: guardy, throttle i wybór
+        # slotu policzyły się w całości, więc log decyzji i `volter.diagnose` pokazują
+        # dokładnie to, co POSZŁOBY do falownika. Wyłącznik odbiera prawo zapisu,
+        # nie widoczność — inaczej nie dałoby się przygotować instalacji na sucho.
+        # Domyślnie WYŁĄCZONY, bo do czasu potwierdzenia mapowania trybów na żywym
+        # falowniku (Etap 3) jedyną barierą przed pierwszym zapisem był przypadek:
+        # niezgodność nazw trybów łapana przez I-10.
+        if not bool(options.get(OPT_CONTROL_ENABLED, DEFAULT_CONTROL_ENABLED)):
+            result.executed = []
+            # THROTTLED, nie ERROR: nic nie poszło, ale nic też nie zawiodło —
+            # a dedup (R-2) nie zapamiętuje tego statusu, więc komenda z chmury
+            # pozostaje retryowalna po włączeniu sterowania.
+            result.status = Status.THROTTLED
+            result.note(
+                "STEROWANIE",
+                "sterowanie wyłączone w opcjach — pominięto zapis: "
+                + ", ".join(f"{k}={v}" for k, v in sorted(writable.items())),
+            )
             if _report:
                 self._remember(source, result, [], [], act)
             return result

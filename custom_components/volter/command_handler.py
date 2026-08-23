@@ -123,7 +123,13 @@ class VolterCommandHandler:
             return
 
         self._running = True
-        self._listen_task = self.hass.async_create_task(self._connection_loop())
+        # HA czeka w bootstrapie na zadania utworzone przez `hass.async_create_task`,
+        # a te dwie pętle nie kończą się nigdy — start HA wisiał przez nie ~90 s
+        # ("Setup timed out for bootstrap waiting on ..."). Zadania tła są
+        # wyłączone z tego oczekiwania i nadal giną razem z config entry.
+        self._listen_task = self._entry.async_create_background_task(
+            self.hass, self._connection_loop(), name="volter_realtime_connection"
+        )
         _LOGGER.debug("Command handler started")
 
     async def async_stop(self) -> None:
@@ -234,7 +240,10 @@ class VolterCommandHandler:
             })
 
             # Heartbeat task
-            self._heartbeat_task = self.hass.async_create_task(self._heartbeat_loop())
+            # jak wyżej — heartbeat też blokował bootstrap HA
+            self._heartbeat_task = self._entry.async_create_background_task(
+                self.hass, self._heartbeat_loop(), name="volter_realtime_heartbeat"
+            )
 
             # Nasłuchuj wiadomości
             async for msg in self._ws:

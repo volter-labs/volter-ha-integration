@@ -23,6 +23,7 @@ from .const import (
     CONF_SUPABASE_ANON_KEY,
     CONF_SUPABASE_URL,
     DEFAULT_RATED_POWER_W,
+    DEFAULT_CONTROL_ENABLED,
     DEFAULT_SOC_RESERVE,
     DEFAULT_SUPABASE_URL,
     DOMAIN,
@@ -40,6 +41,7 @@ from .const import (
     OPT_ENTITY_LOAD_POWER,
     OPT_ENTITY_PV_ENERGY_TOTAL,
     OPT_ENTITY_PV_POWER,
+    OPT_CONTROL_ENABLED,
     OPT_ENTITY_SOC,
     OPT_RATED_POWER_W,
     OPT_SOC_RESERVE,
@@ -333,6 +335,12 @@ class VolterOptionsFlow(OptionsFlowWithConfigEntry):
                             translation_key="user_mode",
                         )
                     ),
+                    vol.Required(
+                        OPT_CONTROL_ENABLED,
+                        default=self._options.get(
+                            OPT_CONTROL_ENABLED, DEFAULT_CONTROL_ENABLED
+                        ),
+                    ): selector.BooleanSelector(),
                     vol.Required(
                         OPT_RATED_POWER_W,
                         default=self._options.get(OPT_RATED_POWER_W, DEFAULT_RATED_POWER_W),

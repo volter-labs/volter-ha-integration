@@ -164,6 +164,14 @@ OPT_SOC_RESERVE = "soc_reserve"
 OPT_USER_MODE = "user_mode"          # earn | autarky | backup
 OPT_RATED_POWER_W = "rated_power_w"  # moc znamionowa falownika, do przeliczenia eco_power
 
+#: Wyłącznik sterowania. DOMYŚLNIE WYŁĄCZONY — integracja liczy plan, guardy
+#: i throttle, loguje decyzję i pokazuje ją w `volter.diagnose`, ale NIE zapisuje
+#: nic do falownika, dopóki właściciel świadomie tego nie włączy. Powód: mapowanie
+#: trybów falownika jest hipotezą do potwierdzenia na żywym sprzęcie (Etap 3),
+#: a integracja nie ma innego hamulca niż usunięcie mapowania encji.
+OPT_CONTROL_ENABLED = "control_enabled"
+DEFAULT_CONTROL_ENABLED = False
+
 DEFAULT_SOC_RESERVE = 20.0
 DEFAULT_RATED_POWER_W = 10000.0
 

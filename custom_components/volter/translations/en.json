@@ -21,7 +21,7 @@
   "options": {
     "step": {
       "init": {
-        "title": "Monitoring — Required entities",
+        "title": "Step 1 of 4 — Monitoring — Required entities",
         "description": "Map your inverter entities to Volter monitoring. These are required for energy optimization.",
         "data": {
           "entity_soc": "Battery State of Charge (SoC)",
@@ -30,7 +30,7 @@
         }
       },
       "monitoring_extended": {
-        "title": "Monitoring — Optional entities",
+        "title": "Step 2 of 4 — Monitoring — Optional entities",
         "description": "Additional entities for improved optimization accuracy.",
         "data": {
           "entity_battery_power": "Battery Power (charge/discharge)",
@@ -41,7 +41,7 @@
         }
       },
       "control": {
-        "title": "Control — Inverter commands",
+        "title": "Step 3 of 4 — Control — Inverter commands",
         "description": "Map inverter control entities to enable remote commands from the Volter app. All fields are optional.",
         "data": {
           "entity_ems_mode": "EMS / Operation Mode (select)",
@@ -54,12 +54,16 @@
         }
       },
       "strategy": {
-        "title": "Strategy — Guard parameters",
-        "description": "These values drive the safety guards. SoC reserve is never crossed in Backup mode.",
+        "title": "Step 4 of 4 — Strategy — Guard parameters",
+        "description": "These values drive the safety guards. SoC reserve is never crossed in Backup mode. Submitting this step saves the whole configuration.",
         "data": {
           "soc_reserve": "Battery reserve (SoC %)",
           "user_mode": "User mode",
-          "rated_power_w": "Inverter rated power (W)"
+          "rated_power_w": "Inverter rated power (W)",
+          "control_enabled": "Enable inverter control"
+        },
+        "data_description": {
+          "control_enabled": "When off, Volter computes the plan and logs every decision but writes NOTHING to the inverter. Leave it off until you have verified the mode mapping with the volter.diagnose action."
         }
       }
     },

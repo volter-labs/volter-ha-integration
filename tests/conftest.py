@@ -271,3 +271,20 @@ def fake_hass() -> FakeHass:
 def fake_entry() -> _FakeConfigEntry:
     """Świeży config entry z pustymi `options` — test dopisuje sobie mapowanie encji."""
     return _FakeConfigEntry()
+
+@pytest.fixture(autouse=True)
+def _sterowanie_wlaczone_w_testach(monkeypatch):
+    """Testy toru zapisu zakładają, że zapis do falownika NASTĘPUJE.
+
+    Produkcyjny `DEFAULT_CONTROL_ENABLED` to False — integracja nie dotyka
+    falownika, dopóki właściciel świadomie nie włączy sterowania w opcjach.
+    Gdyby testy dziedziczyły ten default, kilkadziesiąt z nich testowałoby
+    wyłącznik zamiast tego, co mają testować.
+
+    Testy SAMEGO wyłącznika (`test_wylacznik_sterowania.py`) ustawiają opcję
+    jawnie w `entry.options`, więc ta podmianka ich nie dotyczy — opcja jawna
+    ma pierwszeństwo nad defaultem.
+    """
+    from custom_components.volter import executor as _executor
+
+    monkeypatch.setattr(_executor, "DEFAULT_CONTROL_ENABLED", True)
