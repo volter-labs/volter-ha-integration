@@ -265,6 +265,11 @@ class Slot:
     #: przemalowuje tryb pasywny na import dopiero powyżej progu.
     grid_import_kwh: float | None = None
     grid_export_kwh: float | None = None
+    #: Kategoria WIZUALNA godziny liczona RAZ w chmurze z przepływów i delty SoC
+    #: (`display-kind.ts`). `plan_mode` mówi, co planer POSTANOWIŁ; `display_kind`
+    #: — co się wydarzy (np. `BATTERY_DISCHARGE_SELL` z eksportem 8 Wh to
+    #: `BATTERY_DISCHARGE_SELF`). Karta czyta to pole zamiast liczyć własne.
+    display_kind: str | None = None
 
     def covers(self, moment: datetime) -> bool:
         return self.start <= moment < self.end
@@ -313,6 +318,7 @@ class Slot:
             plan_mode=_tekst_miekko(raw, "plan_mode"),
             grid_import_kwh=_liczba_miekko(raw, "grid_import_kwh"),
             grid_export_kwh=_liczba_miekko(raw, "grid_export_kwh"),
+            display_kind=_tekst_miekko(raw, "display_kind"),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -332,6 +338,7 @@ class Slot:
             "plan_mode": self.plan_mode,
             "grid_import_kwh": self.grid_import_kwh,
             "grid_export_kwh": self.grid_export_kwh,
+            "display_kind": self.display_kind,
         }
 
 

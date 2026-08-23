@@ -95,3 +95,42 @@ def test_karta_dostaje_tryb_planu_a_nie_tylko_kierunek():
     assert s["tryb_planu"] == "SELF_CONSUME"
     assert s["import_kwh"] == 1.4
     assert s["eksport_kwh"] == 0.0
+
+
+# --- display_kind: kategoria liczona RAZ w chmurze (Faza C §8) ---------------------
+#
+# Etykieta z `plan_mode` niosła DECYZJĘ planera, nie przepływ: cztery z ośmiu godzin
+# `BATTERY_DISCHARGE_SELL` eksportowały 6–41 Wh. Chmura liczy teraz kategorię
+# z przepływów i delty SoC (której karta nie ma) i wysyła ją jako `display_kind`.
+# Karta czyta ją wprost; własna reguła zostaje tylko dla planów sprzed tego pola.
+
+
+def test_from_dict_czyta_display_kind_miekko():
+    s = Slot.from_dict({
+        "from": "2026-08-24T00:00:00+00:00", "to": "2026-08-24T01:00:00+00:00",
+        "mode": "discharge", "discharge_purpose": "sell",
+        "plan_mode": "BATTERY_DISCHARGE_SELL", "display_kind": "BATTERY_DISCHARGE_SELF",
+    })
+    assert s.plan_mode == "BATTERY_DISCHARGE_SELL"
+    assert s.display_kind == "BATTERY_DISCHARGE_SELF"
+    # Zły typ nie odrzuca planu — to pole nie steruje niczym.
+    assert Slot.from_dict({
+        "from": "2026-08-24T00:00:00+00:00", "to": "2026-08-24T01:00:00+00:00",
+        "mode": "idle", "display_kind": 7,
+    }).display_kind is None
+
+
+def test_display_kind_przezywa_store():
+    s = _slot(plan_mode="CHARGE_FROM_PV", display_kind="EXPORT_PV")
+    assert Slot.from_dict(s.to_dict()).display_kind == "EXPORT_PV"
+
+
+def test_karta_dostaje_kategorie_z_chmury():
+    plan = Schedule(slots=[_slot(
+        action=Action.DISCHARGE, discharge_purpose="sell",
+        plan_mode="BATTERY_DISCHARGE_SELL", display_kind="BATTERY_DISCHARGE_SELF",
+        grid_import_kwh=0.0, grid_export_kwh=0.008,
+    )])
+    s = plan_do_json(plan, TERAZ)[0]
+    assert s["tryb_planu"] == "BATTERY_DISCHARGE_SELL"
+    assert s["kategoria"] == "BATTERY_DISCHARGE_SELF"

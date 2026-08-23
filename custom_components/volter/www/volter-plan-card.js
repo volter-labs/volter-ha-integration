@@ -83,6 +83,10 @@ const PROG_IMPORTU_KWH = 0.1;
  *  odświeża się co pięć minut, więc dotyczy wyłącznie pierwszych chwil po
  *  aktualizacji integracji. */
 const kategoria = (s) => {
+  // Źródło prawdy: kategoria policzona RAZ w chmurze (z przepływów i delty SoC,
+  // której karta nie ma) — ta sama, którą pokazuje aplikacja. Reguły poniżej to
+  // wyłącznie fallback dla planów utrwalonych przed tym polem.
+  if (s.kategoria && KATEGORIE[s.kategoria]) return s.kategoria;
   let k = s.tryb_planu;
   if (!k || !KATEGORIE[k]) k = kategoriaZKierunku(s);
   // Ta sama reguła co w aplikacji: tryb PASYWNY, który netto importuje, kłamie
@@ -110,7 +114,7 @@ const opisKategorii = (s) => KATEGORIE[kategoria(s)] || KATEGORIE.SELF_CONSUME;
 /** Wersja karty. Widoczna w stopce, zeby dalo sie jednym spojrzeniem odroznic
  *  „kod jest zly" od „przegladarka trzyma stary plik". Test w `test_karta_frontend.py`
  *  pilnuje, zeby nie rozjechala sie z `manifest.json`. */
-const WERSJA = '2.9.0';
+const WERSJA = '2.10.0';
 
 const KOL_W = 22;   // szerokość kolumny godzinowej w jednostkach viewBox
 const WYS_SLUP = 96;

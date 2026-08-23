@@ -53,6 +53,9 @@ def plan_do_json(plan: Schedule | None, teraz: datetime | None = None) -> list[d
             "tryb_planu": s.plan_mode,
             "import_kwh": s.grid_import_kwh,
             "eksport_kwh": s.grid_export_kwh,
+            # Kategoria wizualna z chmury — ta sama, którą widzi aplikacja. Karta ma
+            # ją czytać wprost; liczy własną tylko, gdy plan jest sprzed tego pola.
+            "kategoria": s.display_kind,
             "teraz": s.covers(teraz),
         })
     return out
