@@ -38,9 +38,19 @@ def _num(state: State | None) -> float | None:
 
 
 def _age_s(state: State | None, now: datetime) -> float | None:
+    """Wiek odczytu od OSTATNIEGO RAPORTU integracji, nie od ostatniej ZMIANY.
+
+    HA odświeża `last_updated` tylko, gdy stan lub atrybuty się zmienią. Nocą
+    `pv_power` stoi na 0 godzinami, więc `last_updated` jest sprzed zmierzchu —
+    a I-9 bierze maksimum z wieków trzech encji. Przed tą poprawką każdej nocy
+    zapisy były wstrzymane („odczyt starszy niż 300s, wiek 2573s"), choć falownik
+    raportował co kilka sekund. `last_reported` (HA ≥ 2024.4) rośnie przy każdym
+    raporcie; starsze obiekty bez tego pola degradują do `last_updated`.
+    """
     if state is None:
         return None
-    return max(0.0, (now - state.last_updated).total_seconds())
+    stamp = getattr(state, "last_reported", None) or state.last_updated
+    return max(0.0, (now - stamp).total_seconds())
 
 
 def read_device_state(

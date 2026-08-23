@@ -46,10 +46,14 @@ def _make_module(name: str, attrs: dict[str, Any] | None = None) -> types.Module
 class _FakeState:
     """Odpowiednik homeassistant.core.State."""
 
-    def __init__(self, state: Any, attributes: dict | None = None, last_updated=None):
+    def __init__(
+        self, state: Any, attributes: dict | None = None, last_updated=None, last_reported=None
+    ):
         self.state = state
         self.attributes = attributes or {}
         self.last_updated = last_updated or datetime.now(timezone.utc)
+        # Jak w HA: `last_reported` nigdy nie jest starsze niż `last_updated`.
+        self.last_reported = last_reported or self.last_updated
 
 
 class _FakeStates:
@@ -64,8 +68,9 @@ class _FakeStates:
         state: Any,
         attributes: dict | None = None,
         last_updated=None,
+        last_reported=None,
     ) -> None:
-        self._data[entity_id] = _FakeState(state, attributes, last_updated)
+        self._data[entity_id] = _FakeState(state, attributes, last_updated, last_reported)
 
     def get(self, entity_id: str) -> _FakeState | None:
         return self._data.get(entity_id) if entity_id else None
