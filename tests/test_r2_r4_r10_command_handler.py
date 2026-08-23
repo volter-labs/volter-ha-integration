@@ -75,11 +75,11 @@ async def test_r2_throttled_nie_blokuje_retry():
     executor = AsyncMock()
     executor.async_apply.side_effect = [
         GuardResult(params={}, status=Status.THROTTLED),
-        GuardResult(params={"mode": "eco_charge"}, status=Status.SUCCESS, executed=["mode"]),
+        GuardResult(params={"mode": "charge_battery"}, status=Status.SUCCESS, executed=["mode"]),
     ]
     handler = _handler(executor)
 
-    payload = {"command": "SET_WORK_MODE", "request_id": "req-throttle", "params": {"mode": "eco_charge"}}
+    payload = {"command": "SET_WORK_MODE", "request_id": "req-throttle", "params": {"mode": "charge_battery"}}
     await handler._execute_command(payload)
     await handler._execute_command(payload)
 

@@ -47,7 +47,7 @@ def _hass_ze_swiezym_stanem(soc: str = "55") -> FakeHass:
     hass.states.set("sensor.pv", "1200")
     hass.states.set("sensor.grid", "-300")
     hass.states.set(
-        "select.tryb", "general", {"options": ["general", "eco_charge", "eco_discharge"]}
+        "select.tryb", "auto", {"options": ["auto", "charge_pv", "discharge_pv", "import_ac", "export_ac", "conserve", "off_grid", "battery_standby", "buy_power", "sell_power", "charge_battery", "discharge_battery"]}
     )
     hass.states.set("number.eco_soc", "20")
     return hass
@@ -153,7 +153,7 @@ async def test_r7_diagnose_ignoruje_niezmapowana_encje(fake_entry):
     hass.states.set("sensor.soc", "55")
     hass.states.set("sensor.pv", "1200")
     hass.states.set("sensor.grid", "-300")
-    hass.states.set("select.tryb", "general", {"options": ["general", "eco_charge"]})
+    hass.states.set("select.tryb", "auto", {"options": ["auto", "charge_battery"]})
     fake_entry.options = {
         "entity_soc": "sensor.soc",
         "entity_pv_power": "sensor.pv",

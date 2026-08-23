@@ -68,11 +68,11 @@ def test_r8_t3_charge_limit_przyciety_do_granicy_falownika():
 def test_r8_wartosc_ponizej_dolnej_granicy_encji_podniesiona():
     """Encje `number` mają też `min` — nastawa poniżej niego jest dla falownika
     równie nieosiągalna jak nastawa powyżej `max`."""
-    limits = InverterLimits(param_bounds={"eco_power": ParamBounds(10.0, 100.0)})
+    limits = InverterLimits(param_bounds={"charge_limit": ParamBounds(10.0, 100.0)})
 
-    result = apply_guards(sanitize_params({"eco_power": 3.0}, limits), ctx(limits))
+    result = apply_guards(sanitize_params({"charge_limit": 3.0}, limits), ctx(limits))
 
-    assert result.params["eco_power"] == 10.0
+    assert result.params["charge_limit"] == 10.0
     assert "I-3" in invariants(result)
 
 
@@ -98,7 +98,7 @@ def test_r8_granice_z_encji_maja_pierwszenstwo_nad_param_specs():
     `PARAM_SPECS` (0..200, `to_confirm=True`) i leci fail-closed przez I-10.
     Gdy znamy realną granicę z encji, zgadywanie musi ustąpić — decyduje I-3."""
     with pytest.raises(InvalidCommand) as err:
-        sanitize_params({"charge_limit": 8000.0}, InverterLimits())
+        sanitize_params({"charge_limit": 40000.0}, InverterLimits())
     assert err.value.invariant == "I-10"
 
     z_encji = InverterLimits(param_bounds={"charge_limit": ParamBounds(0.0, 5000.0)})
@@ -122,6 +122,7 @@ def test_r8_procent_poza_domena_nadal_odrzucany_przez_i10():
 OPTIONS = {
     "entity_ems_mode": "select.tryb",
     "entity_charge_limit": "number.charge_limit",
+    "entity_soc_upper": "number.soc_upper",
     "entity_discharge_limit": "number.discharge_limit",
     "entity_export_limit": "number.export_limit",
     "entity_eco_mode_power": "number.eco_power",
@@ -132,6 +133,7 @@ OPTIONS = {
 def test_r8_read_inverter_limits_czyta_min_max_z_encji_number():
     hass = FakeHass()
     hass.states.set("number.charge_limit", "20", {"min": 0, "max": 100, "step": 1})
+    hass.states.set("number.soc_upper", "80", {"min": 0, "max": 100})
     hass.states.set("number.discharge_limit", "30", {"min": 5, "max": 100})
     hass.states.set("number.export_limit", "5000", {"min": 0, "max": 6000})
     hass.states.set("number.eco_power", "50", {"min": 0, "max": 100})
@@ -142,7 +144,7 @@ def test_r8_read_inverter_limits_czyta_min_max_z_encji_number():
     assert limits.param_bounds["charge_limit"] == ParamBounds(0.0, 100.0)
     assert limits.param_bounds["discharge_limit"] == ParamBounds(5.0, 100.0)
     assert limits.param_bounds["export_limit"] == ParamBounds(0.0, 6000.0)
-    assert limits.param_bounds["eco_power"] == ParamBounds(0.0, 100.0)
+    assert limits.param_bounds["charge_limit"] == ParamBounds(0.0, 100.0)
     assert limits.param_bounds["eco_soc"] == ParamBounds(10.0, 100.0)
 
 
@@ -179,7 +181,7 @@ def test_r8_max_rowne_zero_traktowane_jako_brak_granicy():
 
     assert "charge_limit" not in limits.param_bounds
     with pytest.raises(InvalidCommand):
-        sanitize_params({"charge_limit": 8000.0}, limits)
+        sanitize_params({"charge_limit": 40000.0}, limits)
 
 
 def test_r8_brak_zmapowanej_encji_nie_daje_granicy():

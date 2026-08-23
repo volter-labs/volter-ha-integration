@@ -8,7 +8,7 @@ przy `mode='self_consume'` — bo `device-schedule.ts` świadomie NIE podnosi ty
 drenuje baterię natywnie).
 
 `Slot.from_dict` tych pól nie czytało, a `mappers.slot_to_params` mapowało
-`Action.SELF_CONSUME → 'general'` i MIMO TO zapisywało `eco_power` — czyli falownik
+`Action.SELF_CONSUME → 'auto'` i MIMO TO zapisywało `eco_power` — czyli falownik
 dostawał moc bez informacji, w którą stronę. Efektywne pokrycie po stronie urządzenia
 spadało z 34/34 do 20/34 godzin aktywnych bateryjnie.
 
@@ -197,17 +197,17 @@ def test_s2_zly_slot_z_nowym_polem_uniewaznia_caly_harmonogram():
 def test_u1_self_consume_z_discharge_purpose_idzie_jako_eco_discharge():
     """SONDA U-1 (odtworzenie): 41% slotów z mocą jedzie tym kształtem.
 
-    Przed naprawą: `mode='general'` PLUS `eco_power=32.3` — moc bez komendy kierunku.
+    Przed naprawą: `mode='auto'` PLUS `charge_limit=32.3` — moc bez komendy kierunku.
     """
     params = slot_to_params(
         _slot(discharge_purpose="self", power_w=3226.0, soc_target=20.0),
         rated_power_w=10000.0,
     )
 
-    assert params["mode"] == "eco_discharge", (
+    assert params["mode"] == "discharge_battery", (
         "kierunek z discharge_purpose musi dotrzeć do falownika — inaczej moc nie ma sensu"
     )
-    assert params["eco_power"] == pytest.approx(32.3)
+    assert params["charge_limit"] == pytest.approx(3226.0)
 
 
 def test_u1_self_consume_bez_kierunku_nie_dostaje_mocy():
@@ -218,8 +218,8 @@ def test_u1_self_consume_bez_kierunku_nie_dostaje_mocy():
     """
     params = slot_to_params(_slot(power_w=3226.0, soc_target=20.0), rated_power_w=10000.0)
 
-    assert params["mode"] == "general"
-    assert "eco_power" not in params
+    assert params["mode"] == "auto"
+    assert "charge_limit" not in params
 
 
 def test_u1_odrzucenie_mocy_jest_glosne_ale_nie_zalewa_logu(caplog, monkeypatch):
@@ -253,8 +253,11 @@ def test_u1_idle_nie_dostaje_mocy():
     """IDLE to świadoma komenda „stój" — moc bez kierunku jest tu równie bezsensowna."""
     params = slot_to_params(_slot(action=Action.IDLE, power_w=1000.0))
 
-    assert params["mode"] == "general"
-    assert "eco_power" not in params
+    # Etap 3: IDLE ma własny tryb falownika (BATTERY_STANDBY, "PBattery = 0"),
+    # a nie neutralne AUTO — "stój" i "pracuj wg licznika" to różne komendy.
+    # IDLE emituje planer przy ujemnych cenach, gdy bateria jest pełna.
+    assert params["mode"] == "battery_standby"
+    assert "charge_limit" not in params
 
 
 def test_u1_discharge_sell_zostaje_eco_discharge_z_moca():
@@ -264,8 +267,8 @@ def test_u1_discharge_sell_zostaje_eco_discharge_z_moca():
         rated_power_w=10000.0,
     )
 
-    assert params["mode"] == "eco_discharge"
-    assert params["eco_power"] == pytest.approx(50.0)
+    assert params["mode"] == "discharge_battery"
+    assert params["charge_limit"] == pytest.approx(5000.0)
 
 
 # ── Część 4: `charge_source` — pv NIE WOLNO zamienić na pobór z sieci ────────
@@ -277,9 +280,11 @@ def test_u1_charge_z_sieci_idzie_jako_eco_charge_z_moca():
         rated_power_w=10000.0,
     )
 
-    assert params["mode"] == "eco_charge"
-    assert params["eco_power"] == pytest.approx(30.0)
-    assert params["eco_soc"] == 80.0
+    assert params["mode"] == "charge_battery"
+    assert params["charge_limit"] == pytest.approx(3000.0)
+    # `soc_target` na slocie ładowania znaczy "DO ilu naładować" — czyli GÓRNY próg.
+    # Wcześniej szedł w `eco_soc`, czyli w próg DOLNY: dokładnie odwrotnie.
+    assert params["soc_upper"] == 80.0
 
 
 def test_u1_charge_z_pv_nie_wlacza_ladowania_z_sieci():
@@ -294,20 +299,24 @@ def test_u1_charge_z_pv_nie_wlacza_ladowania_z_sieci():
         rated_power_w=10000.0,
     )
 
-    assert params["mode"] != "eco_charge", "pv nie może włączyć ładowania z sieci"
-    assert params["mode"] == "general"
-    assert "eco_power" not in params, (
-        "w trybie general nastawa mocy eco nie ma adresata — byłaby mocą bez komendy"
+    # Etap 3, H-1 WYCOFANA: falownik ma osobny tryb CHARGE_PV — "When set to 0,
+    # only PV power is used". Ładowanie nadwyżką da się więc wyrazić WPROST,
+    # zamiast uciekać w tryb neutralny i tracić intencję planu.
+    assert params["mode"] != "charge_battery", "pv nie może włączyć ładowania z sieci"
+    assert params["mode"] == "charge_pv"
+    assert params["charge_limit"] == 0.0, (
+        "Xset=0 w CHARGE_PV znaczy 'nie dobieraj z sieci' — to jest ta gwarancja"
     )
-    assert params["eco_soc"] == 80.0
+    # Cel ładowania to GÓRNY próg SoC, nie dolny.
+    assert params["soc_upper"] == 80.0
 
 
 def test_u1_self_consume_z_charge_source_pv_tez_nie_laduje_z_sieci():
     """Ta sama reguła dla slotów kolapsujących do `self_consume` (nadwyżka PV)."""
     params = slot_to_params(_slot(charge_source="pv", power_w=2000.0))
 
-    assert params["mode"] == "general"
-    assert "eco_power" not in params
+    assert params["mode"] == "charge_pv"
+    assert params["charge_limit"] == 0.0
 
 
 def test_u1_charge_bez_charge_source_zachowuje_stare_zachowanie():
@@ -316,8 +325,8 @@ def test_u1_charge_bez_charge_source_zachowuje_stare_zachowanie():
         _slot(action=Action.CHARGE, power_w=3000.0), rated_power_w=10000.0
     )
 
-    assert params["mode"] == "eco_charge"
-    assert params["eco_power"] == pytest.approx(30.0)
+    assert params["mode"] == "charge_battery"
+    assert params["charge_limit"] == pytest.approx(3000.0)
 
 
 # ── Część 5: N-8 — pułap eksportu z planu na encję `number` ──────────────────
@@ -363,6 +372,8 @@ OPTIONS = {
     "entity_ems_mode": "select.tryb",
     "entity_eco_mode_soc": "number.eco_soc",
     "entity_eco_mode_power": "number.eco_power",
+    "entity_charge_limit": "number.charge_limit",
+    "entity_soc_upper": "number.soc_upper",
     "entity_export_limit": "number.export_limit",
     "entity_export_limit_switch": "switch.export_limit",
     "soc_reserve": 20.0,
@@ -378,8 +389,8 @@ def _hass(soc: str = "60") -> FakeHass:
     hass.states.set("sensor.grid", "-300")
     hass.states.set(
         "select.tryb",
-        "general",
-        {"options": ["general", "eco_charge", "eco_discharge", "backup"]},
+        "auto",
+        {"options": ["auto", "charge_battery", "discharge_battery", "backup"]},
     )
     hass.states.set("number.eco_soc", "20")
     hass.states.set("number.eco_power", "0")
@@ -460,7 +471,7 @@ async def test_u1_wymuszona_akcja_kasuje_kierunek_opisowy(fake_entry):
     })
 
     zapisy = _zapisy(hass)
-    assert zapisy.get("select.tryb") != "eco_discharge", (
+    assert zapisy.get("select.tryb") != "discharge_battery", (
         "I-1: kierunek opisowy nie może wskrzesić rozładowania zduszonego przez guard"
     )
     assert "number.eco_power" not in zapisy, (
@@ -496,7 +507,7 @@ async def test_u1_end_to_end_slot_self_consume_z_kierunkiem_pisze_moc(fake_entry
     })
 
     zapisy = _zapisy(hass)
-    assert zapisy.get("select.tryb") == "eco_discharge"
-    assert zapisy.get("number.eco_power") == pytest.approx(32.3)
+    assert zapisy.get("select.tryb") == "discharge_battery"
+    assert zapisy.get("number.charge_limit") == pytest.approx(3226.0)
     assert zapisy.get("number.export_limit") == 6000.0
     assert zapisy.get("switch.export_limit") == "turn_on"

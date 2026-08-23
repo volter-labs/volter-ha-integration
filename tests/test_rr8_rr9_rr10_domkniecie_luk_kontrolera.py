@@ -86,7 +86,7 @@ def test_rr8_ochrona_normalny_plan_bez_ingerencji_i1_nadal_nie_jest_forced():
         config=UserConfig(soc_reserve=40.0, mode="autarky"),
         action=Action.CHARGE,
     )
-    result = apply_guards({"mode": "eco_charge", "eco_soc": 80.0}, ctx)
+    result = apply_guards({"mode": "charge_battery", "eco_soc": 80.0}, ctx)
 
     assert result.status is Status.SUCCESS
     assert result.forced_params == set()
@@ -108,7 +108,7 @@ def _hass_rr8(soc: str = "30") -> FakeHass:
     hass.states.set("sensor.pv", "1200")
     hass.states.set("sensor.grid", "-300")
     hass.states.set(
-        "select.tryb", "general", {"options": ["general", "eco_charge", "eco_discharge"]}
+        "select.tryb", "auto", {"options": ["auto", "charge_pv", "discharge_pv", "import_ac", "export_ac", "conserve", "off_grid", "battery_standby", "buy_power", "sell_power", "charge_battery", "discharge_battery"]}
     )
     return hass
 
@@ -188,8 +188,8 @@ def _schedule_charge_normalny(price: float = 0.30) -> dict:
 @pytest.mark.asyncio
 async def test_rr9_zadanych_4_zapisow_zero_wykonanych_nie_moze_byc_success(fake_entry):
     """Sonda z instrukcji zadania: opcje niosą TYLKO monitoring (+ decoy
-    charge/discharge limit, których mapper i tak nigdy nie emituje) — żadna z
-    czterech encji sterujących (mode/eco_soc/eco_power/export_limit_switch)
+    discharge limit, którego mapper i tak nigdy nie emituje) — żadna z
+    czterech encji sterujących (mode/eco_soc/charge_limit/export_limit_switch)
     nie jest zmapowana. Slot `charge`, SoC wysoki (I-1 nie wchodzi), cena
     dodatnia (I-4 nie wchodzi) — żaden guard bezpieczeństwa nic nie wymusza.
     Bez naprawy: `status=success`, `executed=[]`, `errors=[]`, 4 noty — do
@@ -202,10 +202,11 @@ async def test_rr9_zadanych_4_zapisow_zero_wykonanych_nie_moze_byc_success(fake_
         "entity_soc": "sensor.soc",
         "entity_pv_power": "sensor.pv",
         "entity_grid_power": "sensor.grid",
-        "entity_charge_limit": "number.charge_limit",
         "entity_discharge_limit": "number.discharge_limit",
-        # entity_ems_mode, entity_eco_mode_soc, entity_eco_mode_power,
-        # entity_export_limit_switch świadomie NIE zmapowane
+        # entity_ems_mode, entity_eco_mode_soc, entity_charge_limit,
+        # entity_soc_upper, entity_export_limit_switch świadomie NIE zmapowane.
+        # Etap 3: `entity_charge_limit` przestał być decoy — mapper emituje na nią
+        # nastawę mocy, więc zmapowanie jej zepsułoby premisę tego testu.
     }
     executor = VolterExecutor(hass, fake_entry)
     executor._schedule = Schedule.from_dict(_schedule_charge_normalny())
@@ -240,7 +241,7 @@ async def test_rr9_ochrona_gdy_cos_sie_zapisalo_status_nie_jest_wymuszany(fake_e
     hass.states.set("sensor.pv", "1200")
     hass.states.set("sensor.grid", "-300")
     hass.states.set(
-        "select.tryb", "general", {"options": ["general", "eco_charge", "eco_discharge"]}
+        "select.tryb", "auto", {"options": ["auto", "charge_pv", "discharge_pv", "import_ac", "export_ac", "conserve", "off_grid", "battery_standby", "buy_power", "sell_power", "charge_battery", "discharge_battery"]}
     )
     hass.states.set("number.eco_soc", "20")
     fake_entry.options = {
@@ -286,8 +287,8 @@ def _hass_rr10(soc: str = "30") -> FakeHass:
     hass.states.set("sensor.grid", "-300")
     hass.states.set(
         "select.tryb",
-        "general",
-        {"options": ["general", "eco_charge", "eco_discharge", "backup"]},
+        "auto",
+        {"options": ["auto", "charge_battery", "discharge_battery", "backup"]},
     )
     hass.states.set("number.eco_soc", "20")
     hass.states.set("number.eco_power", "0")

@@ -13,7 +13,7 @@ Skutki, oba zmierzone na pełnym torze (JSON → Store → guardy → service ca
 
   * **U-6:** SoC=10%, `soc_reserve`=40%, slot `{mode:'self_consume',
     discharge_purpose:'self', power_w:1476, soc_target:10}` → na falownik szło
-    `select.tryb='eco_discharge'` i `number.eco_power=14.8`, `forced_action=None`.
+    `select.tryb='discharge_battery'` i `number.charge_limit=14.8`, `forced_action=None`.
     Rezerwa backup nie działała wcale — czyli R-1 wskrzeszone nową ścieżką.
   * **U-7:** `act` liczyło się ze `slot.action`, więc `DirectionLimiter` (I-8) nigdy
     nie widział ani `CHARGE`, ani `DISCHARGE` — 12 planów co 120 s dawało 12 przełączeń
@@ -58,6 +58,8 @@ OPTIONS = {
     "entity_ems_mode": "select.tryb",
     "entity_eco_mode_soc": "number.eco_soc",
     "entity_eco_mode_power": "number.eco_power",
+    "entity_charge_limit": "number.charge_limit",
+    "entity_soc_upper": "number.soc_upper",
     "entity_export_limit": "number.export_limit",
     "entity_export_limit_switch": "switch.export_limit",
     "soc_reserve": 20.0,
@@ -79,8 +81,10 @@ def _hass(soc: str = "60") -> FakeHass:
     hass.states.set("sensor.grid", "-300")
     hass.states.set(
         "select.tryb",
-        "general",
-        {"options": ["general", "eco_charge", "eco_discharge", "backup"]},
+        "auto",
+        {"options": ["auto", "charge_pv", "discharge_pv", "import_ac", "export_ac",
+                     "conserve", "off_grid", "battery_standby", "buy_power",
+                     "sell_power", "charge_battery", "discharge_battery"]},
     )
     hass.states.set("number.eco_soc", "20")
     hass.states.set("number.eco_power", "0")
@@ -92,7 +96,14 @@ def _zapisy(hass: FakeHass) -> dict[str, object]:
     """Ostatnia wartość, która poszła na każdą encję."""
     out: dict[str, object] = {}
     for _domain, service, data in hass.services.calls:
-        out[data.get("entity_id", "")] = data.get("option", data.get("value", service))
+        encja = data.get("entity_id", "")
+        wartosc = data.get("option", data.get("value", service))
+        # Etap 3: na encję progu idzie GŁĘBOKOŚĆ rozładowania (DoD), bo `eco_mode_soc`
+        # w GoodWe jest read-only. Odwracamy z powrotem na próg, żeby asercje mówiły
+        # o rezerwie — o tym są te testy — a nie o wielkości odwrotnej.
+        if encja == "number.eco_soc" and isinstance(wartosc, (int, float)):
+            wartosc = round(100.0 - wartosc, 1)
+        out[encja] = wartosc
     return out
 
 
@@ -131,8 +142,10 @@ def _plan(schedule_id: str, teraz: datetime, **pola) -> dict:
         (_slot(action=Action.CHARGE, charge_source="grid"), Action.CHARGE),
         (_slot(charge_source="grid"), Action.CHARGE),
         # `pv` to świadomy BRAK kierunku (hipoteza H-1: eco_charge dobrałby prąd z sieci).
-        (_slot(action=Action.CHARGE, charge_source="pv"), None),
-        (_slot(charge_source="pv"), None),
+        # H-1 WYCOFANA (Etap 3): falownik ma tryb CHARGE_PV z Xset=0, więc
+        # ładowanie nadwyżką jest kierunkiem jak każdy inny.
+        (_slot(action=Action.CHARGE, charge_source="pv"), Action.CHARGE),
+        (_slot(charge_source="pv"), Action.CHARGE),
         (_slot(power_w=2500.0), None),
         (_slot(action=Action.IDLE), None),
     ],
@@ -145,8 +158,8 @@ def test_kierunek_slotu_jest_funkcja_czysta_i_pokrywa_kazdy_ksztalt(slot, oczeki
 def test_akcja_efektywna_nigdy_nie_zwraca_none():
     """`GuardContext.action` musi dostać akcję, a nie „może być None" (I-1/I-2/I-8)."""
     assert akcja_efektywna(_slot(discharge_purpose="self")) is Action.DISCHARGE
-    assert akcja_efektywna(_slot(charge_source="pv")) is Action.SELF_CONSUME
-    assert akcja_efektywna(_slot(action=Action.CHARGE, charge_source="pv")) is Action.SELF_CONSUME
+    assert akcja_efektywna(_slot(charge_source="pv")) is Action.CHARGE
+    assert akcja_efektywna(_slot(action=Action.CHARGE, charge_source="pv")) is Action.CHARGE
     assert akcja_efektywna(_slot(action=Action.IDLE)) is Action.IDLE
 
 
@@ -181,7 +194,14 @@ def test_tryb_falownika_jest_zawsze_tlumaczeniem_akcji_efektywnej(slot):
     """
     params = mappers_module.slot_to_params(slot)
 
-    assert params["mode"] == mappers_module.GOODWE_MODE_MAP[akcja_efektywna(slot)]
+    oczekiwany = mappers_module.GOODWE_MODE_MAP[akcja_efektywna(slot)]
+    if slot.charge_source == "pv" and akcja_efektywna(slot) is Action.CHARGE:
+        # Jedyny udokumentowany wyjątek: ładowanie WYŁĄCZNIE z nadwyżki ma osobny
+        # tryb falownika (CHARGE_PV, "Xset=0 -> only PV power is used"). Kierunek,
+        # który widzą guardy, jest ten sam — CHARGE — więc inwariant U-6 stoi:
+        # tryb nadal jest tłumaczeniem TEJ SAMEJ intencji, tylko dokładniejszym.
+        oczekiwany = mappers_module.GOODWE_TRYB_LADOWANIE_PV
+    assert params["mode"] == oczekiwany
 
 
 # ── Część 2: U-6 — rezerwa blokuje rozładowanie dla KAŻDEGO kształtu ─────────
@@ -202,7 +222,7 @@ async def test_r1_regresja_discharge_sell_ponizej_rezerwy_zablokowany(fake_entry
 
     zapisy = _zapisy(hass)
     assert wynik.forced_action is AkcjaHA.SELF_CONSUME
-    assert zapisy.get("select.tryb") != "eco_discharge"
+    assert zapisy.get("select.tryb") != "discharge_battery"
     assert "number.eco_power" not in zapisy
     assert zapisy.get("number.eco_soc") == 40.0
 
@@ -211,7 +231,7 @@ async def test_r1_regresja_discharge_sell_ponizej_rezerwy_zablokowany(fake_entry
 async def test_u6_self_consume_z_discharge_purpose_ponizej_rezerwy_zablokowany(fake_entry):
     """SONDA U-6 (odtworzenie 1:1): kształt 41% slotów z mocą omijał I-1.
 
-    Zmierzone PRZED naprawą: `select.tryb='eco_discharge'`, `number.eco_power=14.8`,
+    Zmierzone PRZED naprawą: `select.tryb='discharge_battery'`, `number.charge_limit=14.8`,
     `forced_action=None`, brak noty I-1. Rezerwa backup nie zadziałała.
     """
     hass = _hass(soc="10")
@@ -225,7 +245,7 @@ async def test_u6_self_consume_z_discharge_purpose_ponizej_rezerwy_zablokowany(f
     )
 
     zapisy = _zapisy(hass)
-    assert zapisy.get("select.tryb") != "eco_discharge", (
+    assert zapisy.get("select.tryb") != "discharge_battery", (
         "U-6: kierunek opisowy musi być widziany przez I-1 PRZED zapisem, nie po nim"
     )
     assert "number.eco_power" not in zapisy, (
@@ -257,7 +277,10 @@ async def test_u6_ladowanie_z_pv_ponizej_rezerwy_jest_DOZWOLONE(fake_entry):
 
     zapisy = _zapisy(hass)
     assert wynik.forced_action is None, "ładowania nie wolno wymuszać na self_consume"
-    assert zapisy.get("select.tryb") == "general"
+    # H-1 wycofana: ładowanie nadwyżką ma własny tryb, a `Xset=0` gwarantuje,
+    # że falownik nie dobierze brakującej mocy z sieci.
+    assert zapisy.get("select.tryb") == "charge_pv"
+    assert zapisy.get("number.charge_limit") == 0.0
     assert zapisy.get("number.eco_soc") == 40.0
 
 
@@ -276,8 +299,10 @@ async def test_u6_ladowanie_z_sieci_ponizej_rezerwy_dochodzi_z_moca(fake_entry):
 
     zapisy = _zapisy(hass)
     assert wynik.forced_action is None
-    assert zapisy.get("select.tryb") == "eco_charge"
-    assert zapisy.get("number.eco_power") == pytest.approx(14.8)
+    assert zapisy.get("select.tryb") == "charge_battery"
+    # Etap 3: moc idzie w WATACH na `ems_power_limit`, a nie w procentach na
+    # `eco_mode_power` — ta encja jest w integracji mletenay tylko do odczytu.
+    assert zapisy.get("number.charge_limit") == pytest.approx(1476.0)
 
 
 @pytest.mark.asyncio
@@ -297,7 +322,7 @@ async def test_r1_regresja_przemapowanie_dokladnie_raz(fake_entry):
               power_w=1476.0, soc_target=10.0)
     )
 
-    assert _tryby(hass) == ["general"]
+    assert _tryby(hass) == ["auto"]
     assert wynik.status is StatusHA.PARTIAL, (
         "plan NIE został wykonany zgodnie z intencją — chmura musi to widzieć"
     )

@@ -80,7 +80,7 @@ def _hass() -> FakeHass:
     hass.states.set("sensor.soc", "55")
     hass.states.set("sensor.pv", "1000")
     hass.states.set("sensor.grid", "-200")
-    hass.states.set("select.tryb", "general", {"options": ["general", "eco_charge"]})
+    hass.states.set("select.tryb", "auto", {"options": ["auto", "charge_battery"]})
     hass.states.set("number.cl", "20", {"min": 0, "max": 100})
     hass.states.set("number.eco_soc", "20", {"min": 0, "max": 100})
     return hass
@@ -270,7 +270,10 @@ def test_rr2_bez_cache_niedostepna_encja_nadal_nie_daje_granicy():
 
     assert "charge_limit" not in limits.param_bounds
     with pytest.raises(InvalidCommand):
-        sanitize_params({"charge_limit": 3000.0}, limits)
+        # 40 kW — poza `PARAM_SPECS` (0..30000 W). Wartość dobrana tak, żeby test
+        # mierzył FAIL-CLOSED z `PARAM_SPECS`, a nie przypadkową ciasnotę zakresu:
+        # 3000 W mieści się dziś w specyfikacji, bo encja `ems_power_limit` liczy w watach.
+        sanitize_params({"charge_limit": 40000.0}, limits)
 
 
 def test_rr2_cache_granic_wygasa_po_ttl():

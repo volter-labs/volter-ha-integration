@@ -23,8 +23,8 @@ def _hass_ze_swiezym_stanem() -> FakeHass:
     hass.states.set("sensor.soc", "55")
     hass.states.set("sensor.pv", "1200")
     hass.states.set("sensor.grid", "-300")
-    hass.states.set("select.tryb", "general",
-                    {"options": ["general", "eco_charge", "eco_discharge"]})
+    hass.states.set("select.tryb", "auto",
+                    {"options": ["auto", "charge_pv", "discharge_pv", "import_ac", "export_ac", "conserve", "off_grid", "battery_standby", "buy_power", "sell_power", "charge_battery", "discharge_battery"]})
     hass.states.set("number.eco_soc", "20")
     return hass
 

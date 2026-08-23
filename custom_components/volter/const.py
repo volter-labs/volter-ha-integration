@@ -34,6 +34,10 @@ OPT_ENTITY_EXPORT_LIMIT = "entity_export_limit"
 OPT_ENTITY_EXPORT_LIMIT_SWITCH = "entity_export_limit_switch"
 OPT_ENTITY_ECO_MODE_POWER = "entity_eco_mode_power"
 OPT_ENTITY_ECO_MODE_SOC = "entity_eco_mode_soc"
+#: Gorny prog SoC (do ilu ladowac). GoodWe: `number.goodwe_soc_upper_limit`, 0-100%.
+#: Osobna encja, bo `eco_mode_soc` jest w integracji mletenay TYLKO DO ODCZYTU
+#: (`setter=None`) — zapis tam nigdy by nie doszedl do falownika.
+OPT_ENTITY_SOC_UPPER = "entity_soc_upper"
 
 # ── Telemetry ───────────────────────────────────────────────────────────────
 TELEMETRY_BATCH_INTERVAL = 60  # sekund — zapis do telemetry_raw
@@ -49,12 +53,37 @@ REALTIME_RECONNECT_MAX = 120  # max sekundy między próbami
 # command param -> (option_key, ha_domain, ha_service, data_key)
 COMMAND_ENTITY_MAP = {
     "mode": (OPT_ENTITY_EMS_MODE, "select", "select_option", "option"),
+    #: Nastawa mocy `Xset` trybow EMS 11/12, w WATACH po stronie baterii.
+    #: Nazwa parametru jest historyczna (kiedys limit pradu ladowania); encja to
+    #: `number.goodwe_ems_power_limit`, ktora obsluguje OBA kierunki.
     "charge_limit": (OPT_ENTITY_CHARGE_LIMIT, "number", "set_value", "value"),
+    #: Glebokosc rozladowania (DoD, %) podana WPROST — sciezka dla starego kontraktu.
     "discharge_limit": (OPT_ENTITY_DISCHARGE_LIMIT, "number", "set_value", "value"),
     "export_limit": (OPT_ENTITY_EXPORT_LIMIT, "number", "set_value", "value"),
-    "eco_power": (OPT_ENTITY_ECO_MODE_POWER, "number", "set_value", "value"),
+    #: Dolny prog SoC (%). UWAGA: `OPT_ENTITY_ECO_MODE_SOC` to od tej wersji
+    #: "encja sterujaca dolnym progiem SoC", a nie doslownie `eco_mode_soc` —
+    #: tamta jest w integracji mletenay TYLKO DO ODCZYTU (`setter=None`).
+    #: Na GoodWe wskazuje sie tu encje GLEBOKOSCI ROZLADOWANIA (DoD), a odwrocenie
+    #: wartosci robi PARAM_VALUE_TRANSFORM przy zapisie — dzieki temu guardy, plan
+    #: i testy operuja progiem, a nie glebokoscia.
     "eco_soc": (OPT_ENTITY_ECO_MODE_SOC, "number", "set_value", "value"),
+    #: Gorny prog SoC (%) — do ilu ladowac.
+    "soc_upper": (OPT_ENTITY_SOC_UPPER, "number", "set_value", "value"),
 }
+
+#: Przeliczenie wartosci parametru na wartosc encji falownika.
+#:
+#: `eco_soc` to DOLNY PROG SoC (np. 10% = "nie schodz ponizej 10%"), a GoodWe
+#: przyjmuje GLEBOKOSC rozladowania (DoD 90% = to samo). Kierunek tego przeliczenia
+#: jest krytyczny: pomylka zamienia "nie schodz ponizej 10%" w "zuzyj najwyzej 10%".
+#: Zakres encji to 0..99, wiec prog 0% jest nieosiagalny — i dobrze.
+PARAM_VALUE_TRANSFORM = {
+    "eco_soc": lambda prog: round(100.0 - float(prog), 1),
+}
+
+#: Parametry, ktorych encje w integracji mletenay sa TYLKO DO ODCZYTU (`setter=None`).
+#: Zapis by sie nie powiodl, wiec nie emitujemy ich w ogole — patrz mappers.py.
+PARAMETRY_TYLKO_ODCZYT = frozenset({"eco_power"})
 
 # Mapowanie encji monitoringu na klucze telemetrii
 MONITORING_ENTITY_MAP = {

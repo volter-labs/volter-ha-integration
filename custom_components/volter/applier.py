@@ -13,7 +13,7 @@ from typing import Any
 
 from homeassistant.core import HomeAssistant
 
-from .const import COMMAND_ENTITY_MAP, OPT_ENTITY_EXPORT_LIMIT_SWITCH, WRITE_RETRIES
+from .const import COMMAND_ENTITY_MAP, PARAM_VALUE_TRANSFORM, OPT_ENTITY_EXPORT_LIMIT_SWITCH, WRITE_RETRIES
 from .guards import WritePermit, ordered
 
 _LOGGER = logging.getLogger(__name__)
@@ -204,12 +204,20 @@ async def apply_params(
                 )
             continue
 
+        # Przeliczenie na wielkość, którą rozumie falownik (dziś: próg SoC -> DoD).
+        # Robimy je TU, na samej granicy zapisu, żeby guardy, plan i testy operowały
+        # jedną czytelną wielkością, a odwrócenie żyło w dokładnie jednym miejscu.
+        przelicz = PARAM_VALUE_TRANSFORM.get(param_key)
+        wartosc = przelicz(value) if przelicz else value
         ok, err = await _call(
-            hass, ha_domain, ha_service, {"entity_id": entity_id, data_key: value}, permit
+            hass, ha_domain, ha_service, {"entity_id": entity_id, data_key: wartosc}, permit
         )
         if ok:
             executed.append(param_key)
-            _LOGGER.info("Zapisano %s: %s = %s", param_key, entity_id, value)
+            _LOGGER.info(
+                "Zapisano %s: %s = %s%s", param_key, entity_id, wartosc,
+                f" (próg SoC {value}%)" if przelicz else "",
+            )
         else:
             errors.append({"entity": param_key, "error": err})
             _LOGGER.error("Błąd zapisu %s na %s: %s", param_key, entity_id, err)

@@ -42,12 +42,35 @@ _LOGGER = logging.getLogger(__name__)
 
 #: Nazwy opcji encji select trybu pracy. TODO(Etap-1): potwierdzić dokładne stringi
 #: — integracja mletenay może używać innych etykiet lub tłumaczeń.
+#: Tryby EMS falownika GoodWe, potwierdzone w `goodwe/inverter.py::EMSMode`
+#: (biblioteka, z której korzysta integracja mletenay) — nie zgadywane.
+#:
+#:   AUTO (1)              "Self-use. PBattery = PInv - Pmeter - Ppv"
+#:                         bateria sterowana licznikiem = czysta autokonsumpcja
+#:   CHARGE_BATTERY (11)   "Xset is the charging power of the battery. PV preferred;
+#:                          when PV insufficient, it will buy power from the grid"
+#:   DISCHARGE_BATTERY (12) "Xset is the discharge power of the battery,
+#:                          battery discharge has priority"
+#:   BATTERY_STANDBY (8)   "PBattery = 0. The battery does not charge and discharge"
+#:
+#: `Xset` to nastawa `ems_power_limit` (W) — i jest to moc PO STRONIE BATERII,
+#: dokładnie ta wielkość, którą niesie `slot.power_w` (z `soc_profile.delta_kwh`).
+#: Dlatego nie ma tu żadnego przeliczania na procenty mocy znamionowej.
+#:
+#: `discharge_purpose` (self vs sell) NIE potrzebuje osobnego trybu: oba to
+#: DISCHARGE_BATTERY, a różnicę robi limit eksportu, który kontrakt już niesie.
 GOODWE_MODE_MAP: dict[Action, str] = {
-    Action.CHARGE: "eco_charge",
-    Action.DISCHARGE: "eco_discharge",
-    Action.SELF_CONSUME: "general",
-    Action.IDLE: "general",
+    Action.CHARGE: "charge_battery",
+    Action.DISCHARGE: "discharge_battery",
+    Action.SELF_CONSUME: "auto",
+    Action.IDLE: "battery_standby",
 }
+
+#: Ładowanie WYŁĄCZNIE z PV. CHARGE_PV (2): "Xmax is to allow the power to be taken
+#: from the grid... When set to 0, only PV power is used". Czyli tryb + moc 0.
+#: Świadomie nie CONSERVE (6), mimo że też ładuje tylko z PV — CONSERVE blokuje
+#: rozładowanie poza pracą wyspową, co jest skutkiem ubocznym, którego plan nie zamawiał.
+GOODWE_TRYB_LADOWANIE_PV = "charge_pv"
 
 #: RR-10: tożsamość ostatniego odrzucenia mocy (U-1), żeby ostrzeżenie padło RAZ na
 #: slot, a nie na każdy tick pętli wykonawczej. Slot obowiązuje godzinę, pętla chodzi
@@ -115,8 +138,16 @@ def _moc_dla_kierunku(
             _ostatnie_ostrzezenie_o_mocy = klucz
             _LOGGER.warning(komunikat, *argumenty)
         return None
-    percent = max(0.0, min(100.0, (float(slot.power_w) / rated_power_w) * 100.0))
-    return round(percent, 1)
+    # `Xset` jest w watach po stronie baterii — tej samej, w której planer liczy
+    # `delta_kwh`. Żadnego przeliczania na procenty: encja `ems_power_limit`
+    # przyjmuje waty, a `eco_mode_power` (procenty) jest w integracji mletenay
+    # TYLKO DO ODCZYTU, więc nigdy nie była właściwym celem.
+    watty = max(0.0, float(slot.power_w))
+    if rated_power_w > 0:
+        # Nie zamawiaj więcej, niż falownik potrafi. Twardą granicę i tak nałoży
+        # I-3 z atrybutów encji (R-8); to jest tania sanityzacja przed guardami.
+        watty = min(watty, float(rated_power_w))
+    return round(watty, 0)
 
 
 def slot_to_params(
@@ -138,16 +169,49 @@ def slot_to_params(
     # miały jak zobaczyć kierunku opisowego, bo powstawał on dopiero po nich.
     kierunek = kierunek_slotu(slot)
     tryb = _tryb_falownika(slot, modes)
+    # Ładowanie wyłącznie z PV ma własny tryb: CHARGE_BATTERY dobrałby brakującą
+    # część z sieci, czego plan przy `charge_source='pv'` wprost nie chce.
+    tylko_pv = kierunek is Action.CHARGE and slot.charge_source == "pv"
+    if tylko_pv:
+        tryb = GOODWE_TRYB_LADOWANIE_PV
     params: dict[str, Any] = {"mode": tryb}
 
     if slot.soc_target is not None:
-        # `eco_soc` zapisujemy niezależnie od trybu: to nastawa PAMIĘTANA przez falownik,
-        # a I-1 (rezerwa) wymaga, żeby bezpieczna wartość FAKTYCZNIE tam trafiła (RR-8).
-        params["eco_soc"] = float(slot.soc_target)
+        # `soc_target` znaczy co innego w zależności od kierunku:
+        #   ładowanie   -> DO ilu naładować  = GÓRNY próg (`soc_upper`)
+        #   pozostałe   -> DO ilu rozładować = DOLNY próg (`eco_soc` -> DoD)
+        # Wcześniej szło zawsze w `eco_soc`, więc cel ładowania trafiał na próg
+        # dolny — czyli dokładnie odwrotnie, niż chciał plan.
+        if kierunek is Action.CHARGE:
+            params["soc_upper"] = float(slot.soc_target)
+        else:
+            # Zapisujemy niezależnie od trybu: to nastawa PAMIĘTANA przez falownik,
+            # a I-1 (rezerwa) wymaga, żeby bezpieczna wartość FAKTYCZNIE tam trafiła (RR-8).
+            params["eco_soc"] = float(slot.soc_target)
 
-    moc = _moc_dla_kierunku(slot, tryb, kierunek, rated_power_w)
-    if moc is not None:
-        params["eco_power"] = moc
+    if tylko_pv:
+        # CHARGE_PV: `Xset` to moc, jaką wolno DOBRAĆ Z SIECI, a nie moc ładowania.
+        # Zero znaczy "tylko PV" — jedyna wartość, która realizuje intencję planu.
+        # Mocy z planu świadomie nie przepisujemy: nadwyżki PV nie da się wymusić.
+        params["charge_limit"] = 0.0
+    else:
+        moc = _moc_dla_kierunku(slot, tryb, kierunek, rated_power_w)
+        if moc is not None:
+            params["charge_limit"] = moc
+        elif kierunek is Action.CHARGE:
+            # PUŁAPKA: `charge_battery` bez świeżego `Xset` pracowałby na wartości
+            # z POPRZEDNIEGO slotu — a po slocie PV jest tam 0, czyli "ładuj 0 W".
+            # Throttle I-6 nie pomoże, bo pomija wartość niezmienioną. Skoro planer
+            # nie podał mocy (staging nie zapisuje jeszcze `delta_kwh`), nie zgadujemy
+            # jej: wymuszone ładowanie z sieci nieznaną mocą kosztuje realne pieniądze.
+            # Neutralny tryb nic nie kosztuje, a plan i tak wróci z mocą po porcie.
+            _LOGGER.warning(
+                "Slot %s–%s to ładowanie bez znanej mocy — zamiast %r wysyłam tryb "
+                "neutralny %r, żeby nie ładować z sieci nastawą z poprzedniego slotu",
+                slot.start.isoformat(), slot.end.isoformat(), tryb,
+                modes[Action.SELF_CONSUME],
+            )
+            params["mode"] = modes[Action.SELF_CONSUME]
 
     # Eksport (N-8 / D-5 / A-4):
     #   * brak zgody w planie -> twardy limit 0 z włączonym ogranicznikiem;

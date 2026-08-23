@@ -45,12 +45,18 @@
         "description": "Map inverter control entities to enable remote commands from the Volter app. All fields are optional.",
         "data": {
           "entity_ems_mode": "EMS / Operation Mode (select)",
-          "entity_charge_limit": "Battery Charge Limit",
+          "entity_charge_limit": "Battery power setpoint (W) — map EMS power limit",
           "entity_discharge_limit": "Battery Discharge Depth (DOD)",
           "entity_export_limit": "Grid Export Limit (W)",
           "entity_export_limit_switch": "Export Limit Switch (on/off)",
           "entity_eco_mode_power": "Eco Mode Power (%)",
-          "entity_eco_mode_soc": "Eco Mode SOC Target (%)"
+          "entity_eco_mode_soc": "Lower SoC threshold — map the Depth of Discharge entity",
+          "entity_soc_upper": "Upper SoC limit (charge target)"
+        },
+        "data_description": {
+          "entity_eco_mode_soc": "On GoodWe point this at \"Depth of Discharge (On-Grid)\". The eco mode SoC entity is read-only, so writes there never reach the inverter. Volter converts the threshold to depth automatically.",
+          "entity_charge_limit": "On GoodWe point this at \"EMS power limit\" (watts). It carries BOTH charge and discharge power.",
+          "entity_soc_upper": "On GoodWe point this at \"SoC upper limit\". Without it the planner cannot say how far to charge."
         }
       },
       "strategy": {

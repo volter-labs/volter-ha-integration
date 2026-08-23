@@ -43,6 +43,7 @@ from .const import (
     OPT_ENTITY_PV_POWER,
     OPT_CONTROL_ENABLED,
     OPT_ENTITY_SOC,
+    OPT_ENTITY_SOC_UPPER,
     OPT_RATED_POWER_W,
     OPT_SOC_RESERVE,
     OPT_USER_MODE,
@@ -287,6 +288,12 @@ class VolterOptionsFlow(OptionsFlowWithConfigEntry):
                     vol.Optional(
                         OPT_ENTITY_ECO_MODE_POWER,
                         default=self._options.get(OPT_ENTITY_ECO_MODE_POWER, ""),
+                    ): selector.EntitySelector(
+                        selector.EntitySelectorConfig(domain="number")
+                    ),
+                    vol.Optional(
+                        OPT_ENTITY_SOC_UPPER,
+                        default=self._options.get(OPT_ENTITY_SOC_UPPER, ""),
                     ): selector.EntitySelector(
                         selector.EntitySelectorConfig(domain="number")
                     ),

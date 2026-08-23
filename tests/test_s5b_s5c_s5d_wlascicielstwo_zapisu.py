@@ -46,6 +46,8 @@ OPTIONS = {
     "entity_ems_mode": "select.tryb",
     "entity_eco_mode_soc": "number.eco_soc",
     "entity_eco_mode_power": "number.eco_power",
+    "entity_charge_limit": "number.charge_limit",
+    "entity_soc_upper": "number.soc_upper",
     "entity_export_limit_switch": "switch.export_limit",
     "soc_reserve": 20.0,
     "user_mode": "autarky",
@@ -60,8 +62,8 @@ def _hass(soc: str = "60") -> FakeHass:
     hass.states.set("sensor.grid", "-300")
     hass.states.set(
         "select.tryb",
-        "general",
-        {"options": ["general", "eco_charge", "eco_discharge", "backup"]},
+        "auto",
+        {"options": ["auto", "charge_battery", "discharge_battery", "backup"]},
     )
     hass.states.set("number.eco_soc", "20")
     hass.states.set("number.eco_power", "0")
@@ -186,7 +188,7 @@ async def test_s5b_przerwana_sekwencja_zostawia_slad_o_zlamanym_param_order(
     assert ostatni, "S-5b: przerwana sekwencja nie zostawiła żadnego śladu"
     assert ostatni.get("status") != "success", f"przerwana sekwencja to nie sukces: {ostatni}"
     pominiete = {e.get("entity") for e in ostatni.get("errors", [])}
-    assert {"eco_soc", "eco_power", "export_limit_enabled"} <= pominiete, (
+    assert {"soc_upper", "charge_limit", "export_limit_enabled"} <= pominiete, (
         f"ślad musi wymieniać nastawy, które NIE poszły do falownika: {ostatni}"
     )
     assert any(n.get("invariant") == "S-5b" for n in ostatni.get("notes", [])), (
@@ -307,7 +309,8 @@ async def test_s5c_nowy_przebieg_nie_przeplata_sie_z_porzucona_sekwencja(
     assert _encje(hass) == ["select.tryb", "number.eco_soc"], (
         f"S-5c: porzucona sekwencja przeplotła się z nowym przebiegiem: {hass.services.calls}"
     )
-    assert hass.services.calls[-1][2]["value"] == 55.0, (
+    # Na encję idzie GŁĘBOKOŚĆ (DoD), więc próg 55% to wartość 45.
+    assert hass.services.calls[-1][2]["value"] == 45.0, (
         "ostatnia wartość na falowniku musi pochodzić od przebiegu, który commitował"
     )
 
@@ -339,13 +342,13 @@ async def test_s5b_applier_przerywa_na_granicy_nastawy_i_rozlicza_pominiete():
     executed, errors, _notes = await apply_params(
         hass,
         dict(OPTIONS),
-        {"mode": "eco_charge", "eco_soc": 80.0, "eco_power": 50.0},
+        {"mode": "charge_battery", "eco_soc": 80.0, "charge_limit": 50.0},
         forced_params=set(),
         permit=permit,
     )
 
     assert executed == ["mode"], "przerwanie musi nastąpić na granicy, nie w środku nastawy"
-    assert {e["entity"] for e in errors} == {"eco_soc", "eco_power"}
+    assert {e["entity"] for e in errors} == {"eco_soc", "charge_limit"}
     assert all("PARAM_ORDER" in e["error"] for e in errors), (
         f"ślad musi nazywać skutek po imieniu: {errors}"
     )
@@ -380,7 +383,7 @@ async def test_s5b_ponowienie_zapisu_nie_przezywa_odebrania_przepustki(monkeypat
     monkeypatch.setattr(applier_module.asyncio, "sleep", _spij)
 
     executed, errors, _notes = await apply_params(
-        hass, dict(OPTIONS), {"mode": "eco_charge"}, forced_params=set(), permit=permit,
+        hass, dict(OPTIONS), {"mode": "charge_battery"}, forced_params=set(), permit=permit,
     )
 
     assert executed == []

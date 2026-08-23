@@ -40,6 +40,8 @@ OPTIONS = {
     "entity_ems_mode": "select.tryb",
     "entity_eco_mode_soc": "number.eco_soc",
     "entity_eco_mode_power": "number.eco_power",
+    "entity_charge_limit": "number.charge_limit",
+    "entity_soc_upper": "number.soc_upper",
     "entity_discharge_limit": "number.discharge_limit",
     # R-3: `slot_to_params` zawsze emituje `export_limit_enabled` (True albo False) —
     # bez zmapowanej encji przełącznika ten parametr teraz poprawnie ląduje w errors,
@@ -59,8 +61,8 @@ def _hass(soc: str = "30") -> FakeHass:
     hass.states.set("sensor.grid", "-300")
     hass.states.set(
         "select.tryb",
-        "general",
-        {"options": ["general", "eco_charge", "eco_discharge", "backup"]},
+        "auto",
+        {"options": ["auto", "charge_battery", "discharge_battery", "backup"]},
     )
     hass.states.set("number.eco_soc", "20")
     hass.states.set("number.eco_power", "0")
@@ -104,7 +106,7 @@ async def test_r1_slot_rozladowania_ponizej_rezerwy_nie_trafia_do_falownika(fake
 
     `soc_reserve=40`, `user_mode=autarky`, `SoC=30%`, slot
     `{mode: discharge, soc_target: 50, power_w: 5000}`. Przed naprawą kończyło się
-    to `select.select_option(select.tryb, 'eco_discharge')` ze statusem `success`
+    to `select.select_option(select.tryb, 'discharge_battery')` ze statusem `success`
     i zerem not I-1 — rezerwa backup użytkownika była fikcją.
     """
     hass = _hass(soc="30")
@@ -113,13 +115,13 @@ async def test_r1_slot_rozladowania_ponizej_rezerwy_nie_trafia_do_falownika(fake
 
     result = await executor.async_set_schedule(_schedule("discharge", soc_target=50.0))
 
-    assert "eco_discharge" not in _tryby(hass), (
+    assert "discharge_battery" not in _tryby(hass), (
         "I-1: przy SoC 30% i rezerwie 40% tryb rozładowania NIE może pójść do falownika"
     )
     assert any(n.invariant == "I-1" for n in result.notes), "brak noty I-1 w wyniku"
     assert result.status is Status.PARTIAL
     # Falownik nie może zostać w trybie z poprzedniego slotu — musi dostać tryb bezpieczny.
-    assert _tryby(hass) == ["general"]
+    assert _tryby(hass) == ["auto"]
 
 
 @pytest.mark.asyncio
@@ -131,9 +133,18 @@ async def test_r1_slot_ladowania_ponizej_rezerwy_jest_dozwolony(fake_entry):
 
     result = await executor.async_set_schedule(_schedule("charge", soc_target=80.0))
 
-    assert _tryby(hass) == ["eco_charge"], "ładowanie poniżej rezerwy musi być dozwolone"
-    assert result.status is Status.SUCCESS
-    assert result.params["eco_soc"] == 80.0
+    assert _tryby(hass) == ["charge_battery"], "ładowanie poniżej rezerwy musi być dozwolone"
+    # Etap 3: PARTIAL, nie SUCCESS — i to jest POPRAWA, nie regresja. `soc_target`
+    # slotu ładowania idzie teraz w GÓRNY próg (`soc_upper`), więc dolny próg jest
+    # pusty i I-1 dopisuje tam rezerwę użytkownika. Wcześniej cel ładowania lądował
+    # w progu DOLNYM i przypadkiem go „spełniał" — czyli rezerwa nie była
+    # egzekwowana, tylko nadpisana wartością z planu.
+    assert result.status is Status.PARTIAL
+    assert any(n.invariant == "I-1" for n in result.notes)
+    # Cel ładowania (80%) trafia w GÓRNY próg, a w dolnym siedzi rezerwa
+    # użytkownika (40%) dopisana przez I-1 — dwie różne wielkości, dwie encje.
+    assert result.params["soc_upper"] == 80.0
+    assert result.params["eco_soc"] == 40.0
 
 
 @pytest.mark.asyncio
@@ -193,7 +204,7 @@ async def test_r1_komenda_z_chmury_nie_wpycha_trybu_rozladowania_ponizej_rezerwy
     executor = VolterExecutor(hass, fake_entry)
 
     result = await executor.async_apply(
-        {"mode": "eco_discharge", "eco_soc": 10.0},
+        {"mode": "discharge_battery", "eco_soc": 10.0},
         action=HaAction.DISCHARGE,
         source="cloud",
     )
@@ -234,7 +245,7 @@ def _ctx(action: Action | None, *, soc: float, reserve: float) -> GuardContext:
 def test_r1_i1_widzi_intencje_rozladowania_z_planu():
     """Parametry z `slot_to_params` nie mają `discharge_limit` — intencja jest w `action`."""
     result = apply_guards(
-        {"mode": "eco_discharge", "eco_soc": 50.0, "eco_power": 50.0},
+        {"mode": "discharge_battery", "eco_soc": 50.0, "charge_limit": 50.0},
         _ctx(Action.DISCHARGE, soc=30.0, reserve=40.0),
     )
 
@@ -248,19 +259,19 @@ def test_r1_i1_widzi_intencje_rozladowania_z_planu():
 
 def test_r1_i1_nie_blokuje_ladowania_z_planu():
     result = apply_guards(
-        {"mode": "eco_charge", "eco_soc": 80.0},
+        {"mode": "charge_battery", "eco_soc": 80.0},
         _ctx(Action.CHARGE, soc=30.0, reserve=40.0),
     )
 
     assert result.status is PureStatus.SUCCESS
     assert result.forced_action is None
-    assert result.params["mode"] == "eco_charge"
+    assert result.params["mode"] == "charge_battery"
 
 
 def test_r1_i2_sprzeczna_intencja_liczona_z_akcji_planu():
     """I-2 też musi pracować na intencji: plan mówi „ładuj", a parametry żądają rozładowania."""
     result = apply_guards(
-        {"mode": "eco_charge", "discharge_limit": 30.0},
+        {"mode": "charge_battery", "discharge_limit": 30.0},
         _ctx(Action.CHARGE, soc=60.0, reserve=20.0),
     )
 

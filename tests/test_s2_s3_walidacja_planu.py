@@ -39,6 +39,8 @@ OPTIONS = {
     "entity_ems_mode": "select.tryb",
     "entity_eco_mode_soc": "number.eco_soc",
     "entity_eco_mode_power": "number.eco_power",
+    "entity_charge_limit": "number.charge_limit",
+    "entity_soc_upper": "number.soc_upper",
     "entity_discharge_limit": "number.discharge_limit",
     "entity_export_limit_switch": "switch.export_limit",
     "soc_reserve": 20.0,
@@ -53,8 +55,8 @@ def _hass(soc: str = "60") -> FakeHass:
     hass.states.set("sensor.grid", "-300")
     hass.states.set(
         "select.tryb",
-        "general",
-        {"options": ["general", "eco_charge", "eco_discharge", "backup"]},
+        "auto",
+        {"options": ["auto", "charge_battery", "discharge_battery", "backup"]},
     )
     hass.states.set("number.eco_soc", "20")
     hass.states.set("number.eco_power", "0")
@@ -228,7 +230,7 @@ async def test_s2_wyjatek_w_torze_wykonania_prowadzi_do_fallbacku_a_nie_do_ciszy
     zapisane_tryby = [
         call[2].get("option") for call in hass.services.calls if call[0] == "select"
     ]
-    assert "general" in zapisane_tryby, (
+    assert "auto" in zapisane_tryby, (
         f"awaryjny fallback musi ustawić tryb bezpieczny (self_consume), "
         f"a zapisano {zapisane_tryby}"
     )

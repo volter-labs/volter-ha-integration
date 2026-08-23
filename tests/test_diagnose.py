@@ -22,7 +22,7 @@ async def test_diagnose_nie_zapisuje_nic(fake_entry):
     hass.states.set("sensor.soc", "55")
     hass.states.set("sensor.pv", "1200")
     hass.states.set("sensor.grid", "-300")
-    hass.states.set("select.tryb", "general", {"options": ["general", "eco_charge"]})
+    hass.states.set("select.tryb", "auto", {"options": ["auto", "charge_battery"]})
     fake_entry.options = dict(OPTIONS)
 
     report = await VolterExecutor(hass, fake_entry).async_diagnose()
@@ -36,14 +36,14 @@ async def test_diagnose_wypisuje_realne_allowed_modes(fake_entry):
     """To weryfikuje hipoteze z mappers.py przed pierwszym zapisem."""
     hass = FakeHass()
     hass.states.set("sensor.soc", "55")
-    hass.states.set("select.tryb", "general",
-                    {"options": ["general", "eco_charge", "eco_discharge", "backup"]})
+    hass.states.set("select.tryb", "auto",
+                    {"options": ["auto", "charge_battery", "discharge_battery", "backup"]})
     fake_entry.options = dict(OPTIONS)
 
     report = await VolterExecutor(hass, fake_entry).async_diagnose()
 
     assert report["limits"]["allowed_modes"] == [
-        "general", "eco_charge", "eco_discharge", "backup"
+        "auto", "charge_battery", "discharge_battery", "backup"
     ]
 
 

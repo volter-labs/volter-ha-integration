@@ -18,7 +18,7 @@ czeka na trwający zapis. Ścieżka jest realna przy KAŻDEJ zmianie opcji integ
 `command_handler.async_stop()` robi `_listen_task.cancel()` bez `await`.
 
     Sonda E: zapis planu `charge` zatrzymany na pierwszym service callu
-    (`select.tryb='eco_charge'`). Po anulowaniu: `mode` zmieniony,
+    (`select.tryb='charge_battery'`). Po anulowaniu: `mode` zmieniony,
     `eco_soc`/`eco_power`/`export_limit_enabled` NIGDY nie zapisane,
     `diagnostics['last'] == {}`, do chmury nie idzie nic. Falownik w `eco_charge`
     z limitami z poprzedniego slotu — czyli w stanie, któremu ma zapobiegać
@@ -47,6 +47,8 @@ OPTIONS = {
     "entity_ems_mode": "select.tryb",
     "entity_eco_mode_soc": "number.eco_soc",
     "entity_eco_mode_power": "number.eco_power",
+    "entity_charge_limit": "number.charge_limit",
+    "entity_soc_upper": "number.soc_upper",
     "entity_export_limit_switch": "switch.export_limit",
     "soc_reserve": 20.0,
     "user_mode": "autarky",
@@ -61,8 +63,8 @@ def _hass(soc: str = "19") -> FakeHass:
     hass.states.set("sensor.grid", "-300")
     hass.states.set(
         "select.tryb",
-        "general",
-        {"options": ["general", "eco_charge", "eco_discharge", "backup"]},
+        "auto",
+        {"options": ["auto", "charge_battery", "discharge_battery", "backup"]},
     )
     hass.states.set("number.eco_soc", "20")
     hass.states.set("number.eco_power", "0")
@@ -88,9 +90,15 @@ def _plan(mode: str, *, soc_target: float) -> dict:
 
 
 def _zapisy_eco_soc(hass: FakeHass) -> list[float]:
-    """Wartości FAKTYCZNIE zapisane na encji `number.eco_soc` — czyli zapisy do NVM."""
+    """Progi SoC FAKTYCZNIE zapisane do NVM, wyrażone jako PRÓG — nie jako głębokość.
+
+    Etap 3: na encję idzie głębokość rozładowania (DoD), bo `eco_mode_soc` w GoodWe
+    jest tylko do odczytu. Odwracamy tu z powrotem na próg, żeby asercje niżej dalej
+    mówiły o tym, o czym są — o rezerwie użytkownika — a nie o wielkości odwrotnej.
+    Sam kierunek przeliczenia pilnuje `test_wylacznik_sterowania`/`applier`.
+    """
     return [
-        data["value"]
+        round(100.0 - data["value"], 1)
         for domain, service, data in hass.services.calls
         if domain == "number" and data.get("entity_id") == "number.eco_soc"
     ]
@@ -342,8 +350,8 @@ async def test_s5_anulowanie_nie_zostawia_falownika_w_stanie_polowicznym(fake_en
 
     assert _zapisane_encje(hass) >= {
         "select.tryb",
-        "number.eco_soc",
-        "number.eco_power",
+        "number.soc_upper",
+        "number.charge_limit",
         "switch.export_limit",
     }, (
         f"S-5: anulowanie przerwało sekwencję nastaw — falownik został w trybie "
@@ -379,7 +387,9 @@ async def test_s5_anulowanie_zostawia_slad_w_last(fake_entry):
     assert any(
         n.get("invariant") == "S-5" for n in ostatni.get("notes", [])
     ), f"brak noty tłumaczącej anulowanie: {ostatni.get('notes')}"
-    assert "eco_soc" in ostatni.get("executed", []), (
+    # Slot ładowania niesie GÓRNY próg (`soc_upper`) i moc (`charge_limit`) —
+    # dolnego progu nie emituje, bo `soc_target` znaczy tu "do ilu naładować".
+    assert "soc_upper" in ostatni.get("executed", []), (
         f"ślad musi mówić PRAWDĘ o tym, co doszło do falownika: {ostatni}"
     )
 

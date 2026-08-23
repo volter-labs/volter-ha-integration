@@ -29,8 +29,11 @@ from typing import Any, Iterable
 #: W części falowników zmiana trybu resetuje limity, więc limity muszą iść PO trybie.
 PARAM_ORDER: tuple[str, ...] = (
     "mode",
+    # Dolny próg SoC idzie ZARAZ po trybie: to ochrona rezerwy, a zmiana trybu
+    # w części falowników resetuje limity. Moc dopiero po progach — inaczej
+    # falownik przez moment pracowałby mocą planu przy starej głębokości.
     "eco_soc",
-    "eco_power",
+    "soc_upper",
     "charge_limit",
     "discharge_limit",
     "export_limit",
@@ -63,10 +66,17 @@ class ParamSpec:
 
 
 PARAM_SPECS: dict[str, ParamSpec] = {
+    #: Dolny próg SoC (%). Zapisywany jako DoD — przeliczenie w `const.PARAM_VALUE_TRANSFORM`.
     "eco_soc": ParamSpec(0, 100, "%"),
-    "eco_power": ParamSpec(0, 100, "%"),
-    "discharge_limit": ParamSpec(0, 100, "%"),  # GoodWe: DoD
-    "charge_limit": ParamSpec(0, 200, "A", to_confirm=True),
+    #: Górny próg SoC (%) — do ilu ładować.
+    "soc_upper": ParamSpec(0, 100, "%"),
+    #: Głębokość rozładowania podana wprost (stary kontrakt). Encja GoodWe: 0..99.
+    "discharge_limit": ParamSpec(0, 99, "%"),
+    #: Nastawa mocy `Xset` trybów EMS, w WATACH po stronie baterii.
+    #: Było `0..200 A` — to była hipoteza z czasów, gdy sądziliśmy, że sterujemy
+    #: limitem prądu ładowania. Realna encja (`ems_power_limit`) przyjmuje waty,
+    #: a jej `max` czyta guard I-3 wprost z atrybutów encji (R-8).
+    "charge_limit": ParamSpec(0, 30000, "W", to_confirm=True),
     "export_limit": ParamSpec(0, 30000, "W", to_confirm=True),
 }
 
@@ -81,7 +91,14 @@ PARAM_SPECS: dict[str, ParamSpec] = {
 #: TODO(Etap-1): heurystyka jest dodatkowo słaba, bo w GoodWe `discharge_limit` to
 #: głębokość rozładowania (DoD, %), czyli limit, a nie intencja. Potwierdzić semantykę
 #: przy okazji mapy nastaw GoodWe.
-_CHARGE_HINTS = ("charge_limit",)
+_CHARGE_HINTS: tuple[str, ...] = ()
+#: `charge_limit` USUNIETY z podpowiedzi kierunku (Etap 3). Nazwa jest historyczna:
+#: parametr celuje w `ems_power_limit`, czyli nastawe mocy `Xset` trybow EMS, ktora
+#: jest DWUKIERUNKOWA — ten sam rejestr niesie moc ladowania i rozladowania.
+#: Dopoki byl podpowiedzia ladowania, slot rozladowania niosacy moc wygladal dla I-2
+#: jak jednoczesne ladowanie i rozladowanie i cala komenda byla odrzucana.
+#: Kierunek dla starego kontraktu wnioskuje teraz `infer_action` z nazwy trybu
+#: (`discharge_battery` / `charge_battery` / `charge_pv`), co jest jednoznaczne.
 _DISCHARGE_HINTS = ("discharge_limit",)
 
 

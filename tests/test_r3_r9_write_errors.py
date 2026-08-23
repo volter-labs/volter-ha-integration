@@ -66,11 +66,11 @@ async def test_r3_czesciowy_zapis_niezmapowanej_encji_daje_errors_i_wykonane_oso
     """Jeden parametr zmapowany (zapisuje się), drugi nie — `executed` i `errors`
     muszą pokazać oba fakty osobno, żeby executor mógł policzyć PARTIAL/ERROR."""
     hass = FakeHass()
-    hass.states.set("select.tryb", "general", {"options": ["general", "eco_charge"]})
+    hass.states.set("select.tryb", "auto", {"options": ["auto", "charge_battery"]})
     options = {"entity_ems_mode": "select.tryb"}  # eco_soc świadomie NIE zmapowane
 
     executed, errors, notes = await apply_params(
-        hass, options, {"mode": "eco_charge", "eco_soc": 40.0}
+        hass, options, {"mode": "charge_battery", "eco_soc": 40.0}
     )
 
     assert executed == ["mode"]

@@ -49,6 +49,8 @@ OPTIONS = {
     "entity_ems_mode": "select.tryb",
     "entity_eco_mode_soc": "number.eco_soc",
     "entity_eco_mode_power": "number.eco_power",
+    "entity_charge_limit": "number.charge_limit",
+    "entity_soc_upper": "number.soc_upper",
     "entity_export_limit_switch": "switch.export_limit",
     "soc_reserve": 20.0,
     "user_mode": "autarky",
@@ -67,8 +69,8 @@ def _hass(soc: float) -> FakeHass:
     hass.states.set("sensor.grid", "-300")
     hass.states.set(
         "select.tryb",
-        "general",
-        {"options": ["general", "eco_charge", "eco_discharge", "backup"]},
+        "auto",
+        {"options": ["auto", "charge_battery", "discharge_battery", "backup"]},
     )
     hass.states.set("number.eco_soc", "20")
     hass.states.set("number.eco_power", "0")
@@ -94,9 +96,14 @@ def _plan(mode: str, *, soc_target: float) -> dict:
 
 
 def _zapisy_eco_soc(hass: FakeHass) -> list[float]:
-    """Wartości FAKTYCZNIE zapisane na `number.eco_soc` — czyli zapisy do NVM."""
+    """Progi SoC FAKTYCZNIE zapisane do NVM, wyrażone jako PRÓG — nie jako głębokość.
+
+    Etap 3: na encję idzie głębokość rozładowania (DoD), bo `eco_mode_soc` w GoodWe
+    jest tylko do odczytu. Odwracamy z powrotem na próg, żeby asercje mówiły o tym,
+    o czym są — o rezerwie — a LICZBA zapisów (sedno tego pliku) jest bez zmian.
+    """
     return [
-        data["value"]
+        round(100.0 - data["value"], 1)
         for domain, _service, data in hass.services.calls
         if domain == "number" and data.get("entity_id") == "number.eco_soc"
     ]
@@ -251,7 +258,7 @@ async def test_s4b_wyrazne_zejscie_blokuje_rozladowanie_w_pierwszym_tiku(
         for domain, _s, data in hass.services.calls[przed:]
         if domain == "select"
     ]
-    assert tryby and "eco_discharge" not in tryby, (
+    assert tryby and "discharge_battery" not in tryby, (
         "rozładowanie musi zostać zdjęte z falownika, a nie tylko odnotowane"
     )
 

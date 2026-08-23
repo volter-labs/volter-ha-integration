@@ -37,6 +37,8 @@ OPTIONS = {
     "entity_ems_mode": "select.tryb",
     "entity_eco_mode_soc": "number.eco_soc",
     "entity_eco_mode_power": "number.eco_power",
+    "entity_charge_limit": "number.charge_limit",
+    "entity_soc_upper": "number.soc_upper",
     "entity_discharge_limit": "number.discharge_limit",
     "entity_export_limit_switch": "switch.export_limit",
     "soc_reserve": 40.0,
@@ -51,8 +53,8 @@ def _hass(soc: str = "60") -> FakeHass:
     hass.states.set("sensor.grid", "-300")
     hass.states.set(
         "select.tryb",
-        "general",
-        {"options": ["general", "eco_charge", "eco_discharge", "backup"]},
+        "auto",
+        {"options": ["auto", "charge_battery", "discharge_battery", "backup"]},
     )
     hass.states.set("number.eco_soc", "20")
     hass.states.set("number.eco_power", "0")
@@ -166,14 +168,17 @@ async def test_s1_przeplot_nie_rozjezdza_falownika_z_pamiecia_throttle(fake_entr
     await _rownolegle(
         executor.async_set_schedule(_schedule("charge", soc_target=77.0)),
         executor.async_apply(
-            {"mode": "eco_charge", "eco_soc": 55.0},
+            {"mode": "charge_battery", "eco_soc": 55.0},
             action=HaAction.CHARGE,
             source="cloud",
         ),
     )
 
     pamietane = executor._throttle._last_value.get("eco_soc")
-    fizyczne = falownik.stan.get("number.eco_soc")
+    # Throttle pamięta PRÓG, a na encji leży GŁĘBOKOŚĆ (DoD) — `eco_mode_soc`
+    # w GoodWe jest read-only, więc próg realizujemy przez wielkość odwrotną.
+    # Odwracamy stan encji, żeby porównywać te same wielkości.
+    fizyczne = 100.0 - falownik.stan.get("number.eco_soc")
     assert fizyczne == pamietane, (
         f"S-1: throttle pamięta {pamietane}, a na falowniku jest {fizyczne} — "
         f"od tej chwili I-6 uzna wartość planu za 'bez zmiany' i nigdy jej nie dopisze. "
@@ -204,7 +209,7 @@ async def test_s1_przeplot_nie_lamie_param_order_miedzy_przebiegami(
     await _rownolegle(
         executor.async_set_schedule(_schedule("charge", soc_target=77.0)),
         executor.async_apply(
-            {"mode": "eco_discharge", "eco_soc": 55.0, "eco_power": 30.0},
+            {"mode": "discharge_battery", "eco_soc": 55.0, "charge_limit": 30.0},
             action=HaAction.DISCHARGE,
             source="cloud",
         ),
@@ -239,7 +244,7 @@ async def test_s1_przemapowanie_forced_action_nie_zakleszcza_sie(fake_entry):
         timeout=5.0,
     )
 
-    assert falownik.stan.get("select.tryb") == "general", (
+    assert falownik.stan.get("select.tryb") == "auto", (
         "przemapowanie na tryb bezpieczny (R-1) musi nadal dojść do falownika"
     )
     assert any(n.invariant == "I-1" for n in result.notes)
@@ -261,7 +266,7 @@ async def test_s1_przemapowanie_forced_action_pod_rownoczesna_komenda(fake_entry
     await _rownolegle(
         executor.async_set_schedule(_schedule("discharge", soc_target=50.0)),
         executor.async_apply(
-            {"mode": "eco_charge", "eco_soc": 55.0},
+            {"mode": "charge_battery", "eco_soc": 55.0},
             action=HaAction.CHARGE,
             source="cloud",
         ),
@@ -272,7 +277,7 @@ async def test_s1_przemapowanie_forced_action_pod_rownoczesna_komenda(fake_entry
         f"{falownik.slad}"
     )
     pamietane = executor._throttle._last_value.get("eco_soc")
-    assert falownik.stan.get("number.eco_soc") == pamietane
+    assert 100.0 - falownik.stan.get("number.eco_soc") == pamietane
 
 
 # ── Decyzja: przebieg czekający na zamek widzi ODŚWIEŻONY stan ──────────────
@@ -310,13 +315,13 @@ async def test_s1_przebieg_czekajacy_na_zamek_czyta_stan_po_zamku(fake_entry):
     _, wynik_b = await _rownolegle(
         executor.async_set_schedule(_schedule("charge", soc_target=77.0)),
         executor.async_apply(
-            {"mode": "eco_discharge", "eco_soc": 55.0, "eco_power": 30.0},
+            {"mode": "discharge_battery", "eco_soc": 55.0, "charge_limit": 30.0},
             action=HaAction.DISCHARGE,
             source="cloud",
         ),
     )
 
-    assert falownik.stan.get("select.tryb") != "eco_discharge", (
+    assert falownik.stan.get("select.tryb") != "discharge_battery", (
         f"I-1: rozładowanie poniżej rezerwy nie może pójść do falownika — "
         f"{falownik.slad}"
     )

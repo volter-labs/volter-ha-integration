@@ -47,12 +47,14 @@ def ctx(
     previous_soc: float | None = None,
     price: float | None = None,
     limits: InverterLimits | None = None,
+    action: Action | None = None,
 ) -> GuardContext:
     return GuardContext(
         state=DeviceState(soc=soc, age_s=age_s, previous_soc=previous_soc),
         limits=limits or InverterLimits(),
         config=UserConfig(soc_reserve=reserve, mode=mode),
         price_pln_kwh=price,
+        action=action,
     )
 
 
@@ -80,13 +82,15 @@ def test_t2_guard_bezposrednio_sprzeczna_intencja_odrzucona():
     pominięciem `sanitize_params` — sprawdza wyłącznie logikę I-2 w guardzie,
     w oderwaniu od realnego toru komendy (`sanitize_params -> apply_guards`).
 
-    R-13c: dosłowne wartości z wektora T-2 specyfikacji (`charge_limit=3000`,
-    `discharge_limit=2000`) w realnym torze zostałyby odrzucone przez I-10
-    (zakres `charge_limit` to 0..200 A) ZANIM guard w ogóle zobaczyłby I-2 — ten
-    test celowo tego nie odzwierciedla. Realny tor pokrywa
-    `test_t2_pelny_tor_sanitize_i_guardy_sprzeczna_intencja_odrzucona` niżej.
+    Etap 3: sprzeczność wyraża się teraz jako INTENCJA ładowania (`ctx.action`)
+    plus obecność głębokości rozładowania w parametrach. `charge_limit` przestał
+    być podpowiedzią kierunku, bo celuje w `ems_power_limit` — nastawę mocy
+    wspólną dla obu kierunków; dopóki nią był, każdy slot rozładowania niosący
+    moc wyglądał dla I-2 jak sprzeczność i był odrzucany.
     """
-    result = apply_guards({"charge_limit": 20.0, "discharge_limit": 30.0}, ctx())
+    result = apply_guards(
+        {"discharge_limit": 30.0}, ctx(action=Action.CHARGE)
+    )
 
     assert result.status is Status.ERROR
     assert result.params == {}
@@ -97,13 +101,16 @@ def test_t2_pelny_tor_sanitize_i_guardy_sprzeczna_intencja_odrzucona():
     """R-13c: wektor T-2 pokryty REALNYM torem komendy — `sanitize_params`, potem
     dopiero `apply_guards`. Wartości muszą mieścić się w `PARAM_SPECS` (I-10),
     żeby sprzeczność faktycznie dotarła do I-2, a nie została odrzucona wcześniej
-    z mylącym powodem `I-10` zamiast `I-2` (dosłowne wartości z tabeli
-    specyfikacji, `charge_limit=3000`/`discharge_limit=2000`, tego testu by NIE
-    przeszły — `charge_limit` ma zakres 0..200 A)."""
-    limits = InverterLimits()
-    clean = sanitize_params({"charge_limit": 20.0, "discharge_limit": 30.0}, limits)
+    z mylącym powodem `I-10` zamiast `I-2`.
 
-    result = apply_guards(clean, ctx(limits=limits))
+    Etap 3: kierunek podaje `ctx.action` (tak robi executor), a sprzeczny parametr
+    to `discharge_limit`. Wektor T-2 ze specyfikacji jest tym samym zdarzeniem —
+    „plan każe jednocześnie ładować i rozładowywać" — wyrażonym w kontrakcie,
+    który realnie płynie z chmury."""
+    limits = InverterLimits()
+    clean = sanitize_params({"discharge_limit": 30.0}, limits)
+
+    result = apply_guards(clean, ctx(limits=limits, action=Action.CHARGE))
 
     assert result.status is Status.ERROR
     assert result.params == {}
@@ -148,7 +155,10 @@ def test_i10_wartosc_poza_param_specs_odrzucona_gdy_nie_znamy_granic_encji():
     """Osobny przypadek I-10, nie T-3: dopóki encja nie poda `min`/`max`, jedyną
     obroną zostaje zgadywany zakres z `PARAM_SPECS` i wtedy obowiązuje fail-closed."""
     with pytest.raises(InvalidCommand) as err:
-        sanitize_params({"charge_limit": 8000.0}, InverterLimits())
+        # 40 kW — poza `PARAM_SPECS` dla `charge_limit` (0..30000 W). Wcześniej
+        # ten test używał 8000, bo zakres był zgadywany jako 0..200 A; realna
+        # encja `ems_power_limit` przyjmuje waty, więc 8000 jest dziś poprawne.
+        sanitize_params({"charge_limit": 40000.0}, InverterLimits())
     assert err.value.invariant == "I-10"
 
 
@@ -323,7 +333,7 @@ def test_t10_niemozliwy_skok_soc_wstrzymuje_zapisy():
 
 def test_t11_wartosc_poza_zakresem_odrzuca_cala_komende():
     with pytest.raises(InvalidCommand) as err:
-        sanitize_params({"eco_soc": 150.0, "eco_power": 50.0}, InverterLimits())
+        sanitize_params({"eco_soc": 150.0, "charge_limit": 50.0}, InverterLimits())
     assert err.value.invariant == "I-10"
 
 
@@ -333,9 +343,9 @@ def test_t11b_nieznany_parametr_jest_ignorowany_a_nie_wywala_komendy():
 
 
 def test_t11c_mode_walidowany_wobec_listy_opcji_falownika():
-    limits = InverterLimits(allowed_modes=("general", "eco_charge", "eco_discharge"))
+    limits = InverterLimits(allowed_modes=("auto", "charge_battery", "discharge_battery"))
 
-    assert sanitize_params({"mode": "eco_charge"}, limits) == {"mode": "eco_charge"}
+    assert sanitize_params({"mode": "charge_battery"}, limits) == {"mode": "charge_battery"}
     with pytest.raises(InvalidCommand):
         sanitize_params({"mode": "turbo"}, limits)
 
@@ -356,14 +366,14 @@ def test_t12_powtorzony_request_id_rozpoznany_jako_duplikat():
 
 
 def test_t13_mode_zapisywany_przed_limitami():
-    keys = [k for k, _ in ordered({"charge_limit": 10, "export_limit": 0, "mode": "eco_charge"})]
+    keys = [k for k, _ in ordered({"charge_limit": 10, "export_limit": 0, "mode": "charge_battery"})]
 
     assert keys.index("mode") < keys.index("charge_limit")
     assert keys.index("charge_limit") < keys.index("export_limit")
 
 
 def test_t13b_kolejnosc_jest_deterministyczna_dla_nieznanych_parametrow():
-    keys = [k for k, _ in ordered({"zzz": 1, "aaa": 2, "mode": "general"})]
+    keys = [k for k, _ in ordered({"zzz": 1, "aaa": 2, "mode": "auto"})]
     assert keys == ["mode", "aaa", "zzz"]
 
 
@@ -377,21 +387,23 @@ def test_t13b_kolejnosc_jest_deterministyczna_dla_nieznanych_parametrow():
 
 
 def test_zdrowa_komenda_przechodzi_bez_zmian():
-    result = apply_guards({"eco_soc": 60.0, "eco_power": 40.0}, ctx(soc=55.0))
+    result = apply_guards({"eco_soc": 60.0, "charge_limit": 40.0}, ctx(soc=55.0))
 
     assert result.status is Status.SUCCESS
-    assert result.params == {"eco_soc": 60.0, "eco_power": 40.0}
+    assert result.params == {"eco_soc": 60.0, "charge_limit": 40.0}
     assert result.notes == []
 
 
 @pytest.mark.parametrize(
     ("params", "expected"),
     [
-        ({"charge_limit": 10}, Action.CHARGE),
+        # `charge_limit` to nastawa mocy WSPÓLNA dla obu kierunków (ems_power_limit),
+        # więc sama w sobie nie mówi nic o kierunku — patrz `_CHARGE_HINTS`.
+        ({"charge_limit": 10}, Action.SELF_CONSUME),
         ({"discharge_limit": 10}, Action.DISCHARGE),
-        ({"mode": "eco_charge"}, Action.CHARGE),
-        ({"mode": "eco_discharge"}, Action.DISCHARGE),
-        ({"mode": "general"}, Action.SELF_CONSUME),
+        ({"mode": "charge_battery"}, Action.CHARGE),
+        ({"mode": "discharge_battery"}, Action.DISCHARGE),
+        ({"mode": "auto"}, Action.SELF_CONSUME),
     ],
 )
 def test_wnioskowanie_kierunku(params, expected):
@@ -400,7 +412,7 @@ def test_wnioskowanie_kierunku(params, expected):
 
 def test_n4_executed_jest_niezalezne_od_params():
     """Raport musi rozróżniać 'przeszło guardy' od 'zapisane w falowniku'."""
-    result = GuardResult(params={"mode": "general", "eco_soc": 30.0}, status=Status.SUCCESS)
+    result = GuardResult(params={"mode": "auto", "eco_soc": 30.0}, status=Status.SUCCESS)
 
     assert result.executed == []
 

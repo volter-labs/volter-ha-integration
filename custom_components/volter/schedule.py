@@ -332,16 +332,24 @@ def kierunek_slotu(slot: Slot) -> Action | None:
     plan sprzed rozszerzenia kontraktu nie może przez tę zmianę stracić ładowania.
     """
     if slot.action is Action.CHARGE:
-        return None if slot.charge_source == "pv" else Action.CHARGE
+        # H-1 WYCOFANA (Etap 3, potwierdzone w goodwe/inverter.py::EMSMode):
+        # falownik ma osobny tryb CHARGE_PV (2) — "When set to 0, only PV power
+        # is used" — więc ładowanie wyłącznie z nadwyżki DA SIĘ wyrazić wprost.
+        # Obejście "brak kierunku dla pv" istniało tylko dlatego, że zakładaliśmy,
+        # iż jedyny tryb ładowania dobiera brakującą moc z sieci. Kierunek jest
+        # kierunkiem: ładowanie z PV też zużywa budżet I-8 i podlega I-1.
+        return Action.CHARGE
     if slot.action is Action.DISCHARGE:
         return Action.DISCHARGE
     # SELF_CONSUME / IDLE — kierunek może siedzieć wyłącznie w polach opisowych.
     if slot.discharge_purpose is not None:
         return Action.DISCHARGE
-    if slot.charge_source == "grid":
-        # Dziś nieosiągalne z chmury (`chargeSourceForAction` daje przy self_consume
-        # tylko 'pv'), ale gdy kontrakt to kiedyś dopuści, zgoda na pobór z sieci
-        # musi znaczyć to samo w obu miejscach.
+    if slot.charge_source is not None:
+        # H-1 WYCOFANA (Etap 3): także 'pv' jest ładowaniem. Falownik ma osobny
+        # tryb CHARGE_PV z `Xset=0` ("only PV power is used"), więc nadwyżkę da
+        # się wyrazić wprost — nie trzeba już udawać braku kierunku, żeby uniknąć
+        # przypadkowego zakupu z sieci. Kierunek jest kierunkiem: podlega I-1
+        # i zużywa budżet I-8, bo falownik REALNIE przełącza tryb.
         return Action.CHARGE
     return None
 

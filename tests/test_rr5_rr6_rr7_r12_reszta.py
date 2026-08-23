@@ -44,6 +44,8 @@ OPTIONS = {
     "entity_ems_mode": "select.tryb",
     "entity_eco_mode_soc": "number.eco_soc",
     "entity_eco_mode_power": "number.eco_power",
+    "entity_charge_limit": "number.charge_limit",
+    "entity_soc_upper": "number.soc_upper",
     "entity_discharge_limit": "number.discharge_limit",
     "entity_export_limit_switch": "switch.export_limit",
     # Scenariusz z sondy P2/P6: rezerwa backup 40%, tryb autarky.
@@ -59,8 +61,8 @@ def _hass(soc: str = "30") -> FakeHass:
     hass.states.set("sensor.grid", "-300")
     hass.states.set(
         "select.tryb",
-        "general",
-        {"options": ["general", "eco_charge", "eco_discharge", "backup"]},
+        "auto",
+        {"options": ["auto", "charge_battery", "discharge_battery", "backup"]},
     )
     hass.states.set("number.eco_soc", "20")
     hass.states.set("number.eco_power", "0")
@@ -141,7 +143,7 @@ async def test_rr5_forced_action_nie_spamuje_po_ustabilizowaniu(fake_entry, capl
 
     # Strona ochrony R-1: mimo zmiany w logowaniu, plan wymuszony NADAL nie może
     # pójść do falownika jako rozładowanie — tylko tryb bezpieczny.
-    assert "eco_discharge" not in _tryby(hass)
+    assert "discharge_battery" not in _tryby(hass)
     assert executor._direction._current is Action.SELF_CONSUME
 
 
@@ -151,7 +153,7 @@ async def test_rr5_forced_action_nie_spamuje_po_ustabilizowaniu(fake_entry, capl
 @pytest.mark.asyncio
 async def test_rr6_bez_slotu_forced_self_consume_rejestruje_efektywna_akcje(fake_entry):
     """Sonda P6: `SoC=30`, `soc_reserve=40`, `SET_WORK_MODE` bez slotu z komendą
-    `{'mode': 'eco_discharge', 'discharge_limit': 50}`. I-1 blokuje rozładowanie
+    `{'mode': 'discharge_battery', 'discharge_limit': 50}`. I-1 blokuje rozładowanie
     (`forced_action=SELF_CONSUME`), do falownika nie idzie nic rozładowującego —
     ale `act = action or infer_action(...)` bierze akcję OD WOŁAJĄCEGO (DISCHARGE),
     więc `DirectionLimiter.record()` zapamiętuje kierunek, który guard właśnie
@@ -161,7 +163,7 @@ async def test_rr6_bez_slotu_forced_self_consume_rejestruje_efektywna_akcje(fake
     executor = VolterExecutor(hass, fake_entry)
 
     result = await executor.async_apply(
-        {"mode": "eco_discharge", "discharge_limit": 50.0},
+        {"mode": "discharge_battery", "discharge_limit": 50.0},
         action=Action.DISCHARGE,
         source="cloud",
     )
@@ -189,7 +191,7 @@ async def test_rr6_ochrona_ze_slotem_dalej_rejestruje_poprawnie(fake_entry):
     await executor.async_set_schedule(_schedule("discharge", soc_target=50.0))
 
     assert executor._direction._current is Action.SELF_CONSUME
-    assert "eco_discharge" not in _tryby(hass)
+    assert "discharge_battery" not in _tryby(hass)
 
 
 @pytest.mark.asyncio
@@ -202,7 +204,7 @@ async def test_rr6_ochrona_akcja_niewymuszona_nadal_dziala(fake_entry):
     executor = VolterExecutor(hass, fake_entry)
 
     result = await executor.async_apply(
-        {"mode": "eco_discharge", "discharge_limit": 50.0},
+        {"mode": "discharge_battery", "discharge_limit": 50.0},
         action=Action.DISCHARGE,
         source="cloud",
     )
@@ -229,7 +231,7 @@ def _hass_r7(soc: str = "55") -> FakeHass:
     hass.states.set("sensor.pv", "1200")
     hass.states.set("sensor.grid", "-300")
     hass.states.set(
-        "select.tryb", "general", {"options": ["general", "eco_charge", "eco_discharge"]}
+        "select.tryb", "auto", {"options": ["auto", "charge_pv", "discharge_pv", "import_ac", "export_ac", "conserve", "off_grid", "battery_standby", "buy_power", "sell_power", "charge_battery", "discharge_battery"]}
     )
     hass.states.set("number.eco_soc", "20")
     return hass
@@ -318,7 +320,7 @@ def _hass_swiezy(soc: str = "55") -> FakeHass:
     hass.states.set("sensor.pv", "1200")
     hass.states.set("sensor.grid", "-300")
     hass.states.set(
-        "select.tryb", "general", {"options": ["general", "eco_charge", "eco_discharge"]}
+        "select.tryb", "auto", {"options": ["auto", "charge_pv", "discharge_pv", "import_ac", "export_ac", "conserve", "off_grid", "battery_standby", "buy_power", "sell_power", "charge_battery", "discharge_battery"]}
     )
     hass.states.set("number.eco_soc", "20")
     return hass
