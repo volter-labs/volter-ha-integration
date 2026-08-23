@@ -79,6 +79,9 @@ GOODWE_TRYB_LADOWANIE_PV = "charge_pv"
 #: bo mapper jest funkcją czystą i ma zostać przepisywalny 1:1 na `static` w firmware.
 _ostatnie_ostrzezenie_o_mocy: tuple | None = None
 
+#: RR-10, druga ścieżka: ładowanie bez znanej mocy (staging bez `delta_kwh`).
+_ostatnie_ostrzezenie_o_braku_mocy: tuple | None = None
+
 #: Moc znamionowa falownika w W — potrzebna, bo eco_power jest w procentach.
 #: TODO(Etap-1): wziąć z konfiguracji instalacji, nie ze stałej.
 DEFAULT_RATED_POWER_W = 10000.0
@@ -205,12 +208,24 @@ def slot_to_params(
             # nie podał mocy (staging nie zapisuje jeszcze `delta_kwh`), nie zgadujemy
             # jej: wymuszone ładowanie z sieci nieznaną mocą kosztuje realne pieniądze.
             # Neutralny tryb nic nie kosztuje, a plan i tak wróci z mocą po porcie.
-            _LOGGER.warning(
+            # RR-10: głośno, ale RAZ na slot. Slot trwa godzinę, a pętla chodzi
+            # co 60 s — bez klucza tożsamości ta sama przyczyna dawałaby
+            # 60 WARNING/h, czyli szum zamiast informacji.
+            global _ostatnie_ostrzezenie_o_braku_mocy
+            komunikat_bm = (
                 "Slot %s–%s to ładowanie bez znanej mocy — zamiast %r wysyłam tryb "
-                "neutralny %r, żeby nie ładować z sieci nastawą z poprzedniego slotu",
+                "neutralny %r, żeby nie ładować z sieci nastawą z poprzedniego slotu"
+            )
+            argumenty_bm = (
                 slot.start.isoformat(), slot.end.isoformat(), tryb,
                 modes[Action.SELF_CONSUME],
             )
+            klucz_bm = (slot.start, slot.end, tryb)
+            if klucz_bm == _ostatnie_ostrzezenie_o_braku_mocy:
+                _LOGGER.debug(komunikat_bm, *argumenty_bm)
+            else:
+                _ostatnie_ostrzezenie_o_braku_mocy = klucz_bm
+                _LOGGER.warning(komunikat_bm, *argumenty_bm)
             params["mode"] = modes[Action.SELF_CONSUME]
 
     # Eksport (N-8 / D-5 / A-4):
