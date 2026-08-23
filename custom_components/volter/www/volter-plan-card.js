@@ -110,7 +110,7 @@ const opisKategorii = (s) => KATEGORIE[kategoria(s)] || KATEGORIE.SELF_CONSUME;
 /** Wersja karty. Widoczna w stopce, zeby dalo sie jednym spojrzeniem odroznic
  *  „kod jest zly" od „przegladarka trzyma stary plik". Test w `test_karta_frontend.py`
  *  pilnuje, zeby nie rozjechala sie z `manifest.json`. */
-const WERSJA = '2.8.0';
+const WERSJA = '2.9.0';
 
 const KOL_W = 22;   // szerokość kolumny godzinowej w jednostkach viewBox
 const WYS_SLUP = 96;
@@ -268,11 +268,46 @@ class VolterPlanCard extends HTMLElement {
    * delta = moc_bateryjna * 1 h / pojemność. `power_w` jest po stronie baterii,
    * więc to jest dokładnie ta wielkość, która zmienia SoC.
    */
+  /** Prognoza SoC godzina po godzinie: ile jest na początku, ile na końcu.
+   *
+   *  Liczona RAZ i dzielona przez krzywą i podpowiedzi. Gdyby każde z nich liczyło
+   *  osobno, prędzej czy później rozjechałyby się o zaokrąglenie albo o jedną
+   *  godzinę — a wtedy karta pokazywałaby w dymku co innego niż na linii.
+   *
+   *  Historycznego SoC nie mamy: siedzi w recorderze HA, nie w planie. Godziny
+   *  minione dostają `null`, zamiast zmyślonej wartości.
+   *
+   *  Bieżąca godzina zaczyna się od POMIARU, nie od projekcji — i to jest cała
+   *  wartość tej krzywej: przy każdym odświeżeniu sama się koryguje, zamiast
+   *  odjeżdżać od rzeczywistości razem z planem sprzed doby.
+   */
+  _prognozaSoc(sloty, iTeraz, socTeraz, pojemnosc) {
+    const puste = sloty.map(() => null);
+    if (socTeraz == null || !(pojemnosc > 0)) return puste;
+
+    const out = puste.slice();
+    let soc = socTeraz;
+    for (let i = iTeraz; i < sloty.length; i += 1) {
+      // Znak z KIERUNKU, nie z kategorii: to fizyka baterii, a nie nazwa dla człowieka.
+      const kier = AKCJE[sloty[i].akcja] || AKCJE.idle;
+      const kwh = ((sloty[i].moc_w || 0) / 1000) * kier.znak;
+      const koniec = Math.max(0, Math.min(100, soc + (kwh / pojemnosc) * 100));
+      out[i] = { od: soc, do: koniec };
+      soc = koniec;
+    }
+    return out;
+  }
+
   _wykres(sloty, socTeraz, pojemnosc) {
     const n = sloty.length;
     const W = n * KOL_W;
     const H = WYS_SLUP + WYS_SOC + MARGINES;
     const dolSlupka = WYS_SOC + WYS_SLUP;
+    const wysPx = Math.round(H * 1.35);
+    // Ten sam przelicznik, którym pozycjonujemy oś w HTML. SVG skaluje się
+    // nierównomiernie, ale W PIONIE jest to zwykłe mnożenie — więc etykieta
+    // wyliczona tak siada dokładnie na swojej linii.
+    const skala = wysPx / H;
     const maks = Math.max.apply(null,
       sloty.map((s) => Math.abs(s.moc_w || 0)).concat([1]));
 
@@ -287,9 +322,25 @@ class VolterPlanCard extends HTMLElement {
     const wysokosc = (p) => Math.max(4,
       Math.round(Math.sqrt(Math.abs(p || 0) / maks) * (WYS_SLUP - 8)));
 
+    const yDlaSoc = (v) => WYS_SOC - (v / 100) * (WYS_SOC - 8) - 4;
+    const prog = this._prognozaSoc(sloty, iTeraz, socTeraz, pojemnosc);
+    const maSoc = prog.some(Boolean);
+
     let kolumny = '';
     let siatka = '';
     let obszary = '';
+
+    // Poziomy odniesienia SoC. Bez nich linia mówiła tylko „rośnie / spada" —
+    // nie dało się odczytać, czy wieczorem zostaje 20 %, czy 60 %.
+    if (maSoc) {
+      [100, 50, 0].forEach((v) => {
+        siatka += '<line x1="0" y1="' + yDlaSoc(v).toFixed(1) + '" x2="' + W
+          + '" y2="' + yDlaSoc(v).toFixed(1) + '" stroke="rgba(255,255,255,'
+          + (v === 50 ? '.05' : '.09') + ')" stroke-width="1"'
+          + (v === 50 ? ' stroke-dasharray="3 3"' : '')
+          + ' vector-effect="non-scaling-stroke"/>';
+      });
+    }
 
     sloty.forEach((s, i) => {
       const cfg = opisKategorii(s);
@@ -297,13 +348,19 @@ class VolterPlanCard extends HTMLElement {
       const x = i * KOL_W;
       const y = dolSlupka - h;
       const przeszlosc = i < iTeraz;
+      const p = prog[i];
       const tytul = [
         String(godzina(s.od)).padStart(2, '0') + ':00–'
           + String(godzina(s.do)).padStart(2, '0') + ':00',
         cfg.etykieta,
         s.moc_w != null ? moc(s.moc_w) : 'moc niezadana',
         s.cena != null ? Number(s.cena).toFixed(2).replace('.', ',') + ' zł/kWh' : null,
-        s.soc_docelowy != null ? 'SoC ' + Math.round(s.soc_docelowy) + '%' : null,
+        // Prognoza SoC na tę godzinę — to, po co ta krzywa w ogóle jest.
+        // Bieżąca godzina startuje od pomiaru, nie od projekcji; mówimy to wprost,
+        // bo inaczej wartość wyglądałaby na wyliczoną dla pełnej godziny.
+        p ? 'SoC ' + Math.round(p.od) + ' → ' + Math.round(p.do) + ' %'
+          + (i === iTeraz ? ' (od pomiaru)' : '') : null,
+        s.soc_docelowy != null ? 'cel planu ' + Math.round(s.soc_docelowy) + ' %' : null,
         s.zrodlo_ladowania ? 'źródło: ' + s.zrodlo_ladowania : null,
         s.cel_rozladowania ? 'cel: ' + s.cel_rozladowania : null,
         s.eksport === false ? 'eksport zablokowany' : null,
@@ -332,11 +389,11 @@ class VolterPlanCard extends HTMLElement {
       }
     });
 
-    // Podpisy godzin w HTML, NIE w SVG. Wykres skaluje sie nierownomiernie
-    // (`preserveAspectRatio="none"`), zeby slupki wypelnialy cala szerokosc karty
-    // niezaleznie od liczby slotow — a to rozciaga tekst w pionie tym mocniej, im
-    // wezsza karta. Siatka HTML o tej samej liczbie kolumn trzyma podpisy dokladnie
-    // pod slupkami i nie deformuje pisma.
+    // Podpisy godzin w HTML, NIE w SVG. Wykres skaluje się nierównomiernie
+    // (`preserveAspectRatio="none"`), żeby słupki wypełniały całą szerokość karty
+    // niezależnie od liczby slotów — a to rozciąga tekst w pionie tym mocniej, im
+    // węższa karta. Siatka HTML o tej samej liczbie kolumn trzyma podpisy dokładnie
+    // pod słupkami i nie deformuje pisma.
     const podpisy = '<div class="godziny" style="grid-template-columns:repeat('
       + n + ',1fr)">'
       + sloty.map((s) => {
@@ -345,31 +402,33 @@ class VolterPlanCard extends HTMLElement {
       }).join('')
       + '</div>';
 
+    // Etykiety osi też w HTML i z tego samego powodu co godziny.
+    const os = maSoc
+      ? '<div class="os-soc" style="height:' + wysPx + 'px">'
+        + [100, 50, 0].map((v) => '<span style="top:'
+          + (yDlaSoc(v) * skala).toFixed(1) + 'px">' + v + '%</span>').join('')
+        + '</div>'
+      : '<div class="os-soc" style="height:' + wysPx + 'px"></div>';
+
     // Obszar prognozy: od bieżącej godziny w prawo, w ukośne kreski — jak w aplikacji.
     // Bez tego nie widać, gdzie kończy się fakt, a zaczyna założenie.
     const xProg = iTeraz * KOL_W;
-    const prognoza = '<rect x="' + xProg + '" y="0" width="' + (W - xProg)
+    const pasProgozy = '<rect x="' + xProg + '" y="0" width="' + (W - xProg)
       + '" height="' + dolSlupka + '" fill="url(#volter-kreski)"/>';
 
-    // Krzywa SoC WYŁĄCZNIE nad prognozą. Historycznego SoC nie mamy — siedzi
-    // w recorderze HA, nie w planie — więc linia nad przeszłością byłaby
-    // zmyślaniem danych, a nie informacją.
+    // Krzywa SoC WYŁĄCZNIE nad prognozą — historycznego SoC nie mamy, więc linia
+    // nad przeszłością byłaby zmyślaniem danych, a nie informacją.
     let krzywa = '';
     let punktStart = '';
-    if (socTeraz != null && pojemnosc > 0) {
-      let soc = socTeraz;
-      const yDlaSoc = (v) => WYS_SOC - (v / 100) * (WYS_SOC - 8) - 4;
-      const punkty = [(xProg + 1).toFixed(1) + ',' + yDlaSoc(soc).toFixed(1)];
+    if (maSoc) {
+      const punkty = [(xProg + 1).toFixed(1) + ',' + yDlaSoc(socTeraz).toFixed(1)];
       for (let i = iTeraz; i < n; i += 1) {
-        // Znak z KIERUNKU, nie z kategorii: prognoza SoC to fizyka baterii,
-        // a kategoria jest nazwa dla czlowieka.
-        const kier = AKCJE[sloty[i].akcja] || AKCJE.idle;
-        const kwh = ((sloty[i].moc_w || 0) / 1000) * kier.znak;
-        soc = Math.max(0, Math.min(100, soc + (kwh / pojemnosc) * 100));
-        punkty.push((i * KOL_W + KOL_W).toFixed(1) + ',' + yDlaSoc(soc).toFixed(1));
+        if (!prog[i]) continue;
+        punkty.push((i * KOL_W + KOL_W).toFixed(1) + ','
+          + yDlaSoc(prog[i].do).toFixed(1));
       }
       // `non-scaling-stroke`: bez tego niejednorodne skalowanie robi z linii
-      // wstege — grubsza w pionie, cienka w poziomie.
+      // wstęgę — grubszą w pionie, cieńszą w poziomie.
       krzywa = '<polyline points="' + punkty.join(' ') + '" fill="none" stroke="'
         + AURA.primaryBright + '" stroke-width="2" stroke-linejoin="round"'
         + ' stroke-linecap="round" vector-effect="non-scaling-stroke"/>';
@@ -382,11 +441,11 @@ class VolterPlanCard extends HTMLElement {
       + '<line x1="0" y1="0" x2="0" y2="6" stroke="rgba(255,255,255,.06)" '
       + 'stroke-width="2"/></pattern></defs>';
 
-    return '<div class="wykres">'
+    return '<div class="wykres">' + os + '<div class="plotno">'
       + '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none" '
-      + 'style="width:100%;height:' + Math.round(H * 1.35) + 'px">'
-      + defs + prognoza + siatka + krzywa + punktStart + kolumny + obszary
-      + '</svg>' + podpisy + '</div>';
+      + 'style="width:100%;height:' + wysPx + 'px">'
+      + defs + pasProgozy + siatka + krzywa + punktStart + kolumny + obszary
+      + '</svg>' + podpisy + '</div></div>';
   }
 
   _legenda(sloty) {
@@ -463,7 +522,14 @@ class VolterPlanCard extends HTMLElement {
       + '.soc-bar{display:block;height:3px;border-radius:9999px;margin-top:6px;'
       + 'background:rgba(255,255,255,.08);overflow:hidden}'
       + '.soc-bar i{display:block;height:100%;background:' + AURA.primary + '}'
-      + '.wykres{margin:10px -2px 0}'
+      // Os po lewej, plotno po prawej. Etykiety musza byc w HTML z tego samego
+      // powodu co godziny: tekst w SVG rozciaga sie razem z wykresem.
+      + '.wykres{display:grid;grid-template-columns:24px 1fr;margin:10px -2px 0}'
+      + '.os-soc{position:relative}'
+      + '.os-soc span{position:absolute;right:5px;transform:translateY(-50%);'
+      + 'font-size:8px;color:' + AURA.textMuted + ';font-variant-numeric:tabular-nums;'
+      + 'white-space:nowrap}'
+      + '.plotno{min-width:0}'
       + '.godziny{display:grid;margin-top:3px}'
       // `overflow:visible`: komorka siatki ma szerokosc JEDNEJ kolumny wykresu, przy
       // waskiej karcie okolo 9 px, a „21" zajmuje wiecej. Przycinanie robilo z podpisow

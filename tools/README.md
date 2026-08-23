@@ -37,3 +37,12 @@ Strona z `file://` NIE zaimportuje modułu z HA — blokuje to CORS. Dlatego skr
 najpierw nawiguje na origin HA, a dopiero potem wstrzykuje render. Niezalogowany
 HA przekierowuje na `/auth/authorize`, więc render trzeba wstrzyknąć PO tym
 przekierowaniu — inaczej mierzy się ekran logowania, nie kartę.
+
+## sonda-karty.js
+
+Odczytuje z wyrenderowanej karty to, czego nie widac na zrzucie: tresc wszystkich
+podpowiedzi (`<title>` kolumn) i pozycje etykiet osi SoC w pikselach. Sluzy do
+sprawdzenia, czy os siada na krzywej i czy dymek niesie to, co ma niesc —
+zamiast najezdzania kursorem na 34 kolumny recznie.
+
+Wstrzykiwana tak samo jak render, do tego samego dokumentu, PO nim.
