@@ -24,6 +24,7 @@ from .const import (
     STOP_LISTEN_TIMEOUT_S,
 )
 from .executor import VolterExecutor
+from .device_token import DeviceTokenProvider
 from .guards import GuardResult, RequestDeduplicator, Status, infer_action
 from .schedule import InvalidSchedule
 
@@ -89,10 +90,15 @@ class VolterCommandHandler:
         anon_key: str,
         api_key: str,
         executor: VolterExecutor,
+        token_provider: DeviceTokenProvider | None = None,
     ) -> None:
         """Inicjalizacja."""
         self.hass = hass
         self._executor = executor
+        # N-6: tożsamość urządzenia dla kanału PRYWATNEGO. Brak providera (stare
+        # testy) albo brak tokenu (chmura przed cutoverem) = join publiczny.
+        self._token_provider = token_provider
+        self._sent_token: str | None = None
         self._dedup = RequestDeduplicator()
         self._entry = entry
         self._device_id = device_id
@@ -227,17 +233,8 @@ class VolterCommandHandler:
             _LOGGER.info("Connected to Supabase Realtime")
             self._reconnect_delay = REALTIME_RECONNECT_BASE
 
-            # Join channel
-            await self._send_json({
-                "topic": self._channel_topic,
-                "event": "phx_join",
-                "payload": {
-                    "config": {
-                        "broadcast": {"self": False},
-                    },
-                },
-                "ref": self._next_ref(),
-            })
+            # Join channel — prywatny z tokenem urządzenia (N-6), publiczny bez.
+            await self._send_json(await self._join_message())
 
             # Heartbeat task
             # jak wyżej — heartbeat też blokował bootstrap HA
@@ -277,6 +274,46 @@ class VolterCommandHandler:
             await self._session.close()
         self._session = None
 
+    async def _join_message(self) -> dict:
+        """Ramka `phx_join`.
+
+        N-6: z tokenem urządzenia kanał jest PRYWATNY — Realtime sprawdza RLS na
+        `realtime.messages` (migracja 060), więc na `device:{uid}` wchodzi tylko
+        właściciel. Bez tokenu (chmura przed cutoverem, brak łącza do device-token)
+        dołączamy publicznie jak dotąd; po migracji taki join się nie uda i pętla
+        reconnect spróbuje ponownie — już z tokenem, gdy chmura wróci.
+        """
+        token = await self._token_provider.async_get() if self._token_provider else None
+        payload: dict = {"config": {"broadcast": {"self": False}}}
+        if token:
+            payload["config"]["private"] = True
+            payload["access_token"] = token
+        else:
+            _LOGGER.warning(
+                "Brak tokenu urządzenia — dołączam do kanału PUBLICZNEGO [N-6]"
+            )
+        self._sent_token = token
+        return {
+            "topic": self._channel_topic,
+            "event": "phx_join",
+            "payload": payload,
+            "ref": self._next_ref(),
+        }
+
+    async def _refresh_channel_token(self) -> None:
+        """Phoenix: nowy JWT na żywym kanale idzie zdarzeniem `access_token`."""
+        if self._token_provider is None:
+            return
+        token = await self._token_provider.async_get()
+        if token and token != self._sent_token:
+            await self._send_json({
+                "topic": self._channel_topic,
+                "event": "access_token",
+                "payload": {"access_token": token},
+                "ref": self._next_ref(),
+            })
+            self._sent_token = token
+
     async def _heartbeat_loop(self) -> None:
         """Wysyłaj heartbeat co REALTIME_HEARTBEAT_INTERVAL sekund."""
         try:
@@ -288,6 +325,8 @@ class VolterCommandHandler:
                     "payload": {},
                     "ref": self._next_ref(),
                 })
+                # N-6: token żyje krócej niż połączenie — odświeżaj bez rozłączania.
+                await self._refresh_channel_token()
         except (asyncio.CancelledError, ConnectionError):
             pass
 

@@ -17,6 +17,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import CALLBACK_TYPE, Event, EventStateChangedData, HomeAssistant, callback
 from homeassistant.helpers.event import async_call_later, async_track_state_change_event
 
+from .device_token import DeviceTokenProvider
 from .const import (
     CONF_SUPABASE_ANON_KEY,
     DEVICE_TELEMETRY_PATH,
@@ -51,10 +52,14 @@ class VolterTelemetryCoordinator:
         api_key: str,
         device_id: str,
         supabase_url: str,
+        token_provider: DeviceTokenProvider | None = None,
     ) -> None:
         """Inicjalizacja."""
         self.hass = hass
         self._entry = entry
+        # N-6: broadcast na PRYWATNY temat `telemetry:{uid}` wymaga JWT urządzenia;
+        # bez tokenu (przed cutoverem) zostaje klucz anon i temat publiczny.
+        self._token_provider = token_provider
         self._api_key = api_key
         self._device_id = device_id  # = user_id
         self._telemetry_url = f"{supabase_url}{DEVICE_TELEMETRY_PATH}"
@@ -258,6 +263,8 @@ class VolterTelemetryCoordinator:
             "user_id": self._device_id,
             **self._latest_values,
         }
+        token = await self._token_provider.async_get() if self._token_provider else None
+        bearer = token or self._anon_key
 
         try:
             async with self._session.post(
@@ -267,12 +274,14 @@ class VolterTelemetryCoordinator:
                         "topic": f"telemetry:{self._device_id}",
                         "event": "reading",
                         "payload": payload,
+                        # N-6: temat prywatny, gdy mamy tożsamość; RLS sprawdza JWT.
+                        "private": bool(token),
                     }],
                 },
                 headers={
                     "Content-Type": "application/json",
                     "apikey": self._anon_key,
-                    "Authorization": f"Bearer {self._anon_key}",
+                    "Authorization": f"Bearer {bearer}",
                 },
                 timeout=aiohttp.ClientTimeout(total=3),
             ) as resp:

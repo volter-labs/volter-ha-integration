@@ -236,6 +236,10 @@ _make_module("homeassistant.helpers.storage", {"Store": _FakeStore})
 # Loader HA — stad bierzemy wersje integracji do adresu karty. Odczyt `manifest.json`
 # wprost z dysku byl blokujacym wejsciem-wyjsciem w petli zdarzen.
 _make_module("homeassistant.loader", {"async_get_integration": MagicMock()})
+# N-6: sesja aiohttp wspoldzielona z HA — token urzadzenia pobiera sie nia.
+_make_module("homeassistant.helpers.aiohttp_client", {
+    "async_get_clientsession": MagicMock(),
+})
 _make_module("homeassistant.helpers.event", {
     "async_track_time_interval": MagicMock(return_value=MagicMock()),
     "async_track_state_change_event": MagicMock(return_value=MagicMock()),

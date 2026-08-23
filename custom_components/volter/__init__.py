@@ -10,11 +10,13 @@ from homeassistant.components.frontend import add_extra_js_url
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.loader import async_get_integration
 
 from .command_handler import VolterCommandHandler
 from .const import CONF_API_KEY, CONF_DEVICE_ID, CONF_SUPABASE_ANON_KEY, CONF_SUPABASE_URL, DOMAIN
 from .coordinator import VolterTelemetryCoordinator
+from .device_token import DeviceTokenProvider, make_fetch
 from .executor import VolterExecutor
 from .fetcher import ScheduleFetcher
 from .runtime import VolterRuntime
@@ -149,6 +151,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: VolterConfigEntry) -> bo
     supabase_url = entry.data[CONF_SUPABASE_URL]
     anon_key = entry.data[CONF_SUPABASE_ANON_KEY]
 
+    # N-6: jedna tożsamość urządzenia (JWT z device-token) dla obu kanałów
+    # Realtime — telemetrii (nadawanie) i komend (nasłuch). Sesja aiohttp
+    # współdzielona z HA, żeby nie mnożyć połączeń.
+    token_provider = DeviceTokenProvider(
+        make_fetch(lambda: async_get_clientsession(hass), supabase_url, api_key)
+    )
+
     # Telemetry coordinator — zbiera stany encji i wysyła batche co 60s
     coordinator = VolterTelemetryCoordinator(
         hass=hass,
@@ -156,6 +165,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: VolterConfigEntry) -> bo
         api_key=api_key,
         device_id=device_id,
         supabase_url=supabase_url,
+        token_provider=token_provider,
     )
 
     # Wyłącznik sterowania trzymany poza opcjami, żeby przełączenie encją nie
@@ -186,6 +196,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: VolterConfigEntry) -> bo
         anon_key=anon_key,
         api_key=api_key,
         executor=executor,
+        token_provider=token_provider,
     )
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
