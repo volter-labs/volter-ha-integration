@@ -229,7 +229,15 @@ def slot_to_params(
             # a I-1 (rezerwa) wymaga, żeby bezpieczna wartość FAKTYCZNIE tam trafiła (RR-8).
             params["eco_soc"] = float(slot.soc_target)
 
-    if samo_zuzycie or tylko_pv:
+    if kierunek is None and slot.action is Action.IDLE:
+        # BATTERY_STANDBY honoruje `Xset` JAKO NASTAWĘ ŁADOWANIA — nieudokumentowane,
+        # ale zmierzone na GW8KN-ET (2026-09-01):
+        #   Xset=8604 -> ładował 1,5 kW i dokupywał 1,3 kW Z SIECI,
+        #   Xset=0    -> stoi (-15 W), dom pokrywa sieć.
+        # Bez jawnego zera slot „stój" pracowałby na nastawie z poprzedniego slotu,
+        # czyli kupował prąd — a IDLE emituje planer przy UJEMNYCH cenach.
+        params["charge_limit"] = 0.0
+    elif samo_zuzycie or tylko_pv:
         # Świadomie BEZ nastawy mocy: w trybie neutralnym nie ma czego wymuszać,
         # a nadwyżki PV i tak nie da się zamówić nastawą.
         pass

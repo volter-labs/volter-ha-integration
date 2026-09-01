@@ -285,11 +285,15 @@ def test_u1_idle_nie_dostaje_mocy():
     """IDLE to świadoma komenda „stój" — moc bez kierunku jest tu równie bezsensowna."""
     params = slot_to_params(_slot(action=Action.IDLE, power_w=1000.0))
 
-    # Etap 3: IDLE ma własny tryb falownika (BATTERY_STANDBY, "PBattery = 0"),
-    # a nie neutralne AUTO — "stój" i "pracuj wg licznika" to różne komendy.
-    # IDLE emituje planer przy ujemnych cenach, gdy bateria jest pełna.
+    # 2026-09-01, pomiar na żywym GW8KN-ET: BATTERY_STANDBY honoruje `Xset`
+    # JAKO NASTAWĘ ŁADOWANIA, co nie jest udokumentowane.
+    #   Xset=8604, SoC 94% -> ładował 1,5 kW, import 1,3 kW
+    #   Xset=0,    SoC 94% -> STOI (-15 W), dom pokrywa sieć
+    # Tryb jest więc użyteczny, ale WYŁĄCZNIE z jawnym zerem — bez niego slot
+    # „stój" pracowałby na nastawie z poprzedniego slotu i kupował prąd,
+    # a IDLE emituje planer przy UJEMNYCH cenach.
     assert params["mode"] == "battery_standby"
-    assert "charge_limit" not in params
+    assert params["charge_limit"] == 0.0
 
 
 def test_u1_discharge_sell_zostaje_eco_discharge_z_moca():
