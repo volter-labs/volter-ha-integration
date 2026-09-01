@@ -177,6 +177,31 @@ def slot_to_params(
     tylko_pv = kierunek is Action.CHARGE and slot.charge_source == "pv"
     if tylko_pv:
         tryb = GOODWE_TRYB_LADOWANIE_PV
+    # Rozładowanie NA WŁASNE POTRZEBY zostaje w trybie neutralnym.
+    #
+    # W `auto` falownik nie pobiera z sieci, jeśli nie musi: pokrywa dom z PV,
+    # potem z baterii. Czyli `auto` JUŻ realizuje „rozładuj na własne potrzeby",
+    # i robi to lepiej niż nastawa, bo śledzi rzeczywisty pobór. Wymuszenie
+    # `discharge_battery` z mocą planu psuje to w obie strony: przy większym
+    # poborze falownik dobiera brakującą część Z SIECI mimo pełnej baterii,
+    # przy mniejszym wypycha nadmiar do sieci jako eksport, którego plan nie
+    # zamawiał. Dodatkowo `power_w` takiego slotu to średnia godzinowa
+    # z `delta_kwh`, a nie chwilowy pobór — nastawa nie ma jak trafić w profil
+    # obciążenia. Kontrolę nad podłogą zachowuje `eco_soc`, który działa też
+    # w `auto` (niżej: przy DISCHARGE `soc_target` idzie właśnie w `eco_soc`).
+    #
+    # Zgodne z ustaleniem chmury (BATTERY_DISCHARGE_SELF scalone z SELF_CONSUME
+    # — GoodWe robi bateria→dom natywnie) i z firmware Boxa (`vb_map_slot`).
+    #
+    # I-1 zostaje nienaruszone: rezerwę podnosi niezależnie od akcji, a `kierunek`
+    # celowo NIE zmieniamy — przejście `charge_*` → `auto` jest realnym
+    # przełączeniem trybu i ma zużywać budżet anty-oscylacyjny I-8.
+    # WYŁĄCZNIE jawny `self`. Brak celu przy jednoznacznym `mode='discharge'` to
+    # nie to samo co „na własne potrzeby": to stary albo niepełny kontrakt, a plan
+    # wprost prosi o rozładowanie. Zejście na tryb neutralny gubiłoby tam komendę.
+    samo_zuzycie = kierunek is Action.DISCHARGE and slot.discharge_purpose == "self"
+    if samo_zuzycie:
+        tryb = modes[Action.SELF_CONSUME]
     params: dict[str, Any] = {"mode": tryb}
 
     if slot.soc_target is not None:
@@ -192,7 +217,10 @@ def slot_to_params(
             # a I-1 (rezerwa) wymaga, żeby bezpieczna wartość FAKTYCZNIE tam trafiła (RR-8).
             params["eco_soc"] = float(slot.soc_target)
 
-    if tylko_pv:
+    if samo_zuzycie:
+        # Świadomie BEZ nastawy mocy — patrz uzasadnienie przy `samo_zuzycie`.
+        pass
+    elif tylko_pv:
         # CHARGE_PV: `Xset` to moc, jaką wolno DOBRAĆ Z SIECI, a nie moc ładowania.
         # Zero znaczy "tylko PV" — jedyna wartość, która realizuje intencję planu.
         # Mocy z planu świadomie nie przepisujemy: nadwyżki PV nie da się wymusić.
@@ -201,7 +229,7 @@ def slot_to_params(
         moc = _moc_dla_kierunku(slot, tryb, kierunek, rated_power_w)
         if moc is not None:
             params["charge_limit"] = moc
-        elif kierunek is Action.CHARGE:
+        elif kierunek is not None:
             # PUŁAPKA: `charge_battery` bez świeżego `Xset` pracowałby na wartości
             # z POPRZEDNIEGO slotu — a po slocie PV jest tam 0, czyli "ładuj 0 W".
             # Throttle I-6 nie pomoże, bo pomija wartość niezmienioną. Skoro planer
@@ -212,13 +240,18 @@ def slot_to_params(
             # co 60 s — bez klucza tożsamości ta sama przyczyna dawałaby
             # 60 WARNING/h, czyli szum zamiast informacji.
             global _ostatnie_ostrzezenie_o_braku_mocy
+            # Ta sama pułapka dotyczy SPRZEDAŻY: `discharge_battery` bez świeżego
+            # `Xset` opróżniałby baterię mocą z poprzedniego slotu (po slocie
+            # ładowania bywa tam kilka kW), a throttle I-6 tego nie złapie, bo
+            # pomija wartość NIEZMIENIONĄ.
             komunikat_bm = (
-                "Slot %s–%s to ładowanie bez znanej mocy — zamiast %r wysyłam tryb "
-                "neutralny %r, żeby nie ładować z sieci nastawą z poprzedniego slotu"
+                "Slot %s–%s to %s bez znanej mocy — zamiast %r wysyłam tryb "
+                "neutralny %r, żeby nie sterować nastawą z poprzedniego slotu"
             )
             argumenty_bm = (
-                slot.start.isoformat(), slot.end.isoformat(), tryb,
-                modes[Action.SELF_CONSUME],
+                slot.start.isoformat(), slot.end.isoformat(),
+                "ładowanie" if kierunek is Action.CHARGE else "rozładowanie",
+                tryb, modes[Action.SELF_CONSUME],
             )
             klucz_bm = (slot.start, slot.end, tryb)
             if klucz_bm == _ostatnie_ostrzezenie_o_braku_mocy:

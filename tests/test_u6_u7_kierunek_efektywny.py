@@ -195,7 +195,21 @@ def test_tryb_falownika_jest_zawsze_tlumaczeniem_akcji_efektywnej(slot):
     params = mappers_module.slot_to_params(slot)
 
     oczekiwany = mappers_module.GOODWE_MODE_MAP[akcja_efektywna(slot)]
-    if slot.charge_source == "pv" and akcja_efektywna(slot) is Action.CHARGE:
+    if slot.discharge_purpose == "self" and akcja_efektywna(slot) is Action.DISCHARGE:
+        # Drugi udokumentowany wyjątek (2026-09-01): rozładowanie NA WŁASNE POTRZEBY
+        # zostaje w trybie neutralnym, bo `auto` samo pokrywa dom z baterii i śledzi
+        # rzeczywisty pobór — wymuszona nastawa dobierałaby brakującą część z SIECI
+        # przy większym poborze i wypychała nadmiar do sieci przy mniejszym.
+        #
+        # W przeciwieństwie do wyjątku PV ten NIE jest „dokładniejszym tłumaczeniem
+        # tej samej intencji": guardy widzą DISCHARGE, a falownik dostaje `auto`.
+        # Rozjazd jest świadomy i idzie w STRONĘ BEZPIECZNĄ — guardy chronią intencję
+        # ostrzejszą (I-1 zeruje rozładowanie i podnosi rezerwę) niż ta, którą
+        # urządzenie faktycznie wykonuje. Kierunku celowo nie zmieniamy, żeby
+        # przejście `charge_*` → `auto` dalej zużywało budżet I-8: ono JEST realnym
+        # przełączeniem trybu.
+        oczekiwany = mappers_module.GOODWE_MODE_MAP[Action.SELF_CONSUME]
+    elif slot.charge_source == "pv" and akcja_efektywna(slot) is Action.CHARGE:
         # Jedyny udokumentowany wyjątek: ładowanie WYŁĄCZNIE z nadwyżki ma osobny
         # tryb falownika (CHARGE_PV, "Xset=0 -> only PV power is used"). Kierunek,
         # który widzą guardy, jest ten sam — CHARGE — więc inwariant U-6 stoi:

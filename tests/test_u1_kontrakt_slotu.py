@@ -194,20 +194,52 @@ def test_s2_zly_slot_z_nowym_polem_uniewaznia_caly_harmonogram():
 # ── Część 3: U-1 — mapper przekazuje kierunek do falownika ───────────────────
 
 
-def test_u1_self_consume_z_discharge_purpose_idzie_jako_eco_discharge():
-    """SONDA U-1 (odtworzenie): 41% slotów z mocą jedzie tym kształtem.
+def test_rozladowanie_na_wlasne_potrzeby_zostaje_w_trybie_neutralnym():
+    """`self` -> `auto` BEZ nastawy mocy (ustalenie 2026-09-01).
 
-    Przed naprawą: `mode='auto'` PLUS `charge_limit=32.3` — moc bez komendy kierunku.
+    W `auto` falownik nie pobiera z sieci, jeśli nie musi — pokrywa dom z PV,
+    potem z baterii. Czyli sam realizuje „rozładuj na własne potrzeby", i robi to
+    lepiej niż nastawa, bo śledzi rzeczywisty pobór. Wymuszenie mocy psułoby to
+    w obie strony: przy większym poborze falownik dobrałby brakującą część
+    Z SIECI mimo pełnej baterii, przy mniejszym wypchnąłby nadmiar do sieci.
+    Podłogę trzyma `eco_soc`, który działa też w `auto`.
     """
     params = slot_to_params(
         _slot(discharge_purpose="self", power_w=3226.0, soc_target=20.0),
         rated_power_w=10000.0,
     )
 
-    assert params["mode"] == "discharge_battery", (
-        "kierunek z discharge_purpose musi dotrzeć do falownika — inaczej moc nie ma sensu"
+    assert params["mode"] == "auto"
+    assert "charge_limit" not in params, (
+        "moc NIE może iść przy `self` — falownik ma śledzić dom, nie nastawę"
     )
+    # Podłoga zostaje: bez niej `auto` rozładowałby do fabrycznego DoD.
+    assert params["eco_soc"] == pytest.approx(20.0)
+
+
+def test_rozladowanie_na_sprzedaz_wymusza_moc():
+    """`sell` -> `discharge_battery` z mocą: tu WŁAŚNIE chcemy wymusić przepływ,
+    niezależnie od tego, ile bierze dom."""
+    params = slot_to_params(
+        _slot(discharge_purpose="sell", power_w=3226.0, soc_target=20.0),
+        rated_power_w=10000.0,
+    )
+
+    assert params["mode"] == "discharge_battery"
     assert params["charge_limit"] == pytest.approx(3226.0)
+
+
+def test_sprzedaz_bez_mocy_schodzi_na_tryb_neutralny():
+    """`discharge_battery` bez świeżego `Xset` pracowałby na wartości z POPRZEDNIEGO
+    slotu — po slocie ładowania bywa tam kilka kW, czyli opróżnianie baterii mocą,
+    której nikt nie zamówił. Throttle I-6 tego nie łapie (pomija wartość
+    niezmienioną), więc jedyne wyjście to tryb neutralny."""
+    params = slot_to_params(
+        _slot(discharge_purpose="sell", soc_target=20.0), rated_power_w=10000.0
+    )
+
+    assert params["mode"] == "auto"
+    assert "charge_limit" not in params
 
 
 def test_u1_self_consume_bez_kierunku_nie_dostaje_mocy():
@@ -480,10 +512,14 @@ async def test_u1_wymuszona_akcja_kasuje_kierunek_opisowy(fake_entry):
 
 
 @pytest.mark.asyncio
-async def test_u1_end_to_end_slot_self_consume_z_kierunkiem_pisze_moc(fake_entry):
+async def test_u1_end_to_end_slot_self_consume_z_kierunkiem_zostaje_neutralny(fake_entry):
     """Pełna ścieżka: JSON z chmury → Store → guardy → service calls falownika.
 
-    Bez naprawy `select.tryb` dostawał `general`, a `number.eco_power` mimo to wartość.
+    Slot `self_consume` z `discharge_purpose='self'` — dokładnie ten kształt, który
+    chmura wystawia dla rozładowania na własne potrzeby (w żywym planie z 01.09
+    był taki slot na 21:00 UTC). Tryb zostaje NEUTRALNY i mocy nie zapisujemy:
+    w `auto` falownik sam pokrywa dom z baterii i śledzi rzeczywisty pobór.
+    Podłoga (`eco_soc`) i limit eksportu jadą normalnie.
     """
     hass = _hass(soc="60")
     fake_entry.options = dict(OPTIONS)
@@ -507,7 +543,13 @@ async def test_u1_end_to_end_slot_self_consume_z_kierunkiem_pisze_moc(fake_entry
     })
 
     zapisy = _zapisy(hass)
-    assert zapisy.get("select.tryb") == "discharge_battery"
-    assert zapisy.get("number.charge_limit") == pytest.approx(3226.0)
+    assert zapisy.get("select.tryb") == "auto"
+    assert "number.charge_limit" not in zapisy, (
+        "moc NIE może iść przy `self` — falownik ma śledzić dom, nie nastawę"
+    )
+    # Prog 20% zapisuje sie jako GLEBOKOSC rozladowania 80% (PARAM_VALUE_TRANSFORM):
+    # GoodWe przyjmuje DoD, nie prog. Pomylka kierunku zamienilaby "nie schodz
+    # ponizej 20%" w "zuzyj najwyzej 20%".
+    assert zapisy.get("number.eco_soc") == pytest.approx(80.0)
     assert zapisy.get("number.export_limit") == 6000.0
     assert zapisy.get("switch.export_limit") == "turn_on"
