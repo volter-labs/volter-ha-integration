@@ -174,9 +174,21 @@ def slot_to_params(
     tryb = _tryb_falownika(slot, modes)
     # Ładowanie wyłącznie z PV ma własny tryb: CHARGE_BATTERY dobrałby brakującą
     # część z sieci, czego plan przy `charge_source='pv'` wprost nie chce.
+    # Ładowanie WYŁĄCZNIE z nadwyżki PV zostaje w trybie neutralnym.
+    #
+    # Falownik w `auto` ładuje baterię nadwyżką PV natywnie, dopóki nie jest
+    # pełna. `CHARGE_PV` z `Xset=0` wymuszałby tryb, którego urządzenie i tak by
+    # użyło — bez żadnego zysku, za to z realnym zapisem do pamięci nieulotnej.
+    #
+    # Co przy 100% SoC: nadwyżka idzie do sieci, ale steruje tym OGRANICZNIK
+    # EKSPORTU, a nie tryb EMS. Plan ustawia go per slot (`export_allowed`,
+    # `export_limit_w`), a I-4 zamyka eksport przy cenie <= 0.
+    #
+    # Zostaje zasada: tryb wymuszamy TYLKO wtedy, gdy chcemy czegoś, czego
+    # falownik sam by nie zrobił — kupić z sieci albo wypchnąć na sprzedaż.
     tylko_pv = kierunek is Action.CHARGE and slot.charge_source == "pv"
     if tylko_pv:
-        tryb = GOODWE_TRYB_LADOWANIE_PV
+        tryb = modes[Action.SELF_CONSUME]
     # Rozładowanie NA WŁASNE POTRZEBY zostaje w trybie neutralnym.
     #
     # W `auto` falownik nie pobiera z sieci, jeśli nie musi: pokrywa dom z PV,
@@ -217,14 +229,10 @@ def slot_to_params(
             # a I-1 (rezerwa) wymaga, żeby bezpieczna wartość FAKTYCZNIE tam trafiła (RR-8).
             params["eco_soc"] = float(slot.soc_target)
 
-    if samo_zuzycie:
-        # Świadomie BEZ nastawy mocy — patrz uzasadnienie przy `samo_zuzycie`.
+    if samo_zuzycie or tylko_pv:
+        # Świadomie BEZ nastawy mocy: w trybie neutralnym nie ma czego wymuszać,
+        # a nadwyżki PV i tak nie da się zamówić nastawą.
         pass
-    elif tylko_pv:
-        # CHARGE_PV: `Xset` to moc, jaką wolno DOBRAĆ Z SIECI, a nie moc ładowania.
-        # Zero znaczy "tylko PV" — jedyna wartość, która realizuje intencję planu.
-        # Mocy z planu świadomie nie przepisujemy: nadwyżki PV nie da się wymusić.
-        params["charge_limit"] = 0.0
     else:
         moc = _moc_dla_kierunku(slot, tryb, kierunek, rated_power_w)
         if moc is not None:

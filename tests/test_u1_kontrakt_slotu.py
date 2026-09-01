@@ -331,15 +331,18 @@ def test_u1_charge_z_pv_nie_wlacza_ladowania_z_sieci():
         rated_power_w=10000.0,
     )
 
-    # Etap 3, H-1 WYCOFANA: falownik ma osobny tryb CHARGE_PV — "When set to 0,
-    # only PV power is used". Ładowanie nadwyżką da się więc wyrazić WPROST,
-    # zamiast uciekać w tryb neutralny i tracić intencję planu.
+    # Ustalenie 2026-09-01: ładowanie nadwyżką PV falownik robi NATYWNIE w `auto`,
+    # dopóki bateria nie jest pełna. CHARGE_PV z `Xset=0` wymuszałby tryb, którego
+    # urządzenie i tak by użyło — bez zysku, za to z zapisem do pamięci nieulotnej.
+    # Gwarancja "nie kupuj z sieci" jest zachowana i mocniejsza: nie wysyłamy
+    # ŻADNEJ nastawy mocy, więc nie ma czym pomylić kierunku.
     assert params["mode"] != "charge_battery", "pv nie może włączyć ładowania z sieci"
-    assert params["mode"] == "charge_pv"
-    assert params["charge_limit"] == 0.0, (
-        "Xset=0 w CHARGE_PV znaczy 'nie dobieraj z sieci' — to jest ta gwarancja"
+    assert params["mode"] == "auto"
+    assert "charge_limit" not in params, (
+        "w trybie neutralnym nie ma czego wymuszać — nadwyżki PV nie da się zamówić"
     )
-    # Cel ładowania to GÓRNY próg SoC, nie dolny.
+    # Cel ładowania to GÓRNY próg SoC, nie dolny. W `auto` to on decyduje,
+    # do ilu naładować — więc musi jechać mimo neutralnego trybu.
     assert params["soc_upper"] == 80.0
 
 
@@ -347,8 +350,8 @@ def test_u1_self_consume_z_charge_source_pv_tez_nie_laduje_z_sieci():
     """Ta sama reguła dla slotów kolapsujących do `self_consume` (nadwyżka PV)."""
     params = slot_to_params(_slot(charge_source="pv", power_w=2000.0))
 
-    assert params["mode"] == "charge_pv"
-    assert params["charge_limit"] == 0.0
+    assert params["mode"] == "auto"
+    assert "charge_limit" not in params
 
 
 def test_u1_charge_bez_charge_source_zachowuje_stare_zachowanie():

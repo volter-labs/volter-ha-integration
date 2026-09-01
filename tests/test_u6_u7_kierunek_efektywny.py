@@ -210,11 +210,12 @@ def test_tryb_falownika_jest_zawsze_tlumaczeniem_akcji_efektywnej(slot):
         # przełączeniem trybu.
         oczekiwany = mappers_module.GOODWE_MODE_MAP[Action.SELF_CONSUME]
     elif slot.charge_source == "pv" and akcja_efektywna(slot) is Action.CHARGE:
-        # Jedyny udokumentowany wyjątek: ładowanie WYŁĄCZNIE z nadwyżki ma osobny
-        # tryb falownika (CHARGE_PV, "Xset=0 -> only PV power is used"). Kierunek,
-        # który widzą guardy, jest ten sam — CHARGE — więc inwariant U-6 stoi:
-        # tryb nadal jest tłumaczeniem TEJ SAMEJ intencji, tylko dokładniejszym.
-        oczekiwany = mappers_module.GOODWE_TRYB_LADOWANIE_PV
+        # Ładowanie wyłącznie z nadwyżki PV zostaje w trybie neutralnym: `auto`
+        # robi to natywnie, dopóki bateria nie jest pełna. Ten sam rodzaj wyjątku
+        # co przy `discharge_purpose='self'` — guardy widzą CHARGE, falownik
+        # dostaje `auto`, a rozjazd idzie w stronę bezpieczną (nie wymuszamy nic,
+        # czego urządzenie samo by nie zrobiło).
+        oczekiwany = mappers_module.GOODWE_MODE_MAP[Action.SELF_CONSUME]
     assert params["mode"] == oczekiwany
 
 
@@ -291,10 +292,11 @@ async def test_u6_ladowanie_z_pv_ponizej_rezerwy_jest_DOZWOLONE(fake_entry):
 
     zapisy = _zapisy(hass)
     assert wynik.forced_action is None, "ładowania nie wolno wymuszać na self_consume"
-    # H-1 wycofana: ładowanie nadwyżką ma własny tryb, a `Xset=0` gwarantuje,
-    # że falownik nie dobierze brakującej mocy z sieci.
-    assert zapisy.get("select.tryb") == "charge_pv"
-    assert zapisy.get("number.charge_limit") == 0.0
+    # Ładowanie nadwyżką zostaje w trybie neutralnym (`auto` robi to natywnie),
+    # a brak nastawy mocy jest MOCNIEJSZĄ gwarancją niż `Xset=0`: nie ma czym
+    # pomylić kierunku. Rezerwa i tak jedzie — I-1 nie blokuje ładowania.
+    assert zapisy.get("select.tryb") == "auto"
+    assert "number.charge_limit" not in zapisy
     assert zapisy.get("number.eco_soc") == 40.0
 
 
