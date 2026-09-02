@@ -218,14 +218,20 @@ def test_rozladowanie_na_wlasne_potrzeby_zostaje_w_trybie_neutralnym():
 
 
 def test_rozladowanie_na_sprzedaz_wymusza_moc():
-    """`sell` -> `discharge_battery` z mocą: tu WŁAŚNIE chcemy wymusić przepływ,
-    niezależnie od tego, ile bierze dom."""
+    """`sell` -> `sell_power` z mocą EKSPORTU.
+
+    Wcześniej szło to jako `discharge_battery` z uzasadnieniem „tu właśnie chcemy
+    wymusić przepływ niezależnie od tego, ile bierze dom". Zmierzone 2026-09-02
+    o 21:00 pokazało, co to znaczy w praktyce: plan zadał 400 W, dom wziął
+    2,4-5,9 kW, bateria trzymała 364 W, a różnicę dokupiliśmy z sieci po 1,866 zł.
+    `sell_power` pokrywa dom z baterii i eksportuje nastawę PONAD to.
+    """
     params = slot_to_params(
         _slot(discharge_purpose="sell", power_w=3226.0, soc_target=20.0),
         rated_power_w=10000.0,
     )
 
-    assert params["mode"] == "discharge_battery"
+    assert params["mode"] == "sell_power"
     assert params["charge_limit"] == pytest.approx(3226.0)
 
 
@@ -336,7 +342,7 @@ def test_u1_discharge_sell_zostaje_eco_discharge_z_moca():
         rated_power_w=10000.0,
     )
 
-    assert params["mode"] == "discharge_battery"
+    assert params["mode"] == "sell_power"
     assert params["charge_limit"] == pytest.approx(5000.0)
 
 

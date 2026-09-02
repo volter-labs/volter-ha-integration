@@ -57,8 +57,16 @@ _LOGGER = logging.getLogger(__name__)
 #: dokładnie ta wielkość, którą niesie `slot.power_w` (z `soc_profile.delta_kwh`).
 #: Dlatego nie ma tu żadnego przeliczania na procenty mocy znamionowej.
 #:
-#: `discharge_purpose` (self vs sell) NIE potrzebuje osobnego trybu: oba to
-#: DISCHARGE_BATTERY, a różnicę robi limit eksportu, który kontrakt już niesie.
+#: `discharge_purpose` POTRZEBUJE osobnego trybu — to założenie było błędne.
+#: `discharge_battery` ma nastawę STAŁĄ i nie reaguje na pobór domu: zmierzone
+#: 2026-09-02 o 21:00, gdy plan zadał 400 W, a dom wziął 2,4–5,9 kW — bateria
+#: trzymała 364 W przez 20 minut, a różnicę dokupiliśmy z sieci po 1,866 zł.
+#: `sell_power` pokrywa dom Z BATERII i eksportuje nastawę PONAD to (zmierzone
+#: tej samej doby: bateria 2909 W = dom 2518 W + eksport 441 W przy Xset 400).
+#: Tryb dla slotu SPRZEDAŻY. Osobno od `GOODWE_MODE_MAP`, bo rozróżnia go nie
+#: akcja, tylko `discharge_purpose` — a mapa jest kluczowana akcją.
+GOODWE_SELL_MODE = "sell_power"
+
 GOODWE_MODE_MAP: dict[Action, str] = {
     Action.CHARGE: "charge_battery",
     Action.DISCHARGE: "discharge_battery",
@@ -106,7 +114,13 @@ def _tryb_falownika(slot: Slot, modes: dict[Action, str]) -> str:
     Tryb bierzemy zawsze z `modes`, nigdy z literału — `mode_map` jest parametrem
     właśnie po to, żeby dało się podmienić nazwy opcji encji select po Etapie 3.
     """
-    return modes[akcja_efektywna(slot)]
+    akcja = akcja_efektywna(slot)
+    # Sprzedaż to nadal rozładowanie, ale INNYM trybem: `discharge_battery` głodzi
+    # dom z sieci przy poborze większym niż nastawa. To nie jest decyzja mappera —
+    # `discharge_purpose` niesie plan, my go tylko tłumaczymy.
+    if akcja is Action.DISCHARGE and slot.discharge_purpose == "sell":
+        return GOODWE_SELL_MODE
+    return modes[akcja]
 
 
 def _moc_dla_kierunku(

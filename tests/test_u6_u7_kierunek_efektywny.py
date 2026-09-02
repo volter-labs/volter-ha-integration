@@ -195,7 +195,18 @@ def test_tryb_falownika_jest_zawsze_tlumaczeniem_akcji_efektywnej(slot):
     params = mappers_module.slot_to_params(slot)
 
     oczekiwany = mappers_module.GOODWE_MODE_MAP[akcja_efektywna(slot)]
-    if slot.discharge_purpose == "self" and akcja_efektywna(slot) is Action.DISCHARGE:
+    if slot.discharge_purpose == "sell" and akcja_efektywna(slot) is Action.DISCHARGE:
+        # Trzeci udokumentowany wyjątek (2026-09-02): SPRZEDAŻ idzie `sell_power`,
+        # nie `discharge_battery`. To NIE jest rozjazd intencji — guardy widzą
+        # DISCHARGE i falownik rozładowuje. Zmienia się tylko to, że tryb jest
+        # funkcją pary (akcja, `discharge_purpose`), a nie samej akcji.
+        #
+        # Powód jest zmierzony: `discharge_battery` ma nastawę STAŁĄ i przy poborze
+        # domu większym niż nastawa dokupuje różnicę Z SIECI (2026-09-02 o 21:00 —
+        # 0,828 kWh po 1,866 zł w 20 minut, przy baterii w 47 %). `sell_power`
+        # pokrywa dom z baterii i eksportuje nastawę ponad to.
+        oczekiwany = mappers_module.GOODWE_SELL_MODE
+    elif slot.discharge_purpose == "self" and akcja_efektywna(slot) is Action.DISCHARGE:
         # Drugi udokumentowany wyjątek (2026-09-01): rozładowanie NA WŁASNE POTRZEBY
         # zostaje w trybie neutralnym, bo `auto` samo pokrywa dom z baterii i śledzi
         # rzeczywisty pobór — wymuszona nastawa dobierałaby brakującą część z SIECI
