@@ -302,7 +302,12 @@ class ReserveHysteresis:
         # reakcji, a I-1 jest ochroną, nie wygładzaniem.
         if soc < reserve - self.deep_pp:
             return True
-        if soc < reserve:
+        # NIEOSTRO: równość to ostatnia chwila, w której ochrona może zadziałać,
+        # a nie pierwsza, w której może odpuścić. Z progu nie da się rozładować
+        # ani o wat, nie schodząc poniżej progu. Zmierzone na żywej instalacji:
+        # przy ostrym warunku sterownik wysłał tryb rozładowania stojąc dokładnie
+        # na progu — zatrzymał je dopiero własny próg falownika, czyli sprzęt.
+        if soc <= reserve:
             if trwanie is not None and trwanie < self.released_min_s:
                 return False
             return True
@@ -710,7 +715,7 @@ def apply_guards(params: dict[str, Any], ctx: GuardContext) -> GuardResult:
             state.soc, cfg.soc_reserve, ctx.now_s
         )
     else:
-        ponizej_rezerwy = state.soc < cfg.soc_reserve
+        ponizej_rezerwy = state.soc <= cfg.soc_reserve
 
     if ponizej_rezerwy:
         removed: list[str] = []
@@ -747,8 +752,8 @@ def apply_guards(params: dict[str, Any], ctx: GuardContext) -> GuardResult:
             # wyłącznie dlatego, że nie upłynął minimalny czas trwania stanu. Bez tego
             # rozróżnienia log przy SoC=40% twierdziłby „w paśmie histerezy 20%".
             pasmo = ctx.reserve_hysteresis.band_pp if ctx.reserve_hysteresis else 0.0
-            if state.soc < cfg.soc_reserve:
-                powod = f"SoC={state.soc}% < rezerwa {cfg.soc_reserve}%"
+            if state.soc <= cfg.soc_reserve:
+                powod = f"SoC={state.soc}% <= rezerwa {cfg.soc_reserve}%"
                 powod_key = "ponizej_rezerwy"
             elif state.soc < cfg.soc_reserve + pasmo:
                 powod = (

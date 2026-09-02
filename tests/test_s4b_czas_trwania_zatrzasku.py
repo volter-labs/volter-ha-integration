@@ -334,7 +334,8 @@ def test_s4b_nota_i1_mowi_prawde_i_nie_zalewa_logu():
         return next(n for n in wynik.notes if n.invariant == "I-1")
 
     pod_rezerwa = _nota(19.0, 0.0)
-    assert "< rezerwa" in pod_rezerwa.message
+    # `<=`, bo granica jest nieostra: SoC równy rezerwie też uruchamia ochronę.
+    assert "<= rezerwa" in pod_rezerwa.message
     assert pod_rezerwa.key == "rezerwa_ponizej_rezerwy"
 
     w_pasmie = _nota(21.0, 60.0)

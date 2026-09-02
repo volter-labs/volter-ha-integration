@@ -59,11 +59,28 @@ def _pure_ctx(soc: float, reserve: float) -> PureGuardContext:
 # ── R-13a: I-1 granica SoC == soc_reserve ────────────────────────────────────
 
 
-def test_r13a_soc_rowny_rezerwie_spelnia_inwariant():
-    """Inwariant I-1 brzmi `SoC >= soc_reserve`. Przy SoC dokładnie równym rezerwie
-    inwariant JEST spełniony — guard nie powinien zerować rozładowania ani zgłaszać
-    naruszenia."""
+def test_r13a_soc_rowny_rezerwie_zdejmuje_rozladowanie():
+    """Przy SoC DOKŁADNIE równym rezerwie rozładowanie musi zostać zdjęte.
+
+    Wcześniej obowiązywała reguła odwrotna, z uzasadnieniem „inwariant brzmi
+    SoC >= rezerwa, więc równość go spełnia". To prawda o STANIE, ale guard ocenia
+    AKCJĘ: z progu nie da się rozładować ani o wat, nie schodząc poniżej progu.
+    Równość jest ostatnią chwilą, w której ochrona może zadziałać.
+
+    Zmierzone na żywej instalacji: przy ostrym warunku sterownik wysłał tryb
+    rozładowania stojąc dokładnie na progu; rozładowanie zablokował dopiero własny
+    próg falownika, czyli sprzęt, a nie ten kod.
+    """
     result = pure_apply_guards({"discharge_limit": 30.0}, _pure_ctx(soc=20.0, reserve=20.0))
+
+    assert result.status is PureStatus.PARTIAL
+    assert "discharge_limit" not in result.params
+    assert any(n.invariant == "I-1" for n in result.notes)
+
+
+def test_r13a_tuz_nad_rezerwa_przepuszcza_rozladowanie():
+    """Granica przesuwa się o jeden przypadek — nie blokuje rozładowania w ogóle."""
+    result = pure_apply_guards({"discharge_limit": 30.0}, _pure_ctx(soc=20.5, reserve=20.0))
 
     assert result.status is PureStatus.SUCCESS
     assert result.params.get("discharge_limit") == 30.0
