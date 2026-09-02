@@ -64,6 +64,9 @@ GOODWE_MODE_MAP: dict[Action, str] = {
     Action.DISCHARGE: "discharge_battery",
     Action.SELF_CONSUME: "auto",
     Action.IDLE: "battery_standby",
+    # HOLD: ta sama fizyka co IDLE. Różni je wyłącznie eksport, o którym
+    # decyduje `export_allowed` ze slotu, a nie tryb EMS.
+    Action.HOLD: "battery_standby",
 }
 
 #: Ładowanie WYŁĄCZNIE z PV. CHARGE_PV (2): "Xmax is to allow the power to be taken
@@ -229,7 +232,7 @@ def slot_to_params(
             # a I-1 (rezerwa) wymaga, żeby bezpieczna wartość FAKTYCZNIE tam trafiła (RR-8).
             params["eco_soc"] = float(slot.soc_target)
 
-    if kierunek is None and slot.action is Action.IDLE:
+    if kierunek is None and slot.action in (Action.IDLE, Action.HOLD):
         # BATTERY_STANDBY honoruje `Xset` JAKO NASTAWĘ ŁADOWANIA — nieudokumentowane,
         # ale zmierzone na GW8KN-ET (2026-09-01):
         #   Xset=8604 -> ładował 1,5 kW i dokupywał 1,3 kW Z SIECI,

@@ -48,6 +48,13 @@ class Action(str, Enum):
     DISCHARGE = "discharge"
     SELF_CONSUME = "self_consume"
     IDLE = "idle"
+    #: „Bateria stoi, ale nadwyżka PV idzie do sieci".
+    #:
+    #: Fizycznie to samo co IDLE (standby + jawne zero), ale inna intencja, i widać
+    #: to dopiero przy eksporcie: IDLE powstał dla ujemnych cen i eksport blokuje,
+    #: HOLD go WYMAGA. Bez tego rozróżnienia slot „trzymaj SoC i sprzedaj produkcję"
+    #: schodził na `self_consume`, gdzie falownik ładuje baterię z nadwyżki.
+    HOLD = "hold"
 
 
 @dataclass(frozen=True)

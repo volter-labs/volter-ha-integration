@@ -185,11 +185,13 @@ def _waliduj_spojnosc_kierunku(
     `discharge_purpose` są już osobno zwalidowane, więc kontrola spójności między
     nimi ma jedno miejsce, a nie jest rozsypana po `mappers.py`/`executor.py`.
     """
-    if akcja is Action.IDLE and (charge_source is not None or discharge_purpose is not None):
+    if akcja in (Action.IDLE, Action.HOLD) and (
+        charge_source is not None or discharge_purpose is not None
+    ):
         raise InvalidSchedule(
             "mode",
-            "mode='idle' nie może nieść kierunku — charge_source/discharge_purpose "
-            "opisują akcję, której IDLE świadomie nie ma",
+            f"mode='{akcja.value}' nie może nieść kierunku — charge_source/"
+            "discharge_purpose opisują akcję, której ten tryb świadomie nie ma",
         )
     if akcja is Action.CHARGE and discharge_purpose is not None:
         raise InvalidSchedule(
@@ -413,7 +415,11 @@ def akcja_efektywna(slot: Slot) -> Action:
     kierunek = kierunek_slotu(slot)
     if kierunek is not None:
         return kierunek
-    return Action.IDLE if slot.action is Action.IDLE else Action.SELF_CONSUME
+    # HOLD zachowuje własną tożsamość z tego samego powodu co IDLE: guardy
+    # rozstrzygają po akcji, a „stój i eksportuj" nie jest samozużyciem.
+    if slot.action in (Action.IDLE, Action.HOLD):
+        return slot.action
+    return Action.SELF_CONSUME
 
 
 @dataclass(frozen=True)

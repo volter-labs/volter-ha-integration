@@ -296,6 +296,39 @@ def test_u1_idle_nie_dostaje_mocy():
     assert params["charge_limit"] == 0.0
 
 
+def test_hold_stoi_na_tej_samej_fizyce_co_idle():
+    """HOLD — „bateria stoi, ale nadwyżka PV idzie do sieci".
+
+    Fizycznie to samo co IDLE (standby + jawne zero); różni je wyłącznie eksport,
+    o którym decyduje `export_allowed` ze slotu, a nie tryb EMS. Bez tego trybu
+    plan mówiący „trzymaj SoC i sprzedaj produkcję" schodził na `self_consume`,
+    czyli `auto` — a tam falownik ładuje baterię z nadwyżki.
+    """
+    params = slot_to_params(_slot(action=Action.HOLD))
+
+    assert params["mode"] == "battery_standby"
+    assert params["charge_limit"] == 0.0
+
+
+def test_hold_parsuje_sie_z_planu():
+    """Nieznany tryb odrzuca slot, więc HA musi znać `hold`, zanim chmura go wyśle."""
+    slot = Slot.from_dict({
+        "from": "2026-09-02T09:00:00+02:00", "to": "2026-09-02T10:00:00+02:00",
+        "mode": "hold",
+    })
+
+    assert slot.action is Action.HOLD
+
+
+def test_hold_z_kierunkiem_jest_odrzucany():
+    """Ta sama zasada co przy IDLE: kierunek przeczy bezruchowi (U-9)."""
+    with pytest.raises(InvalidSchedule):
+        Slot.from_dict({
+            "from": "2026-09-02T09:00:00+02:00", "to": "2026-09-02T10:00:00+02:00",
+            "mode": "hold", "charge_source": "pv",
+        })
+
+
 def test_u1_discharge_sell_zostaje_eco_discharge_z_moca():
     """Jednoznaczny tryb `discharge` działa jak dotąd — naprawa jest addytywna."""
     params = slot_to_params(
